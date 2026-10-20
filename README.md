@@ -2,42 +2,57 @@
 
 Clients → Headroom → opencodex → providers.
 
-Only Headroom is available on the host, at `127.0.0.1:10204`.
-State stays in Docker volumes. Existing services are untouched.
+## Local
 
-Keep this setup on localhost. Keep API keys private.
-
-## Sources
-
-Use the latest changes from these branches:
-
-- [opencodex: gateway](https://github.com/Creator54/opencodex/tree/gateway)
-- [Headroom: gateway](https://github.com/Creator54/headroom/tree/gateway)
-
-Tag each image with its source commit. Deploy a specific image digest.
-
-## Build and test
-
-Requires Git, Docker Compose and [just](https://just.systems).
+Docker Compose or Podman Compose: `compose.yaml`, image settings in `.env`.
 
 ```sh
-just check
+direnv allow       # load tools
+just check         # build and test
+just up
+just status
+just logs
+just info          # addresses
+just down          # keeps data
 ```
 
-This fetches both source branches, builds images tagged with their commits,
-and tests them. Source stays in `.sources/`; image names are saved in `.env`.
-Neither folder nor file is committed. Nothing is published automatically.
-
-Use `just build` or `just test` to run either step separately.
-
-The test creates a temporary key, checks access and responses, then restarts
-opencodex to check that state survives. It never reads your existing credentials.
-It resets only its own test volumes and leaves the test stack running.
-
-## Stop the test
+Port: `GATEWAY_PORT` in `.env` (default **10204**). Tokens:
 
 ```sh
-docker compose -p llm-gateway-smoke -f compose.yaml -f compose.test.yaml down --volumes
+just copy-token admin llm-gateway-hub-1
+just copy-token api llm-gateway-hub-1
 ```
 
-This deletes test state. Do not use `--volumes` with real provider state.
+## Nix run
+
+Set `OCX_IMAGE` and `HEADROOM_IMAGE` in
+`~/.local/share/llm-gateway/images.env`. Requires the Podman API running.
+
+```bash
+read -rsp 'New API key: ' key; printf '\n'
+printf '%s' "$key" | nix run github:Creator54/llm-gateway -- init
+unset key
+```
+
+```sh
+nix run github:Creator54/llm-gateway -- up
+nix run github:Creator54/llm-gateway -- status
+nix run github:Creator54/llm-gateway -- down
+```
+
+## NixOS
+
+Input: `llm-gateway.url = "github:Creator54/llm-gateway";`
+
+```nix
+imports = [ inputs.llm-gateway.nixosModules.default ];
+services.llm-gateway = {
+  enable = true;
+  ocxImage = "docker.io/creator54/llm-gateway@sha256:<ocx-digest>";
+  headroomImage = "docker.io/creator54/llm-gateway@sha256:<headroom-digest>";
+  apiKeyFile = "/run/secrets/llm-gateway-key";
+  port = 10204;
+};
+```
+
+Key file must be readable by UID 1000 and outside the Nix store.
