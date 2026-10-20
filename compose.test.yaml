@@ -1,0 +1,32 @@
+# Use a different project name so tests never modify the real stack's volumes.
+services:
+  fake:
+    image: ocx-gateway:sync-2.89
+    entrypoint: [bun, /tmp/fake-upstream.ts]
+    healthcheck:
+      test: [CMD, bun, -e, "const r=await fetch('http://127.0.0.1:10302/v1/models');if(!r.ok)process.exit(1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./tests/fake-upstream.ts:/tmp/fake-upstream.ts:ro
+    networks: [gateway]
+
+  check:
+    image: ocx-gateway:sync-2.89
+    entrypoint: [bun, /tmp/check.ts]
+    healthcheck:
+      disable: true
+    profiles: [check]
+    environment:
+      TEST_BASE: http://headroom:8787
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./tests/check.ts:/tmp/check.ts:ro
+      - ocx-state:/home/bun/.opencodex:ro
+    networks: [gateway]

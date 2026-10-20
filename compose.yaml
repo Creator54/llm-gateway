@@ -1,0 +1,46 @@
+name: llm-gateway
+
+services:
+  hub:
+    image: creator54/llm-gateway:ocx-2.89-dedup
+    build:
+      context: ${OCX_SOURCE:-../.cache/ocx-gateway/trial-ocx}
+      target: runtime
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - ocx-state:/home/bun/.opencodex
+      - codex-state:/home/bun/.codex
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks: [gateway]
+
+  headroom:
+    image: creator54/llm-gateway:headroom-3b326d3a-gateway
+    command: [--host, 0.0.0.0, --port, '8787', --openai-api-url, 'http://hub:10100']
+    environment:
+      HEADROOM_BEACON: 'off'
+      DO_NOT_TRACK: '1'
+      # The host port is loopback-only; hub enforces client authentication.
+      HEADROOM_ALLOW_UNAUTHENTICATED_BIND: '1'
+    ports:
+      - '127.0.0.1:${GATEWAY_PORT:-10204}:8787'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      hub:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks: [gateway]
+
+networks:
+  gateway:
+
+volumes:
+  ocx-state:
+  codex-state:
