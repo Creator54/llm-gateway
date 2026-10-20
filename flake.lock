@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "headroom-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792433994,
+        "narHash": "sha256-hxSuj/c8hGuy8Jnvns5K6ptfJrNMtKdIDKRQgOgdEok=",
+        "owner": "Creator54",
+        "repo": "headroom",
+        "rev": "de9f2f804eeceb303309d455f6c4c4e5ade28239",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Creator54",
+        "ref": "gateway",
+        "repo": "headroom",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1792094642,
@@ -16,9 +33,28 @@
         "type": "github"
       }
     },
+    "opencodex-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792426287,
+        "narHash": "sha256-wOI41y5ChUXiM9dwUpigk/ZbJKmIxe1eXzro/EWbdTM=",
+        "owner": "Creator54",
+        "repo": "opencodex",
+        "rev": "a2a9e557d98c824088642632567b651cc8573aa8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Creator54",
+        "ref": "gateway",
+        "repo": "opencodex",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "headroom-src": "headroom-src",
+        "nixpkgs": "nixpkgs",
+        "opencodex-src": "opencodex-src"
       }
     }
   },

@@ -1,17 +1,39 @@
 {
   description = "Personal LLM gateway";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    headroom-src = {
+      url = "github:Creator54/headroom/gateway";
+      flake = false;
+    };
+    opencodex-src = {
+      url = "github:Creator54/opencodex/gateway";
+      flake = false;
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, opencodex-src, headroom-src }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       eachSystem = nixpkgs.lib.genAttrs systems;
     in {
-      nixosModules.default = import ./module.nix;
+      nixosModules.default = { pkgs, ... }: {
+        imports = [ ./module.nix ];
+        services.llm-gateway = {
+          ocxImageStream = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.ocx-image;
+          headroomImageStream = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.headroom-image;
+        };
+      };
       packages = eachSystem (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
-        in {
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          opencodex = pkgs.callPackage ./nix/opencodex.nix {
+            src = opencodex-src;
+          };
+          headroom = pkgs.callPackage ./nix/headroom.nix { src = headroom-src; };
+        in (import ./nix/images.nix { inherit pkgs opencodex headroom; }) // {
+          inherit opencodex headroom;
           default = pkgs.writeShellApplication {
             name = "llm-gateway";
             runtimeInputs = [ pkgs.podman pkgs.docker-compose pkgs.coreutils ];

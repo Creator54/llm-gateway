@@ -5,8 +5,10 @@ let
 in {
   options.services.llm-gateway = {
     enable = mkEnableOption "LLM gateway";
-    ocxImage = mkOption { type = types.str; description = "opencodex image reference, preferably pinned by digest."; };
-    headroomImage = mkOption { type = types.str; description = "Headroom image reference, preferably pinned by digest."; };
+    ocxImage = mkOption { type = types.str; default = "llm-gateway-ocx:${cfg.ocxImageStream.imageTag or "source"}"; description = "opencodex image reference."; };
+    headroomImage = mkOption { type = types.str; default = "llm-gateway-headroom:${cfg.headroomImageStream.imageTag or "source"}"; description = "Headroom image reference."; };
+    ocxImageStream = mkOption { type = types.nullOr types.package; default = null; description = "Nix-built opencodex image stream; null to use an external image."; };
+    headroomImageStream = mkOption { type = types.nullOr types.package; default = null; description = "Nix-built Headroom image stream; null to use an external image."; };
     apiKeyFile = mkOption {
       type = types.str;
       description = "Absolute runtime path to the client API key, readable by container UID 1000. Never put the key in the Nix store.";
@@ -25,6 +27,7 @@ in {
       containers = {
         llm-gateway-hub = {
           image = cfg.ocxImage;
+          imageStream = cfg.ocxImageStream;
           environment.OCX_API_TOKEN_FILE = "/run/secrets/client-key";
           volumes = [
             "llm-gateway-ocx:/home/bun/.opencodex"
@@ -42,6 +45,7 @@ in {
         };
         llm-gateway-headroom = {
           image = cfg.headroomImage;
+          imageStream = cfg.headroomImageStream;
           dependsOn = [ "llm-gateway-hub" ];
           cmd = [ "--host" "0.0.0.0" "--port" "8787" "--openai-api-url" "http://hub:10100" ];
           ports = [ "127.0.0.1:${toString cfg.port}:8787" ];

@@ -48,11 +48,11 @@ Input: `llm-gateway.url = "github:Creator54/llm-gateway";`
 imports = [ inputs.llm-gateway.nixosModules.default ];
 services.llm-gateway = {
   enable = true;
-  ocxImage = "docker.io/creator54/llm-gateway@sha256:<ocx-digest>";
-  headroomImage = "docker.io/creator54/llm-gateway@sha256:<headroom-digest>";
   apiKeyFile = "/run/secrets/llm-gateway-key";
   port = 10204;
 };
 ```
+
+Nix builds headless images from the sources pinned in `flake.lock`. Update the input lock to upgrade; switching loads the images and restarts the services. No Docker build or image archive is needed.
 
 Key file must be readable by UID 1000 and outside the Nix store.

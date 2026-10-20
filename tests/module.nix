@@ -14,7 +14,21 @@ let
   }).config;
   c = configured "/run/secrets/gateway";
   invalid = configured "/nix/store/unsafe-key";
+  sourceBuilt = (nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [ module {
+      system.stateVersion = "25.11";
+      services.llm-gateway = {
+        enable = true;
+        apiKeyFile = "/run/secrets/gateway";
+      };
+    } ];
+  }).config.virtualisation.oci-containers.containers;
 in
+assert sourceBuilt.llm-gateway-hub.imageStream != null;
+assert sourceBuilt.llm-gateway-headroom.imageStream != null;
+assert sourceBuilt.llm-gateway-hub.image == "llm-gateway-ocx:${sourceBuilt.llm-gateway-hub.imageStream.imageTag}";
+assert sourceBuilt.llm-gateway-headroom.image == "llm-gateway-headroom:${sourceBuilt.llm-gateway-headroom.imageStream.imageTag}";
 assert c.virtualisation.oci-containers.backend == "podman";
 assert c.virtualisation.oci-containers.containers.llm-gateway-headroom.ports == [ "127.0.0.1:10204:8787" ];
 assert c.virtualisation.oci-containers.containers.llm-gateway-hub.ports == [];
