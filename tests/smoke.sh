@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset DOCKER_HOST DOCKER_CONTEXT
 cd "$(dirname "$0")/.."
 export GATEWAY_PORT="${GATEWAY_PORT:-10204}"
-compose=(docker compose -p llm-gateway-smoke -f compose.yaml -f compose.test.yaml)
+# Override saved deployment volume names before any destructive cleanup.
+export OCX_STATE_VOLUME=llm-gateway-smoke_ocx-state
+export CODEX_STATE_VOLUME=llm-gateway-smoke_codex-state
+export OPENCODE_STATE_VOLUME=llm-gateway-smoke_opencode-state
+compose=(podman compose -p llm-gateway-smoke -f compose.yaml -f compose.test.yaml)
 # Fresh test-only volumes. Never use this script with real-provider state.
 "${compose[@]}" down --volumes --remove-orphans
 "${compose[@]}" run --rm --no-deps --entrypoint bun hub -e '
@@ -27,6 +32,6 @@ echo 'after_restart:'
 "${compose[@]}" run --rm --no-deps check
 # Guard against accidentally publishing the hub on any host interface.
 hub_id=$("${compose[@]}" ps -q hub)
-[[ "$(docker inspect "$hub_id" --format '{{len .HostConfig.PortBindings}}')" == 0 ]] || { echo 'Hub port unexpectedly published' >&2; exit 1; }
+[[ "$(podman inspect "$hub_id" --format '{{len .HostConfig.PortBindings}}')" == 0 ]] || { echo 'Hub port unexpectedly published' >&2; exit 1; }
 echo 'hub_unpublished=PASS'
-echo 'Smoke stack left running. Stop: docker compose -p llm-gateway-smoke -f compose.yaml -f compose.test.yaml down --volumes'
+echo 'Smoke stack left running. Stop: podman compose -p llm-gateway-smoke -f compose.yaml -f compose.test.yaml down --volumes'

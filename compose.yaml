@@ -7,11 +7,14 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs:
-      - /tmp:size=64m,mode=1777
     volumes:
       - ocx-state:/home/bun/.opencodex
       - codex-state:/home/bun/.codex
+      - opencode-state:/home/bun/.local
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /home/bun/.cache:mode=1777
+      - /home/bun/.config:mode=1777
     restart: unless-stopped
     stop_grace_period: 30s
     networks: [gateway]
@@ -40,4 +43,8 @@ networks:
 
 volumes:
   ocx-state:
+    name: ${OCX_STATE_VOLUME:-${COMPOSE_PROJECT_NAME}_ocx-state}
   codex-state:
+    name: ${CODEX_STATE_VOLUME:-${COMPOSE_PROJECT_NAME}_codex-state}
+  opencode-state:
+    name: ${OPENCODE_STATE_VOLUME:-${COMPOSE_PROJECT_NAME}_opencode-state}

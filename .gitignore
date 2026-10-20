@@ -4,3 +4,5 @@
 .sources/
 .tmp/
 *.log
+/result
+/.direnv/
