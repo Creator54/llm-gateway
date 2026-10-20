@@ -1,7 +1,7 @@
 # Use a different project name so tests never modify the real stack's volumes.
 services:
   fake:
-    image: ocx-gateway:sync-2.89
+    image: ${OCX_IMAGE:?Run just build first}
     entrypoint: [bun, /tmp/fake-upstream.ts]
     healthcheck:
       test: [CMD, bun, -e, "const r=await fetch('http://127.0.0.1:10302/v1/models');if(!r.ok)process.exit(1)"]
@@ -16,7 +16,7 @@ services:
     networks: [gateway]
 
   check:
-    image: ocx-gateway:sync-2.89
+    image: ${OCX_IMAGE:?Run just build first}
     entrypoint: [bun, /tmp/check.ts]
     healthcheck:
       disable: true

@@ -16,13 +16,19 @@ Use the latest changes from these branches:
 
 Tag each image with its source commit. Deploy a specific image digest.
 
-## Test
+## Build and test
 
-Requires Docker Compose and both images built locally.
+Requires Git, Docker Compose and [just](https://just.systems).
 
 ```sh
-bash tests/smoke.sh
+just check
 ```
+
+This fetches both source branches, builds images tagged with their commits,
+and tests them. Source stays in `.sources/`; image names are saved in `.env`.
+Neither folder nor file is committed. Nothing is published automatically.
+
+Use `just build` or `just test` to run either step separately.
 
 The test creates a temporary key, checks access and responses, then restarts
 opencodex to check that state survives. It never reads your existing credentials.

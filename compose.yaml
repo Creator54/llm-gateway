@@ -2,10 +2,7 @@ name: llm-gateway
 
 services:
   hub:
-    image: creator54/llm-gateway:ocx-2.89-dedup
-    build:
-      context: ${OCX_SOURCE:-../.cache/ocx-gateway/trial-ocx}
-      target: runtime
+    image: ${OCX_IMAGE:?Run just build first}
     init: true
     read_only: true
     cap_drop: [ALL]
@@ -20,7 +17,7 @@ services:
     networks: [gateway]
 
   headroom:
-    image: creator54/llm-gateway:headroom-3b326d3a-gateway
+    image: ${HEADROOM_IMAGE:?Run just build first}
     command: [--host, 0.0.0.0, --port, '8787', --openai-api-url, 'http://hub:10100']
     environment:
       HEADROOM_BEACON: 'off'
