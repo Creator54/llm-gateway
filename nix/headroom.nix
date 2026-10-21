@@ -121,6 +121,7 @@ in py.buildPythonApplication rec {
     py.uvicorn
     py.orjson
     py.httpx
+    py.h2
     py.openai
     mcp_1_30
     py.magika

@@ -21,7 +21,9 @@
       nixosModules.default = { pkgs, ... }: {
         imports = [ ./module.nix ];
         services.llm-gateway = {
-          ocxImageStream = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.ocx-image;
+          package         = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.opencodex;
+          headroomPackage = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.headroom;
+          ocxImageStream  = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.ocx-image;
           headroomImageStream = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.headroom-image;
         };
       };

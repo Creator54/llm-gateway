@@ -1,38 +1,27 @@
 { nixpkgs, module, system ? "x86_64-linux" }:
 let
-  configured = key: (nixpkgs.lib.nixosSystem {
+  pkgs = nixpkgs.legacyPackages.${system};
+
+  mkConfig = extra: (nixpkgs.lib.nixosSystem {
     inherit system;
-    modules = [ module {
+    modules = [ module ({ lib, ... }: {
       system.stateVersion = "25.11";
       services.llm-gateway = {
         enable = true;
-        ocxImage = "example/ocx:test";
-        headroomImage = "example/headroom:test";
-        apiKeyFile = key;
-      };
-    } ];
-  }).config;
-  c = configured "/run/secrets/gateway";
-  invalid = configured "/nix/store/unsafe-key";
-  sourceBuilt = (nixpkgs.lib.nixosSystem {
-    inherit system;
-    modules = [ module {
-      system.stateVersion = "25.11";
-      services.llm-gateway = {
-        enable = true;
+        package = pkgs.hello;          # lightweight stand-in
+        headroomPackage = pkgs.hello;
         apiKeyFile = "/run/secrets/gateway";
-      };
-    } ];
-  }).config.virtualisation.oci-containers.containers;
+      } // extra;
+    }) ];
+  }).config;
+
+  c = mkConfig {};
+  invalid = mkConfig { apiKeyFile = "/nix/store/unsafe-key"; };
 in
-assert sourceBuilt.llm-gateway-hub.imageStream != null;
-assert sourceBuilt.llm-gateway-headroom.imageStream != null;
-assert sourceBuilt.llm-gateway-hub.image == "llm-gateway-ocx:${sourceBuilt.llm-gateway-hub.imageStream.imageTag}";
-assert sourceBuilt.llm-gateway-headroom.image == "llm-gateway-headroom:${sourceBuilt.llm-gateway-headroom.imageStream.imageTag}";
-assert c.virtualisation.oci-containers.backend == "podman";
-assert c.virtualisation.oci-containers.containers.llm-gateway-headroom.ports == [ "127.0.0.1:10204:8787" ];
-assert c.virtualisation.oci-containers.containers.llm-gateway-hub.ports == [];
-assert builtins.elem "llm-gateway-network.service" c.systemd.services.podman-llm-gateway-hub.requires;
-assert builtins.elem "podman-llm-gateway-hub.service" c.systemd.services.podman-llm-gateway-headroom.after;
+assert c.systemd.services.llm-gateway-hub.serviceConfig.User == "llm-gateway";
+assert c.systemd.services.llm-gateway-headroom.serviceConfig.User == "llm-gateway";
+assert builtins.elem "llm-gateway-hub.service" c.systemd.services.llm-gateway-headroom.requires;
+assert builtins.elem "llm-gateway-hub.service" c.systemd.services.llm-gateway-headroom.after;
+assert c.users.users.llm-gateway.isSystemUser;
 assert builtins.any (a: !a.assertion && nixpkgs.lib.hasInfix "apiKeyFile" a.message) invalid.assertions;
 true
