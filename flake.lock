@@ -36,11 +36,11 @@
     "opencodex-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1792426287,
-        "narHash": "sha256-wOI41y5ChUXiM9dwUpigk/ZbJKmIxe1eXzro/EWbdTM=",
+        "lastModified": 1792780001,
+        "narHash": "sha256-RiJx/pb+vQbwrJgr9ddE9qSnKXZhkhVhtzAZ0RgtGMc=",
         "owner": "Creator54",
         "repo": "opencodex",
-        "rev": "a2a9e557d98c824088642632567b651cc8573aa8",
+        "rev": "21b9378f95862ad3ab42ece3739cab41db688777",
         "type": "github"
       },
       "original": {
