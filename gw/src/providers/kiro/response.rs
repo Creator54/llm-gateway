@@ -1,6 +1,7 @@
 //! Kiro eventstream payloads to Chat completion chunks.
 
 use super::eventstream::Message;
+use super::payload::CompletionMode;
 use super::wire::{self, ToolNames};
 use serde_json::{json, Map, Value};
 
@@ -27,8 +28,11 @@ pub(super) enum Event {
         input: Option<String>,
         stop: Option<bool>,
     },
-    Usage(Usage),
-    StopReason(String),
+    /// `metadataEvent` carries usage and/or the native stop reason.
+    Metadata {
+        usage: Option<Usage>,
+        stop: Option<String>,
+    },
     Failure(String),
 }
 
@@ -108,19 +112,13 @@ pub(super) fn parse(message: &Message) -> Result<Option<Event>, String> {
             }
         }
         "metadataEvent" => {
-            if let Some(stop) = field("stopReason")? {
-                if let Some(usage) = token_usage(&object)? {
-                    return Ok(Some(Event::Usage(usage)));
-                }
-                return Ok(Some(Event::StopReason(stop)));
+            let stop = field("stopReason")?;
+            let usage = token_usage(&object)?;
+            if stop.is_none() && usage.is_none() {
+                number("contextUsagePercentage")?;
+                return Ok(None);
             }
-            match token_usage(&object)? {
-                Some(usage) => Event::Usage(usage),
-                None => {
-                    number("contextUsagePercentage")?;
-                    return Ok(None);
-                }
-            }
+            Event::Metadata { usage, stop }
         }
         "meteringEvent" => {
             field("unit")?.ok_or_else(|| {
@@ -191,12 +189,18 @@ fn token_usage(object: &Value) -> Result<Option<Usage>, String> {
 pub(super) struct Translator {
     model: String,
     names: ToolNames,
+    /// Text stays staged until the turn is known to have delivered its answer.
+    defer: bool,
+    staged: Vec<Value>,
     text: String,
     calls: Vec<Value>,
     open: Option<(String, String, String)>,
     usage: Option<Usage>,
     stop_reason: Option<String>,
     next_index: u64,
+    answered: bool,
+    saw_real_tool: bool,
+    needs_fallback: bool,
     finished: bool,
 }
 
@@ -207,16 +211,22 @@ fn tool_call(index: u64, id: &str, name: &str, arguments: &str) -> Value {
 }
 
 impl Translator {
-    pub(super) fn new(model: &str, names: ToolNames) -> Self {
+    pub(super) fn new(model: &str, names: ToolNames, mode: CompletionMode) -> Self {
         Self {
             model: model.to_owned(),
             names,
+            // Only the demanding attempt stages text; the bounded retry's text is the answer.
+            defer: mode == CompletionMode::Required,
+            staged: Vec::new(),
             text: String::new(),
             calls: Vec::new(),
             open: None,
             usage: None,
             stop_reason: None,
             next_index: 0,
+            answered: false,
+            saw_real_tool: false,
+            needs_fallback: false,
             finished: false,
         }
     }
@@ -229,7 +239,12 @@ impl Translator {
                     return Ok(Vec::new());
                 }
                 self.text.push_str(&text);
-                Ok(vec![self.chunk(json!({ "content": text }))])
+                let chunk = self.chunk(json!({ "content": text }));
+                if self.defer {
+                    self.staged.push(chunk);
+                    return Ok(Vec::new());
+                }
+                Ok(vec![chunk])
             }
             Event::Reasoning(text) => {
                 if text.is_empty() {
@@ -243,12 +258,13 @@ impl Translator {
                 input,
                 stop,
             } => self.tool_event(name, id, input, stop),
-            Event::Usage(usage) => {
-                self.usage = Some(usage);
-                Ok(Vec::new())
-            }
-            Event::StopReason(reason) => {
-                self.stop_reason = Some(reason);
+            Event::Metadata { usage, stop } => {
+                if let Some(usage) = usage {
+                    self.usage = Some(usage);
+                }
+                if let Some(stop) = stop {
+                    self.stop_reason = Some(stop);
+                }
                 Ok(Vec::new())
             }
             Event::Failure(message) => Err(message),
@@ -298,20 +314,45 @@ impl Translator {
 
     fn close_call(&mut self, id: String, name: String, arguments: String) -> Vec<Value> {
         if name == wire::COMPLETION_TOOL {
-            // The completion call carries the final answer itself and ends the turn.
+            // The completion call carries the final answer and supersedes staged progress text.
             if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&arguments) {
                 if let Some(answer) = map.get("answer").and_then(Value::as_str) {
                     if !answer.is_empty() {
-                        self.text.push_str(answer);
+                        self.text = answer.to_owned();
+                        self.answered = true;
+                        self.staged.clear();
+                        return vec![self.chunk(json!({ "content": answer }))];
                     }
                 }
             }
             return Vec::new();
         }
+        self.saw_real_tool = true;
         let index = self.next_index;
         self.next_index += 1;
         self.calls.push(tool_call(index, &id, &name, &arguments));
         vec![self.chunk(json!({ "tool_calls": [tool_call(index, &id, &name, &arguments)] }))]
+    }
+
+    /// Whether this turn still owes a bounded `text_fallback` retry.
+    pub(super) fn fallback_text(&self) -> Option<String> {
+        self.needs_fallback.then(|| self.text.clone())
+    }
+
+    /// Whether the turn produced anything the client can see.
+    pub(super) fn produced_output(&self) -> bool {
+        self.answered || self.saw_real_tool || !self.text.trim().is_empty()
+    }
+
+    /// Release staged progress text as the final answer when no retry is possible.
+    pub(super) fn release(&mut self) -> Vec<Value> {
+        self.needs_fallback = false;
+        if self.finished {
+            return Vec::new();
+        }
+        let mut chunks = std::mem::take(&mut self.staged);
+        chunks.extend(self.final_chunk());
+        chunks
     }
 
     /// Final chunk: the stop reason plus usage, or nothing when already finished.
@@ -319,6 +360,25 @@ impl Translator {
         if self.finished {
             return Vec::new();
         }
+        if self.defer && !self.answered && !self.saw_real_tool && !self.text.trim().is_empty() {
+            let retry_stop = matches!(
+                self.stop_reason.as_deref(),
+                None | Some("END_TURN") | Some("STOP_SEQUENCE")
+            );
+            if !retry_stop {
+                let mut chunks = std::mem::take(&mut self.staged);
+                chunks.extend(self.final_chunk());
+                return chunks;
+            }
+            self.needs_fallback = true;
+            return Vec::new();
+        }
+        let mut chunks = std::mem::take(&mut self.staged);
+        chunks.extend(self.final_chunk());
+        chunks
+    }
+
+    fn final_chunk(&mut self) -> Vec<Value> {
         self.finished = true;
         let mut chunk = self.chunk(json!({}));
         let finish = if self.calls.is_empty() {

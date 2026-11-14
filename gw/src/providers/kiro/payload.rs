@@ -11,11 +11,22 @@ const EMPTY_TOOL_RESULT: &str = "The tool completed without textual output.";
 const MAX_INJECTED_INSTRUCTION_CHARS: usize = 16_384;
 const COMPLETION_INSTRUCTIONS: &str = "When tools are available, ordinary assistant text is mid-task commentary and does not end the turn. Continue using tools after progress updates. When the task is fully complete and no more tool calls are needed, call codex_kiro_final_answer exactly once with the complete user-facing final answer in `answer`. Do not provide the final answer as ordinary assistant text. This completion tool is not an ordinary work tool. When the task is complete, call it instead of emitting answer-shaped ordinary assistant text. The call is terminal and is the exception to generic tool-result counting: it is complete when issued, ends the turn, returns no tool result, and no text or tool call may follow it. If you cannot continue until the user supplies a decision, information, or a clarification that only they can give, that question is your final answer: call codex_kiro_final_answer with the question and stop. Do not write the question as ordinary text and then answer it yourself.";
 
+/// How the turn is asked to hand back its final answer.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum CompletionMode {
+    Disabled,
+    Required,
+    TextFallback,
+}
+
 /// What the reply side needs from the request side.
 pub(super) struct Built {
     pub body: Value,
     pub names: ToolNames,
+    pub mode: CompletionMode,
 }
+
+const COMPLETION_RETRY_MESSAGE: &str = "Continue the existing task without quoting this instruction. If the task is complete, call codex_kiro_final_answer now with the complete final answer. If you cannot continue until the user supplies a decision, information, or a clarification that only they can give, call codex_kiro_final_answer now with that question as the answer. Otherwise issue the next real tool call now. Do not solicit a new task and do not emit another progress-only message.";
 
 enum Turn {
     User {
@@ -49,6 +60,7 @@ pub(super) fn build(
     client: WireClient,
     profile_arn: Option<&str>,
     session: &str,
+    forced: Option<CompletionMode>,
 ) -> Result<Built, String> {
     validate_capabilities(chat)?;
     let model_id = wire::normalize_model_id(
@@ -131,10 +143,15 @@ pub(super) fn build(
     }
 
     let (mut tools, nudge) = convert_tools(chat, &mut names);
-    let completion = !tools.is_empty();
-    if completion {
+    let mode = forced.unwrap_or(if tools.is_empty() {
+        CompletionMode::Disabled
+    } else {
+        CompletionMode::Required
+    });
+    if mode != CompletionMode::Disabled {
         tools.push(completion_tool());
     }
+    let completion = mode != CompletionMode::Disabled;
     let mut system = Vec::new();
     if !system_parts.is_empty() {
         system.push(identify_routed_model(&system_parts.join("\n\n"), &model_id));
@@ -156,6 +173,7 @@ pub(super) fn build(
         tools,
         system_prefix,
         names,
+        mode,
     )
 }
 
@@ -170,13 +188,24 @@ fn assembled(
     tools: Vec<Value>,
     system_prefix: String,
     names: ToolNames,
+    mode: CompletionMode,
 ) -> Result<Built, String> {
     // Kiro needs alternating turns that start and end on the user.
     if turns.first().is_none_or(|turn| !turn.is_user()) {
         turns.insert(0, continuation());
     }
     if matches!(turns.last(), Some(Turn::Assistant { .. })) {
-        turns.push(continuation());
+        // The retry has to name the completion tool, the normal resumption must not.
+        let content = if mode == CompletionMode::TextFallback {
+            COMPLETION_RETRY_MESSAGE
+        } else {
+            CONTINUATION_MESSAGE
+        };
+        turns.push(Turn::User {
+            content: content.to_owned(),
+            images: Vec::new(),
+            tool_results: Vec::new(),
+        });
     }
     for turn in &mut turns {
         if let Turn::User {
@@ -216,6 +245,7 @@ fn assembled(
         current,
         tools,
         names,
+        mode,
     )
 }
 
@@ -230,12 +260,32 @@ fn finish(
     mut current: Turn,
     tools: Vec<Value>,
     names: ToolNames,
+    mode: CompletionMode,
 ) -> Result<Built, String> {
     let has_results =
         matches!(&current, Turn::User { tool_results, .. } if !tool_results.is_empty());
     if let Turn::User { content, .. } = &mut current {
-        if !has_results && content != CONTINUATION_MESSAGE {
+        if mode == CompletionMode::TextFallback {
+            if content != COMPLETION_RETRY_MESSAGE {
+                append_text(content, COMPLETION_RETRY_MESSAGE);
+            }
+        } else if !has_results
+            && content != CONTINUATION_MESSAGE
+            && content != COMPLETION_RETRY_MESSAGE
+        {
             *content = inject_thinking_tags(content, chat, &model_id);
+        }
+    }
+    for turn in history.iter().chain(std::iter::once(&current)) {
+        if let Turn::User {
+            content,
+            images,
+            tool_results,
+        } = turn
+        {
+            if content.trim().is_empty() && images.is_empty() && tool_results.is_empty() {
+                return Err("Kiro user messages must not be empty".to_owned());
+            }
         }
     }
     let history: Vec<Value> = history
@@ -269,6 +319,7 @@ fn finish(
     Ok(Built {
         body: Value::Object(body),
         names,
+        mode,
     })
 }
 

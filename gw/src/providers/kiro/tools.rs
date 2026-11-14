@@ -63,11 +63,15 @@ pub(super) fn completion_tool() -> Value {
 
 /// Converted tool catalog, its injected nudge, and the names its aliases hide from the client.
 pub(super) fn convert_tools(chat: &Value, names: &mut ToolNames) -> (Vec<Value>, Option<String>) {
-    let requested: Vec<Value> = chat
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // `tool_choice: none` emulates a tool-free turn; aliases are still assigned above.
+    let requested: Vec<Value> = if chat.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        Vec::new()
+    } else {
+        chat.get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
     let limit =
         if super::wire::normalize_model_id(chat.get("model").and_then(Value::as_str).unwrap_or(""))
             == "gpt-5.6-sol"

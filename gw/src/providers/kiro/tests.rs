@@ -82,6 +82,78 @@ async fn upstream(
     (format!("http://{address}/"), state)
 }
 
+/// One scripted reply: status, headers, body.
+type Staged = (u16, Vec<(String, String)>, Vec<u8>);
+type StagedInput<'a> = (u16, Vec<(&'a str, &'a str)>, Vec<u8>);
+
+/// Fake upstream that answers with a scripted sequence of responses.
+struct Scripted {
+    replies: Mutex<Vec<Staged>>,
+    captured: Mutex<Vec<Captured>>,
+}
+
+async fn scripted_handler(
+    State(state): State<Arc<Scripted>>,
+    request: axum::extract::Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .unwrap_or_default();
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    state.captured.lock().expect("capture").push(Captured {
+        method: parts.method.as_str().to_owned(),
+        path: parts.uri.path().to_owned(),
+        headers,
+        body: bytes.to_vec(),
+    });
+    let reply = state.replies.lock().expect("replies").remove(0);
+    let mut response = Response::builder().status(reply.0);
+    for (name, value) in &reply.1 {
+        response = response.header(name, value);
+    }
+    response.body(Body::from(reply.2)).expect("response")
+}
+
+async fn scripted(replies: Vec<StagedInput<'_>>) -> (String, Arc<Scripted>) {
+    let state = Arc::new(Scripted {
+        replies: Mutex::new(
+            replies
+                .into_iter()
+                .map(|(status, headers, body)| {
+                    (
+                        status,
+                        headers
+                            .into_iter()
+                            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                            .collect(),
+                        body,
+                    )
+                })
+                .collect(),
+        ),
+        captured: Mutex::new(Vec::new()),
+    });
+    let app = Router::new()
+        .fallback(any(scripted_handler))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    (format!("http://{address}/"), state)
+}
+
 fn account(extra: &[(&str, &str)], token: &str) -> Account {
     Account {
         id: "acct".into(),
@@ -506,6 +578,171 @@ async fn missing_credential_is_an_auth_failure() {
         .err()
         .expect("auth");
     assert_eq!(failure, Failure::Auth);
+}
+
+#[test]
+fn fallback_endpoint_only_replaces_the_canonical_runtime_host() {
+    assert_eq!(
+        wire::fallback_endpoint(None, "eu-west-1").as_deref(),
+        Some("https://q.eu-west-1.amazonaws.com/")
+    );
+    assert_eq!(
+        wire::fallback_endpoint(Some("https://runtime.us-east-1.kiro.dev/"), "us-east-1")
+            .as_deref(),
+        Some("https://q.us-east-1.amazonaws.com/")
+    );
+    // A configured non-canonical endpoint is authoritative; never swap it behind the operator.
+    assert!(wire::fallback_endpoint(Some("http://127.0.0.1:8080/v1"), "us-east-1").is_none());
+    assert!(
+        wire::fallback_endpoint(Some("https://runtime.us-east-1.kiro.dev/api"), "us-east-1")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn tool_choice_none_sends_no_tools() {
+    let (base, upstream) = upstream(
+        200,
+        vec![("content-type", "application/vnd.amazon.eventstream")],
+        text_frame("Hello"),
+    )
+    .await;
+    let mut body = chat_body(true);
+    body["tool_choice"] = serde_json::json!("none");
+    let _ = provider(&base)
+        .send(
+            &request(Inbound::Chat, body, true),
+            &account(&[], "aoa-token"),
+        )
+        .await
+        .expect("reply");
+    let captured = upstream
+        .captured
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("request");
+    let body: Value = serde_json::from_slice(&captured.body).expect("json");
+    let user = &body["conversationState"]["currentMessage"]["userInputMessage"];
+    assert!(user.get("userInputMessageContext").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn empty_user_message_is_rejected_locally() {
+    let (base, upstream) = upstream(200, vec![], Vec::new()).await;
+    let body = serde_json::json!({
+        "model": "kiro/claude-sonnet-4-5",
+        "messages": [{ "role": "user", "content": "   " }],
+    });
+    let failure = provider(&base)
+        .send(
+            &request(Inbound::Chat, body, false),
+            &account(&[], "aoa-token"),
+        )
+        .await
+        .err()
+        .expect("fatal");
+    assert!(matches!(failure, Failure::Fatal { status, .. } if status == StatusCode::BAD_REQUEST));
+    assert!(upstream.captured.lock().expect("capture").is_none());
+}
+
+#[tokio::test]
+async fn required_completion_retries_once_then_takes_the_answer() {
+    let first = {
+        let mut body = encode_message(
+            &[
+                (":message-type", "event"),
+                (":event-type", "assistantResponseEvent"),
+            ],
+            br#"{"content":"Let me look."}"#,
+        );
+        body.extend(encode_message(
+            &[(":message-type", "event"), (":event-type", "metadataEvent")],
+            br#"{"stopReason":"END_TURN"}"#,
+        ));
+        body
+    };
+    let answer = {
+        let first_part = serde_json::json!({
+            "name": "codex_kiro_final_answer",
+            "toolUseId": "call-1",
+            "input": "{\"answer\":\"",
+        });
+        let mut body = encode_message(
+            &[(":message-type", "event"), (":event-type", "toolUseEvent")],
+            first_part.to_string().as_bytes(),
+        );
+        let rest = serde_json::json!({ "input": "Done.\"}", "stop": true });
+        body.extend(encode_message(
+            &[(":message-type", "event"), (":event-type", "toolUseEvent")],
+            rest.to_string().as_bytes(),
+        ));
+        body.extend(encode_message(
+            &[(":message-type", "event"), (":event-type", "metadataEvent")],
+            br#"{"stopReason":"END_TURN"}"#,
+        ));
+        body
+    };
+    let (base, upstream) = scripted(vec![
+        (
+            200,
+            vec![("content-type", "application/vnd.amazon.eventstream")],
+            first,
+        ),
+        (
+            200,
+            vec![("content-type", "application/vnd.amazon.eventstream")],
+            answer,
+        ),
+    ])
+    .await;
+    let reply = provider(&base)
+        .send(
+            &request(Inbound::Chat, chat_body(false), false),
+            &account(&[], "aoa-token"),
+        )
+        .await
+        .expect("reply");
+    let mut bytes = Vec::new();
+    let mut stream = reply.body;
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.expect("chunk"));
+    }
+    let body: Value = serde_json::from_slice(&bytes).expect("json");
+    let text = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content");
+    assert_eq!(text, "Done.");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+
+    let captured = upstream.captured.lock().expect("capture");
+    assert_eq!(captured.len(), 2, "exactly one bounded retry");
+    let retry: Value = serde_json::from_slice(&captured[1].body).expect("json");
+    let state = &retry["conversationState"];
+    let history = state["history"].as_array().expect("history");
+    let first = history[0]["userInputMessage"]["content"]
+        .as_str()
+        .expect("content");
+    assert!(first.starts_with("Be terse."), "{first}");
+    assert!(first.ends_with("Say hello."), "{first}");
+    assert_eq!(
+        history[1]["assistantResponseMessage"]["content"],
+        "Let me look."
+    );
+    let content = state["currentMessage"]["userInputMessage"]["content"]
+        .as_str()
+        .expect("content");
+    assert!(
+        content.contains("call codex_kiro_final_answer now"),
+        "{content}"
+    );
+    assert!(
+        state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["toolSpecification"]["name"] == "codex_kiro_final_answer")
+    );
 }
 
 #[test]

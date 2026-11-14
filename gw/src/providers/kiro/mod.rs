@@ -80,19 +80,13 @@ fn fatal(status: StatusCode, message: impl Into<String>) -> Failure {
     }
 }
 
-fn headers(
-    account: &Account,
-    token: &str,
-    profile_arn: Option<&str>,
-    client: wire::WireClient,
-) -> HeaderMap {
+fn headers(token: &str, profile_arn: Option<&str>, client: wire::WireClient) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in wire::headers(token, profile_arn, client) {
         if let Ok(value) = HeaderValue::from_str(&value) {
             out.insert(name, value);
         }
     }
-    let _ = account;
     out
 }
 
@@ -117,6 +111,14 @@ fn retry_after(headers: &HeaderMap, body: &str) -> Option<Duration> {
 
 fn is_quota(body: &str) -> bool {
     let lower = body.to_lowercase();
+    let rate_window = lower.contains("requests per min")
+        || lower.contains("per minute")
+        || lower.contains("per second")
+        || lower.contains("rpm")
+        || lower.contains("tpm");
+    if rate_window {
+        return false;
+    }
     lower.contains("insufficient_quota")
         || lower.contains("quota exhausted")
         || lower.contains("quota exceeded")
@@ -124,6 +126,16 @@ fn is_quota(body: &str) -> bool {
         || lower.contains("account quota")
         || lower.contains("monthly quota")
         || lower.contains("exhausted your")
+}
+
+/// Account-scoped refusals: suspension or an exhausted monthly allowance.
+fn is_refusal(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    is_quota(body)
+        || lower.contains("temporarily_suspended")
+        || lower.contains("temporarily suspended")
+        || lower.contains("locked your account")
+        || lower.contains("monthly_request_count")
 }
 
 /// Plain text carried by an upstream error body.
@@ -142,28 +154,14 @@ fn upstream_text(body: &str) -> String {
 }
 
 fn classify(status: StatusCode, headers: &HeaderMap, body: &str) -> Failure {
-    let lower = body.to_lowercase();
     match status.as_u16() {
-        429 => {
-            if is_quota(body) {
-                return Failure::Quota { reset_after: None };
-            }
-            let suspended = lower.contains("temporarily_suspended") || lower.contains("suspended");
-            if suspended && is_quota(body) {
-                return Failure::Quota { reset_after: None };
-            }
-            Failure::RateLimited {
-                retry_after: retry_after(headers, body),
-            }
-        }
-        401 | 403 => {
-            if is_quota(body) || lower.contains("temporarily_suspended") {
-                Failure::Quota { reset_after: None }
-            } else {
-                Failure::Auth
-            }
-        }
-        400 if lower.contains("insufficient_quota") => Failure::Quota { reset_after: None },
+        429 if is_quota(body) => Failure::Quota { reset_after: None },
+        429 => Failure::RateLimited {
+            retry_after: retry_after(headers, body),
+        },
+        401 | 403 if is_refusal(body) => Failure::Quota { reset_after: None },
+        401 | 403 => Failure::Auth,
+        400 if is_quota(body) => Failure::Quota { reset_after: None },
         status if (500..600).contains(&status) => Failure::Retryable,
         _ => fatal(status, upstream_message(status, body)),
     }
@@ -216,36 +214,23 @@ impl Provider for Kiro {
             } else {
                 wire::WireClient::Ide
             };
-            let built = payload::build(&chat, wire_client, profile_arn.as_deref(), &req.session)
-                .map_err(|message| fatal(StatusCode::BAD_REQUEST, message))?;
-            let url = wire::endpoint(self.base_url.as_deref(), &wire::region(&account.extra))
-                .map_err(|message| fatal(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-            let body = serde_json::to_vec(&built.body).unwrap_or_default();
-            let response = self
-                .client
-                .post(&url)
-                .timeout(TIMEOUT)
-                .headers(headers(
-                    account,
-                    &token,
-                    profile_arn.as_deref(),
-                    wire_client,
-                ))
-                .body(body)
-                .send()
-                .await
-                .map_err(|_| Failure::Retryable)?;
-            let status = response.status();
-            if !status.is_success() {
-                let headers = response.headers().clone();
-                let text = response.text().await.unwrap_or_default();
-                return Err(classify(status, &headers, &text));
-            }
-            let session = session_parts(&chat, req.inbound, built);
+            let call = Call {
+                client: self.client.clone(),
+                base_url: self.base_url.clone(),
+                token,
+                profile_arn,
+                wire_client,
+                chat,
+                session: req.session.clone(),
+                region: wire::region(&account.extra),
+            };
+            let (response, built) = call.send(None).await?;
+            let chat = call.chat.clone();
+            let session = session_parts(&chat, req.inbound, &built, call);
             if req.stream {
                 Ok(stream_reply(response, session))
             } else {
-                let chat = collect(response, session).await?;
+                let chat = collect(response, &session).await?;
                 let body = match req.inbound {
                     Inbound::Chat => chat,
                     Inbound::Responses => {
@@ -261,11 +246,102 @@ impl Provider for Kiro {
     }
 }
 
+/// One client request's wire state, reused by the bounded completion retry.
+struct Call {
+    client: reqwest::Client,
+    base_url: Option<String>,
+    token: String,
+    profile_arn: Option<String>,
+    wire_client: wire::WireClient,
+    chat: Value,
+    session: String,
+    region: String,
+}
+
+impl Call {
+    async fn send(
+        &self,
+        forced: Option<payload::CompletionMode>,
+    ) -> Result<(reqwest::Response, payload::Built), Failure> {
+        let built = payload::build(
+            &self.chat,
+            self.wire_client,
+            self.profile_arn.as_deref(),
+            &self.session,
+            forced,
+        )
+        .map_err(|message| fatal(StatusCode::BAD_REQUEST, message))?;
+        let url = wire::endpoint(self.base_url.as_deref(), &self.region)
+            .map_err(|message| fatal(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+        let body = serde_json::to_vec(&built.body).unwrap_or_default();
+        let headers = headers(&self.token, self.profile_arn.as_deref(), self.wire_client);
+        let mut response = self
+            .client
+            .post(&url)
+            .timeout(TIMEOUT)
+            .headers(headers.clone())
+            .body(body.clone())
+            .send()
+            .await;
+        // The runtime host retries on the legacy canonical host before giving up.
+        let unreachable = match &response {
+            Ok(response) => matches!(response.status().as_u16(), 502..=504),
+            Err(_) => true,
+        };
+        if unreachable {
+            if let Some(fallback) = wire::fallback_endpoint(self.base_url.as_deref(), &self.region)
+            {
+                response = self
+                    .client
+                    .post(&fallback)
+                    .timeout(TIMEOUT)
+                    .headers(headers)
+                    .body(body)
+                    .send()
+                    .await;
+            }
+        }
+        let response = response.map_err(|_| Failure::Retryable)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify(status, &headers, &text));
+        }
+        Ok((response, built))
+    }
+
+    /// The single bounded retry: replay the visible text and demand the completion call.
+    async fn retry(&self, text: &str) -> Result<(reqwest::Response, payload::Built), Failure> {
+        let mut chat = self.chat.clone();
+        if !text.trim().is_empty() {
+            if let Some(messages) = chat.get_mut("messages").and_then(Value::as_array_mut) {
+                messages.push(serde_json::json!({ "role": "assistant", "content": text }));
+            }
+        }
+        let retry = Call {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            token: self.token.clone(),
+            profile_arn: self.profile_arn.clone(),
+            wire_client: self.wire_client,
+            chat,
+            session: self.session.clone(),
+            region: self.region.clone(),
+        };
+        retry
+            .send(Some(payload::CompletionMode::TextFallback))
+            .await
+    }
+}
+
 fn json_reply(body: Value) -> Reply {
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
     Reply {
         status: StatusCode::OK,
-        headers: HeaderMap::new(),
+        headers,
         body: Box::pin(futures_util::stream::once(
             async move { Ok(Bytes::from(bytes)) },
         )),
@@ -277,9 +353,11 @@ struct Session {
     model: String,
     inbound: Protocol,
     names: wire::ToolNames,
+    mode: payload::CompletionMode,
+    call: Call,
 }
 
-fn session_parts(chat: &Value, inbound: Inbound, built: payload::Built) -> Session {
+fn session_parts(chat: &Value, inbound: Inbound, built: &payload::Built, call: Call) -> Session {
     let model = chat
         .get("model")
         .and_then(Value::as_str)
@@ -293,16 +371,20 @@ fn session_parts(chat: &Value, inbound: Inbound, built: payload::Built) -> Sessi
     Session {
         model,
         inbound,
-        names: built.names,
+        names: built.names.clone(),
+        mode: built.mode,
+        call,
     }
 }
 
-/// Collect the whole eventstream for a non-streamed client request.
-async fn collect(response: reqwest::Response, session: Session) -> Result<Value, Failure> {
+/// Drain one eventstream into a translator without emitting anything.
+async fn drain(
+    response: reqwest::Response,
+    translator: &mut response::Translator,
+) -> Result<(), Failure> {
     use futures_util::StreamExt;
     let mut stream = response.bytes_stream();
     let mut decoder = eventstream::Decoder::new();
-    let mut translator = response::Translator::new(&session.model, session.names);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| Failure::Retryable)?;
         let messages = decoder.push(&chunk).map_err(|_| Failure::Retryable)?;
@@ -313,71 +395,90 @@ async fn collect(response: reqwest::Response, session: Session) -> Result<Value,
         }
     }
     decoder.finish().map_err(|_| Failure::Retryable)?;
+    Ok(())
+}
+
+/// Collect the whole eventstream for a non-streamed client request.
+async fn collect(response: reqwest::Response, session: &Session) -> Result<Value, Failure> {
+    let mut translator =
+        response::Translator::new(&session.model, session.names.clone(), session.mode);
+    drain(response, &mut translator).await?;
+    translator.finish();
+    if let Some(text) = translator.fallback_text() {
+        // A turn that stopped talking without delivering an answer gets exactly one retry that
+        // demands the completion call; a failed retry still returns the first attempt's text.
+        if let Ok((response, _)) = session.call.retry(&text).await {
+            let mut retry = response::Translator::new(
+                &session.model,
+                session.names.clone(),
+                payload::CompletionMode::TextFallback,
+            );
+            if drain(response, &mut retry).await.is_ok() {
+                retry.finish();
+                if retry.produced_output() {
+                    return Ok(retry.completion());
+                }
+            }
+        }
+    }
     Ok(translator.completion())
 }
 
 /// Stream the translated reply to the client as it arrives.
 fn stream_reply(response: reqwest::Response, session: Session) -> Reply {
-    use futures_util::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-    let model = session.model.clone();
     tokio::spawn(async move {
-        let mut decoder = eventstream::Decoder::new();
-        let mut translator = response::Translator::new(&model, session.names);
-        let mut sink = Sink::new(session.inbound, &model);
-        let mut stream = response.bytes_stream();
+        let mut sink = Sink::new(session.inbound, &session.model);
         if let Some(bytes) = sink.start() {
             if tx.send(Ok(bytes)).await.is_err() {
                 return;
             }
         }
-        while let Some(chunk) = stream.next().await {
-            let Ok(chunk) = chunk else {
-                fail_stream(&mut sink, &tx, "Kiro upstream connection failed").await;
-                return;
-            };
-            let messages = match decoder.push(&chunk) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    fail_stream(&mut sink, &tx, &error.to_string()).await;
-                    return;
+        let mut translator =
+            response::Translator::new(&session.model, session.names.clone(), session.mode);
+        let mut chunks = match pump(response, &mut translator, &mut sink, &tx).await {
+            Ok(()) => translator.finish(),
+            Err(error) => {
+                // Nothing has reached the client yet in a deferred turn, so a failed attempt is
+                // reported as an error rather than a partial answer.
+                if let Some(bytes) = sink.error(&error) {
+                    let _ = tx.send(Ok(bytes)).await;
                 }
-            };
-            for message in messages {
-                let event = match response::parse(&message) {
-                    Ok(Some(event)) => event,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        fail_stream(&mut sink, &tx, &error).await;
+                finish_sink(&mut sink, &tx).await;
+                return;
+            }
+        };
+        if let Some(text) = translator.fallback_text() {
+            // One bounded retry that demands the completion call; its answer replaces the
+            // progress text of the first attempt.
+            if let Ok((retry, built)) = session.call.retry(&text).await {
+                let mut second = response::Translator::new(
+                    &session.model,
+                    built.names,
+                    payload::CompletionMode::TextFallback,
+                );
+                if pump(retry, &mut second, &mut sink, &tx).await.is_ok() {
+                    let mut retry_chunks = second.finish();
+                    if second.produced_output() {
+                        for chunk in retry_chunks {
+                            if tx.send(Ok(sink.push(&chunk))).await.is_err() {
+                                return;
+                            }
+                        }
+                        finish_sink(&mut sink, &tx).await;
                         return;
                     }
-                };
-                let chunks = match translator.push(event) {
-                    Ok(chunks) => chunks,
-                    Err(error) => {
-                        fail_stream(&mut sink, &tx, &error).await;
-                        return;
-                    }
-                };
-                for chunk in chunks {
-                    if tx.send(Ok(sink.push(&chunk))).await.is_err() {
-                        return;
-                    }
+                    retry_chunks.clear();
                 }
             }
+            chunks = translator.release();
         }
-        if let Err(error) = decoder.finish() {
-            fail_stream(&mut sink, &tx, &error.to_string()).await;
-            return;
-        }
-        for chunk in translator.finish() {
+        for chunk in chunks {
             if tx.send(Ok(sink.push(&chunk))).await.is_err() {
                 return;
             }
         }
-        if let Some(bytes) = sink.finish() {
-            let _ = tx.send(Ok(bytes)).await;
-        }
+        finish_sink(&mut sink, &tx).await;
     });
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -394,13 +495,36 @@ fn stream_reply(response: reqwest::Response, session: Session) -> Reply {
     }
 }
 
-async fn fail_stream(
+/// Forward one eventstream attempt into the sink. Never buffers the body.
+async fn pump(
+    response: reqwest::Response,
+    translator: &mut response::Translator,
     sink: &mut Sink,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    message: &str,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut decoder = eventstream::Decoder::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "Kiro upstream connection failed".to_owned())?;
+        for message in decoder.push(&chunk).map_err(|error| error.to_string())? {
+            let Some(event) = response::parse(&message)? else {
+                continue;
+            };
+            for chunk in translator.push(event)? {
+                if tx.send(Ok(sink.push(&chunk))).await.is_err() {
+                    return Err("client closed the stream".to_owned());
+                }
+            }
+        }
+    }
+    decoder.finish().map_err(|error| error.to_string())
+}
+
+async fn finish_sink(
+    sink: &mut Sink,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
-    let bytes = sink.error(message);
-    let _ = tx.send(Ok(bytes)).await;
     if let Some(bytes) = sink.finish() {
         let _ = tx.send(Ok(bytes)).await;
     }
@@ -447,14 +571,14 @@ impl Sink {
         }
     }
 
-    fn error(&mut self, message: &str) -> Bytes {
+    fn error(&mut self, message: &str) -> Option<Bytes> {
         match self {
             Sink::Chat => {
                 let body = serde_json::json!({ "error": { "message": message } });
-                Bytes::from(format!("data: {body}\n\n"))
+                Some(Bytes::from(format!("data: {body}\n\n")))
             }
             // The stream adapters have no mid-stream error event; close the reply instead.
-            Sink::Responses(_) | Sink::Messages(_) => Bytes::new(),
+            Sink::Responses(_) | Sink::Messages(_) => None,
         }
     }
 }

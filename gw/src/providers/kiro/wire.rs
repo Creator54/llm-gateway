@@ -70,6 +70,17 @@ pub(super) fn endpoint(base_url: Option<&str>, region: &str) -> Result<String, S
     Ok(url.to_string())
 }
 
+/// The legacy canonical host, used when the runtime host is unreachable.
+pub(super) fn fallback_endpoint(base_url: Option<&str>, region: &str) -> Option<String> {
+    if let Some(base) = base_url {
+        let url = reqwest::Url::parse(base).ok()?;
+        if !is_runtime_host(url.host_str().unwrap_or_default()) || url.path() != "/" {
+            return None;
+        }
+    }
+    Some(format!("https://q.{region}.amazonaws.com/"))
+}
+
 fn is_runtime_host(host: &str) -> bool {
     let Some(rest) = host.strip_prefix("runtime.") else {
         return false;
@@ -342,7 +353,7 @@ pub(super) fn normalize_tool_id(id: &str) -> String {
 }
 
 /// Per-request tool name aliases, shared by the catalog and replayed calls.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct ToolNames {
     used: BTreeSet<String>,
     wire_to_kiro: BTreeMap<String, String>,
