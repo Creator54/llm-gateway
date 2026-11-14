@@ -11,7 +11,10 @@ provider at the parity recorder:
 
 ## Request
 
-    POST https://opencode.ai/zen/v1/chat/completions
+    POST https://opencode.ai/inference/openai/v1/chat/completions
+
+This is the live URL seen through a TLS proxy (the CLI honors `HTTPS_PROXY`
+and `NODE_EXTRA_CA_CERTS`). `/zen/v1/chat/completions` answers the same way.
 
 Headers in wire order:
 
@@ -63,6 +66,30 @@ Free models end in `-free`. The server also has `/zen/v1/models`.
   claims (config value, default `1.19.5`).
 - Pass body fields through from the client. Do not add `temperature`,
   `max_tokens` or `reasoning_effort` defaults that the client did not send.
+
+## Tools and prompts
+
+gw forwards the client's `messages`, `system` and `tools` unchanged and never
+adds the CLI's own agent tools or system prompt. The client runs the tools.
+The CLI's 47 tools belong to its agent loop; its title request sends none,
+so tool-free requests are normal traffic. The server side
+(`packages/console/app/src/lib/inference-proxy.ts:17-48`) only reads the key
+(`public` or empty means anonymous), the client IP and the request id. It does
+not inspect tools or prompts.
+
+Upstream (`~/opencode`, `packages/core/src/session/model-request.ts:281-291`)
+also sends `x-session-affinity`, `X-Session-Id` and `promptCacheKey` (the
+session id without `ses_`); 1.19.5 did not. Match the version gw claims.
+
+## Live test (2026-11-14)
+
+- Direct calls with the exact CLI headers reach the model API. No 403;
+  the request format is accepted.
+- Anonymous quota is per IP and shared with the CLI: after it ran out, both
+  the CLI and direct calls got `429 FreeUsageLimitError` with
+  `Retry-After: 24061`. Unavailable models return `400 Model is unavailable`.
+- One CLI run succeeded after a direct call had already been refused.
+  Unexplained; retest when the quota resets.
 
 ## Unknowns
 
