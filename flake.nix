@@ -34,8 +34,9 @@
             src = opencodex-src;
           };
           headroom = pkgs.callPackage ./nix/headroom.nix { src = headroom-src; };
+          gw = pkgs.callPackage ./nix/gw.nix { };
         in (import ./nix/images.nix { inherit pkgs opencodex headroom; }) // {
-          inherit opencodex headroom;
+          inherit opencodex headroom gw;
           default = pkgs.writeShellApplication {
             name = "llm-gateway";
             runtimeInputs = [ pkgs.podman pkgs.docker-compose pkgs.coreutils ];
@@ -58,6 +59,9 @@
           default = pkgs.mkShellNoCC {
             packages = [ pkgs.just pkgs.git pkgs.podman pkgs.docker-compose pkgs.curl pkgs.wl-clipboard pkgs.xclip ];
             PODMAN_COMPOSE_PROVIDER = "${pkgs.docker-compose}/bin/docker-compose";
+          };
+          rust = pkgs.mkShellNoCC {
+            packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.rust-analyzer ];
           };
         });
     };
