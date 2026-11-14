@@ -79,7 +79,13 @@ build:
 test:
     bash tests/smoke.sh
 
+# Unit tests for the parity harness and the gateway.
+test-unit:
+    bun test tests/parity
+    nix shell nixpkgs#cargo nixpkgs#rustc -c cargo test --manifest-path gw/Cargo.toml
+
 # Build, then test.
 check:
     just build
     just test
+    just test-unit

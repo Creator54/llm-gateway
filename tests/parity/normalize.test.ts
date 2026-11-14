@@ -8,6 +8,7 @@ const record = (overrides: Partial<RecordedRequest> = {}): RecordedRequest => ({
   headers: [['content-type', 'application/json']],
   bodyEncoding: 'utf8',
   body: '{}',
+  bodyTruncated: false,
   ...overrides,
 });
 
@@ -17,12 +18,27 @@ describe('maskVolatile', () => {
     expect(maskVolatile('chatcmpl-abc123def456')).toBe('<id>');
   });
 
-  test('masks timestamps and dates', () => {
+  test('masks iso timestamps and dates anywhere', () => {
     expect(maskVolatile('at 2026-01-02T03:04:05.678Z')).toBe('at <timestamp>');
-    expect(maskVolatile('created 1770000000 expired 1770000000123')).toBe(
-      'created <timestamp> expired <timestamp>',
-    );
     expect(maskVolatile('on 2026-01-02')).toBe('on <date>');
+  });
+
+  test('masks epoch numbers only under timestamp keys', () => {
+    expect(
+      maskVolatile(
+        '{"created":1770000000,"created_at":1770000000123,"expires_at":1770000000,"timestamp":1770000000,"iat":1770000000,"exp":1770000000,"reset_at":1770000000}',
+      ),
+    ).toBe(
+      '{"created":<timestamp>,"created_at":<timestamp>,"expires_at":<timestamp>,"timestamp":<timestamp>,"iat":<timestamp>,"exp":<timestamp>,"reset_at":<timestamp>}',
+    );
+  });
+
+  test('leaves other numbers alone', () => {
+    expect(maskVolatile('{"input_tokens":1770000000,"total":1770000000123}')).toBe(
+      '{"input_tokens":1770000000,"total":1770000000123}',
+    );
+    expect(maskVolatile('count 1770000000')).toBe('count 1770000000');
+    expect(maskVolatile('{"created":"not a number"}')).toBe('{"created":"not a number"}');
   });
 
   test('leaves ordinary text alone', () => {
@@ -31,7 +47,7 @@ describe('maskVolatile', () => {
 });
 
 describe('normalizeRequest', () => {
-  test('masks sensitive headers by default', () => {
+  test('masks sensitive headers by default but keeps content-length', () => {
     const input = record({
       headers: [
         ['authorization', 'Bearer secret'],
@@ -44,7 +60,7 @@ describe('normalizeRequest', () => {
     });
     expect(normalizeRequest(input).headers).toEqual([
       ['authorization', '<masked>'],
-      ['content-length', '<masked>'],
+      ['content-length', '42'],
       ['x-api-key', '<masked>'],
       ['date', '<masked>'],
       ['x-request-id', '<masked>'],
@@ -79,6 +95,28 @@ describe('normalizeRequest', () => {
   test('leaves base64 bodies untouched', () => {
     const input = record({ bodyEncoding: 'base64', body: '//4AgA==' });
     expect(normalizeRequest(input).body).toBe('//4AgA==');
+  });
+
+  test('normalizes the recorded response too', () => {
+    const input = record({
+      response: {
+        status: 200,
+        headers: [['authorization', 'Bearer secret'], ['content-length', '9']],
+        bodyEncoding: 'utf8',
+        body: '{"created_at":1770000000}',
+        bodyTruncated: true,
+      },
+    });
+    expect(normalizeRequest(input).response).toEqual({
+      status: 200,
+      headers: [
+        ['authorization', '<masked>'],
+        ['content-length', '9'],
+      ],
+      bodyEncoding: 'utf8',
+      body: '{"created_at":<timestamp>}',
+      bodyTruncated: true,
+    });
   });
 
   test('is pure', () => {
