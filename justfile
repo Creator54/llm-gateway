@@ -53,27 +53,7 @@ copy-token kind container:
 
 # Fetch both gateway branches and build images.
 build:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p .sources
-    for repo in opencodex headroom; do
-      dir=".sources/$repo"
-      if [[ ! -d "$dir/.git" ]]; then
-        git clone --single-branch --branch gateway "https://github.com/Creator54/$repo.git" "$dir"
-      fi
-      [[ -z "$(git -C "$dir" status --porcelain)" ]] || { echo "Uncommitted changes in $dir" >&2; exit 1; }
-      git -C "$dir" fetch origin gateway
-      git -C "$dir" checkout --detach FETCH_HEAD
-    done
-    ocx=$(git -C .sources/opencodex rev-parse HEAD)
-    headroom=$(git -C .sources/headroom rev-parse HEAD)
-    ocx_image="creator54/llm-gateway:ocx-$ocx"
-    headroom_image="creator54/llm-gateway:headroom-$headroom"
-    podman build --format docker --target runtime --label "org.opencontainers.image.revision=$ocx" -t "$ocx_image" .sources/opencodex
-    podman build --format docker --target runtime-slim --build-arg HEADROOM_EXTRAS=proxy,code \
-      --build-arg "HEADROOM_BUILD_VERSION=source-build+g$headroom" \
-      --label "org.opencontainers.image.revision=$headroom" -t "$headroom_image" .sources/headroom
-    printf 'OCX_IMAGE=%s\nHEADROOM_IMAGE=%s\n' "$ocx_image" "$headroom_image" > .env
+    nix build .#gw --no-link
 
 # Test with a fake provider, never existing credentials.
 test:
@@ -82,7 +62,7 @@ test:
 # Unit tests for the parity harness and the gateway.
 test-unit:
     bun test tests/parity
-    nix shell nixpkgs#cargo nixpkgs#rustc -c cargo test --manifest-path gw/Cargo.toml
+    nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy nixpkgs#rustfmt -c sh -c 'cd gw && cargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings'
 
 # Build, then test.
 check:
