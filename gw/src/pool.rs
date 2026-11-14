@@ -1,38 +1,42 @@
 //! Accounts per provider: which one serves a request, and which are cooling down.
 
 use crate::provider::Failure;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Sessions kept before the oldest is dropped.
-const MAX_SESSIONS: usize = 10_000;
+/// Shortest cooldown, so a provider asking for zero cannot spin a retry loop.
+const MIN_COOLDOWN: Duration = Duration::from_secs(1);
 /// Cooldown for a rate limit that came without `Retry-After`.
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 /// Cooldown for an exhausted plan quota with no reset time.
 const QUOTA_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 /// Cooldown after a rejected credential: long enough to stop a retry storm, short enough to recover.
 const AUTH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// Sessions untouched for this long are dropped.
+const SESSION_IDLE: Duration = Duration::from_secs(60 * 60);
+/// Idle sweeps run at most once per interval, keeping the insert path cheap.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// Why an account is cooling down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    /// Provider said slow down.
     RateLimited,
-    /// Plan quota is used up.
     Quota,
-    /// Credential was rejected.
     Auth,
 }
 
 /// What one attempt on an account means for that account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The account worked.
     Success,
     /// 429; cool it down for `retry_after` or a minute.
-    RateLimited { retry_after: Option<Duration> },
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
     /// Quota used up; cool it down until `reset_after` or an hour.
-    Quota { reset_after: Option<Duration> },
+    Quota {
+        reset_after: Option<Duration>,
+    },
     /// Credential rejected; cool it down for five minutes.
     Auth,
 }
@@ -73,8 +77,8 @@ struct Session {
     accounts: Vec<(String, String)>,
     /// Combo to the target index the session settled on, and how many requests kept it.
     targets: Vec<(String, usize, u16)>,
-    /// Insertion order; an entry is stale once a newer session reuses the same name.
-    seq: u64,
+    /// Last time a request used the session; idle sessions are dropped on insert.
+    seen: Instant,
 }
 
 /// Usable accounts per provider, plus what each session is using.
@@ -82,12 +86,21 @@ struct Session {
 pub struct Pool {
     providers: HashMap<String, Vec<AccountState>>,
     sessions: HashMap<String, Session>,
-    /// Session insertions in order, oldest first, for bounded memory.
-    order: VecDeque<(u64, String)>,
-    /// Bumped for every assignment and every session insertion.
+    /// Bumped for every assignment.
     counter: u64,
     /// Bumped for every new session that needs a rotating start (combos use it).
     rotation: u64,
+    /// When the session map was last swept for idle entries.
+    swept: Option<Instant>,
+}
+
+/// An account as the account commands report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub id: String,
+    pub paused: bool,
+    /// Cooldown end and reason, when the account is cooling down.
+    pub cooldown: Option<(Instant, Reason)>,
 }
 
 impl Pool {
@@ -132,8 +145,15 @@ impl Pool {
     }
 
     /// Remember the combo target a session settled on; `reuses` counts the requests that kept it.
-    pub fn set_session_target(&mut self, session: &str, combo: &str, index: usize, reuses: u16) {
-        let entry = self.session_or_insert(session);
+    pub fn set_session_target(
+        &mut self,
+        session: &str,
+        combo: &str,
+        index: usize,
+        reuses: u16,
+        now: Instant,
+    ) {
+        let entry = self.session_or_insert(session, now);
         match entry.targets.iter_mut().find(|(name, _, _)| name == combo) {
             Some(slot) => {
                 slot.1 = index;
@@ -194,21 +214,54 @@ impl Pool {
         // A pin is one request's choice; only an automatic pick moves the session.
         if pinned.is_none() {
             if let Some(account) = &chosen {
-                self.bind(session, provider, account);
+                self.bind(session, provider, account, now);
             }
+        } else if let Some(entry) = self.sessions.get_mut(session) {
+            entry.seen = now;
         }
         chosen
     }
 
-    /// Record how an attempt on an account went.
-    pub fn report(&mut self, provider: &str, account: &str, outcome: Outcome, now: Instant) {
+    /// Accounts of a provider with their paused and cooldown state.
+    pub fn accounts(&self, provider: &str) -> Vec<AccountInfo> {
+        self.providers
+            .get(provider)
+            .map(|states| {
+                states
+                    .iter()
+                    .map(|state| AccountInfo {
+                        id: state.id.clone(),
+                        paused: state.paused,
+                        cooldown: state.cooldown,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drop an account's cooldown so it is tried again; unknown accounts are ignored.
+    pub fn clear_cooldown(&mut self, provider: &str, account: &str) {
+        if let Some(state) = self.state_mut(provider, account) {
+            state.cooldown = None;
+        }
+    }
+
+    /// Record how an attempt on an account went; false when the account is unknown.
+    pub fn report(
+        &mut self,
+        provider: &str,
+        account: &str,
+        outcome: Outcome,
+        now: Instant,
+    ) -> bool {
         let tick = self.bump();
         let cooldown = match outcome {
             Outcome::Success => {
-                if let Some(state) = self.state_mut(provider, account) {
-                    state.assigned = tick;
-                }
-                return;
+                let Some(state) = self.state_mut(provider, account) else {
+                    return false;
+                };
+                state.assigned = tick;
+                return true;
             }
             Outcome::RateLimited { retry_after } => (
                 retry_after.unwrap_or(RATE_LIMIT_COOLDOWN),
@@ -219,9 +272,12 @@ impl Pool {
             }
             Outcome::Auth => (AUTH_COOLDOWN, Reason::Auth),
         };
-        if let Some(state) = self.state_mut(provider, account) {
-            state.cooldown = Some((now + cooldown.0, cooldown.1));
-        }
+        let Some(state) = self.state_mut(provider, account) else {
+            return false;
+        };
+        // A provider may send `Retry-After: 0`; a zero cooldown would retry forever.
+        state.cooldown = Some((now + cooldown.0.max(MIN_COOLDOWN), cooldown.1));
+        true
     }
 
     /// Soonest time an account could serve again, when none is usable now.
@@ -258,8 +314,8 @@ impl Pool {
         self.counter
     }
 
-    fn bind(&mut self, session: &str, provider: &str, account: &str) {
-        let entry = self.session_or_insert(session);
+    fn bind(&mut self, session: &str, provider: &str, account: &str, now: Instant) {
+        let entry = self.session_or_insert(session, now);
         match entry.accounts.iter_mut().find(|(name, _)| name == provider) {
             Some(slot) => slot.1 = account.to_owned(),
             None => entry
@@ -268,34 +324,29 @@ impl Pool {
         }
     }
 
-    fn session_or_insert(&mut self, session: &str) -> &mut Session {
+    fn session_or_insert(&mut self, session: &str, now: Instant) -> &mut Session {
         if !self.sessions.contains_key(session) {
-            if self.sessions.len() >= MAX_SESSIONS {
-                self.evict_oldest();
+            let due = self.swept.is_none_or(|last| now >= last + SWEEP_EVERY);
+            if due {
+                self.sessions
+                    .retain(|_, entry| now.saturating_duration_since(entry.seen) <= SESSION_IDLE);
+                self.swept = Some(now);
             }
-            let seq = self.bump();
             self.sessions.insert(
                 session.to_owned(),
                 Session {
                     accounts: Vec::new(),
                     targets: Vec::new(),
-                    seq,
+                    seen: now,
                 },
             );
-            self.order.push_back((seq, session.to_owned()));
         }
-        self.sessions
+        let entry = self
+            .sessions
             .get_mut(session)
-            .expect("session was just inserted")
-    }
-
-    fn evict_oldest(&mut self) {
-        while let Some((seq, session)) = self.order.pop_front() {
-            if self.sessions.get(&session).is_some_and(|e| e.seq == seq) {
-                self.sessions.remove(&session);
-                return;
-            }
-        }
+            .expect("session was just inserted");
+        entry.seen = now;
+        entry
     }
 }
 
@@ -431,27 +482,157 @@ mod tests {
     }
 
     #[test]
-    fn session_map_is_bounded() {
+    fn session_map_drops_idle_sessions() {
         let mut pool = pool_of("p", &["a1"]);
         let now = Instant::now();
-        for index in 0..MAX_SESSIONS + 10 {
-            pool.pick("p", &format!("s{index}"), None, now);
-        }
-        assert_eq!(pool.sessions.len(), MAX_SESSIONS);
-        assert!(pool.session_target("s0", "c").is_none());
-        assert!(pool
-            .sessions
-            .contains_key(&format!("s{}", MAX_SESSIONS + 9)));
+        pool.pick("p", "old", None, now);
+        pool.pick("p", "fresh", None, now + Duration::from_secs(10));
+        // The sweep runs on the next insert, once the interval has passed.
+        let later = now + SESSION_IDLE + SWEEP_EVERY;
+        pool.pick("p", "new", None, later);
+        assert!(!pool.sessions.contains_key("old"));
+        assert!(!pool.sessions.contains_key("fresh"));
+        assert!(pool.sessions.contains_key("new"));
     }
 
     #[test]
     fn combo_targets_are_remembered_per_session() {
+        let now = Instant::now();
         let mut pool = Pool::new();
         assert_eq!(pool.session_target("s1", "c"), None);
-        pool.set_session_target("s1", "c", 2, 1);
+        pool.set_session_target("s1", "c", 2, 1, now);
         assert_eq!(pool.session_target("s1", "c"), Some((2, 1)));
-        pool.set_session_target("s1", "c", 3, 2);
+        pool.set_session_target("s1", "c", 3, 2, now);
         assert_eq!(pool.session_target("s1", "c"), Some((3, 2)));
         assert_eq!(pool.session_target("s1", "other"), None);
+    }
+
+    #[test]
+    fn report_reports_whether_it_recorded_anything() {
+        let mut pool = pool_of("p", &["a1"]);
+        let now = Instant::now();
+        assert!(pool.report("p", "a1", Outcome::Auth, now));
+        assert!(pool.report("p", "a1", Outcome::Success, now));
+        assert!(!pool.report("p", "missing", Outcome::Auth, now));
+        assert!(!pool.report("nope", "a1", Outcome::Success, now));
+    }
+
+    #[test]
+    fn accounts_are_listed_with_their_state() {
+        let mut pool = pool_of("p", &["a1", "a2"]);
+        let now = Instant::now();
+        pool.set_paused("p", "a2", true);
+        pool.report("p", "a1", Outcome::Auth, now);
+        let listed = pool.accounts("p");
+        assert_eq!(
+            listed,
+            [
+                AccountInfo {
+                    id: "a1".into(),
+                    paused: false,
+                    cooldown: Some((now + AUTH_COOLDOWN, Reason::Auth)),
+                },
+                AccountInfo {
+                    id: "a2".into(),
+                    paused: true,
+                    cooldown: None,
+                },
+            ]
+        );
+        assert!(pool.accounts("missing").is_empty());
+    }
+
+    #[test]
+    fn clearing_a_cooldown_makes_the_account_usable() {
+        let mut pool = pool_of("p", &["a1"]);
+        let now = Instant::now();
+        pool.report("p", "a1", Outcome::Auth, now);
+        assert_eq!(pool.pick("p", "s1", None, now), None);
+        pool.clear_cooldown("p", "a1");
+        assert!(pool.accounts("p")[0].cooldown.is_none());
+        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn failure_maps_to_account_state() {
+        let wait = Duration::from_secs(7);
+        let fatal = Failure::Fatal {
+            status: http::StatusCode::BAD_REQUEST,
+            body: bytes::Bytes::new(),
+        };
+        let cases = [
+            (
+                Failure::RateLimited {
+                    retry_after: Some(wait),
+                },
+                Some(Outcome::RateLimited {
+                    retry_after: Some(wait),
+                }),
+            ),
+            (
+                Failure::RateLimited { retry_after: None },
+                Some(Outcome::RateLimited { retry_after: None }),
+            ),
+            (
+                Failure::Quota {
+                    reset_after: Some(wait),
+                },
+                Some(Outcome::Quota {
+                    reset_after: Some(wait),
+                }),
+            ),
+            (
+                Failure::Quota { reset_after: None },
+                Some(Outcome::Quota { reset_after: None }),
+            ),
+            (Failure::Auth, Some(Outcome::Auth)),
+            (Failure::Retryable, None),
+            (fatal, None),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(Outcome::from_failure(&failure), expected, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn zero_retry_after_still_cools_down() {
+        let mut pool = pool_of("p", &["a1"]);
+        let now = Instant::now();
+        pool.report(
+            "p",
+            "a1",
+            Outcome::RateLimited {
+                retry_after: Some(Duration::ZERO),
+            },
+            now,
+        );
+        assert_eq!(pool.pick("p", "s1", None, now), None);
+        assert_eq!(pool.earliest_free("p", None, now), Some(now + MIN_COOLDOWN));
+        assert_eq!(
+            pool.pick("p", "s1", None, now + MIN_COOLDOWN).as_deref(),
+            Some("a1")
+        );
+    }
+
+    #[test]
+    fn pinned_account_that_is_cooling_is_not_picked() {
+        let mut pool = pool_of("p", &["a1", "a2"]);
+        let now = Instant::now();
+        pool.report(
+            "p",
+            "a1",
+            Outcome::Quota {
+                reset_after: Some(Duration::from_secs(120)),
+            },
+            now,
+        );
+        assert_eq!(pool.pick("p", "s1", Some("a1"), now), None);
+        assert_eq!(
+            pool.earliest_free("p", Some("a1"), now),
+            Some(now + Duration::from_secs(120))
+        );
+        // The other account is free, so an unpinned pick works and nothing is pending.
+        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a2"));
+        assert_eq!(pool.earliest_free("p", None, now), None);
     }
 }
