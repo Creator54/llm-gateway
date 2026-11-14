@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -20,8 +21,15 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::{
-    cache, config::Config, creds, journal::Journal, models, provider, providers, route,
-    store::Store, tidy, tokens, translate::SseParser, usage,
+    cache, combo,
+    config::Config,
+    creds,
+    journal::Journal,
+    models, pool, provider, providers, route,
+    store::Store,
+    tidy, tokens,
+    translate::{self, SseParser},
+    usage,
 };
 
 /// How long in-flight requests may keep the process alive after a shutdown signal.
@@ -31,6 +39,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 const MAX_JSON_REPLY: u64 = 8 << 20;
 
 const TRANSFORMS: &str = "x-gw-transforms";
+
+/// Most attempts one request makes, whatever the account count.
+const MAX_ATTEMPTS: usize = 5;
+
+/// Provider whose free tier serves requests with no stored account.
+const ANONYMOUS_PROVIDER: &str = "opencode";
+/// Account id the free tier is pooled and reported under.
+const ANONYMOUS_ACCOUNT: &str = "anonymous";
 
 /// Run the gateway on `cfg.listen` until SIGINT or SIGTERM.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -114,16 +130,18 @@ struct Gateway {
     max_body: usize,
     /// Where accounts and the usage journal live; adapters read credentials from here.
     state_dir: std::path::PathBuf,
-    /// Per-provider endpoint overrides.
-    endpoints: std::collections::BTreeMap<String, String>,
+    /// One adapter per provider name, built once.
+    adapters: BTreeMap<String, Arc<dyn provider::Provider>>,
+    /// Accounts per provider: cool-downs and session stickiness.
+    pool: Mutex<pool::Pool>,
     cache: cache::Options,
     tidy: tidy::Options,
     /// Learned provider quirks; `None` when the store could not be opened.
     store: Option<Arc<Store>>,
     /// `None` when the state dir was unusable; requests still serve, rows are skipped.
     journal: Option<Arc<Journal>>,
-    /// Combos from the config, so `/v1/models` can name what this gateway routes.
-    combos: Vec<crate::combo::Combo>,
+    /// Combos from the config, so a route can expand to its targets.
+    combos: BTreeMap<String, combo::Combo>,
     /// Prefix hash and cache read of the last reply, for the cache-break detector.
     prefix: Arc<Mutex<Option<(u64, u64)>>>,
 }
@@ -158,6 +176,26 @@ impl Gateway {
         let journal = store
             .as_ref()
             .map(|store| Arc::new(Journal::start(Arc::clone(store))));
+        let mut adapters: BTreeMap<String, Arc<dyn provider::Provider>> = BTreeMap::new();
+        for name in providers::NAMES {
+            let base = cfg.endpoints.get(name).cloned();
+            let adapter: Box<dyn provider::Provider> = match name {
+                "opencode" => Box::new(providers::opencode::Opencode::new(client.clone(), base)),
+                "openai" => Box::new(providers::openai::OpenAi::new(client.clone(), base)),
+                "anthropic" => Box::new(providers::anthropic::Anthropic::new(client.clone(), base)),
+                "antigravity" => Box::new(providers::antigravity::Antigravity::new(
+                    client.clone(),
+                    base,
+                )),
+                "command-code" => Box::new(providers::command_code::CommandCode::new(
+                    client.clone(),
+                    base,
+                )),
+                "kiro" => Box::new(providers::kiro::Kiro::new(client.clone(), base)),
+                other => anyhow::bail!("{other} has no adapter"),
+            };
+            adapters.insert(name.to_owned(), Arc::from(adapter));
+        }
         Ok(Self {
             client,
             fallback: cfg.fallback.clone(),
@@ -168,8 +206,21 @@ impl Gateway {
             tidy: cfg.tidy_options(),
             store,
             journal,
-            combos: cfg.combos.values().cloned().collect(),
-            endpoints: cfg.endpoints.clone(),
+            adapters,
+            pool: Mutex::new(pool::Pool::new()),
+            combos: cfg
+                .combos
+                .iter()
+                .map(|(name, combo)| {
+                    (
+                        name.clone(),
+                        combo::Combo {
+                            name: name.clone(),
+                            ..combo.clone()
+                        },
+                    )
+                })
+                .collect(),
             prefix: Arc::new(Mutex::new(None)),
         })
     }
@@ -408,7 +459,7 @@ impl Gateway {
     /// Models this gateway can route, or empty when the config names none.
     fn model_list(&self) -> Vec<models::Entry> {
         let mut entries = Vec::new();
-        for target in self.combos.iter().flat_map(|combo| &combo.targets) {
+        for target in self.combos.values().flat_map(|combo| &combo.targets) {
             let id = format!("{}/{}", target.provider, target.model);
             if !entries.iter().any(|entry: &models::Entry| entry.id == id) {
                 entries.push(models::Entry {
@@ -422,7 +473,7 @@ impl Gateway {
         if entries.is_empty() {
             return entries;
         }
-        let names: Vec<String> = self.combos.iter().map(|c| c.name.clone()).collect();
+        let names: Vec<String> = self.combos.keys().cloned().collect();
         models::with_builtins(entries, &names)
     }
 
@@ -479,8 +530,8 @@ impl Gateway {
         self.reply(upstream, plan, started)
     }
 
-    /// Pass the upstream reply through untouched except for the transforms header.
-    /// Serve a request through a native adapter when the route names one.
+    /// Serve a request through an adapter: pick an account, fail over to the next
+    /// account or combo target, and only then give up.
     ///
     /// Returns `None` when no adapter owns the provider, so the caller falls back
     /// to plain forwarding.
@@ -492,57 +543,330 @@ impl Gateway {
             "/v1/chat/completions" => provider::Inbound::Chat,
             _ => return None,
         };
+        let shape = wire(inbound);
         let info = RequestInfo::of(&plan.body);
-        // Routing already resolved `provider/model`; an unqualified model has no adapter.
-        if info.provider.is_empty() || info.provider == "combo" || info.provider == "auto" {
-            return None;
+        let route = self.route(&info)?;
+        let creds = match creds::Store::load(&self.state_dir) {
+            Ok(creds) => creds,
+            Err(e) => {
+                tracing::warn!(error = %e, "credential store is unreadable");
+                return Some(error_reply(
+                    shape,
+                    StatusCode::BAD_GATEWAY,
+                    "credential store is unreadable",
+                    None,
+                ));
+            }
+        };
+        self.sync(&creds);
+        let session = info.session.clone();
+        self.restore(&session, &route);
+        let budget = self.budget(&route);
+        let stream = stream_requested(&plan.body);
+        let mut last: Option<provider::Failure> = None;
+        let mut tried: Vec<(String, String)> = Vec::new();
+        let mut tries = 0;
+        while tries < budget {
+            let next = match self.step(&route, &session, &tried) {
+                Some(next) => next,
+                None if tried.is_empty() && self.free_tier(&route) => {
+                    (route.targets[0].clone(), ANONYMOUS_ACCOUNT.to_owned(), 0)
+                }
+                None => break,
+            };
+            let (target, id, index) = next;
+            tries += 1;
+            let Some(adapter) = self.adapters.get(&target.provider) else {
+                continue;
+            };
+            let Some(account) = Self::declared(&creds, &target.provider, &id) else {
+                continue;
+            };
+            let request = provider::Request {
+                inbound,
+                model: target.model.clone(),
+                headers: plan.headers.clone(),
+                body: plan.body.clone(),
+                stream,
+                session: info.session.clone(),
+            };
+            let outcome = self
+                .attempt(adapter.as_ref(), &request, &target.provider, &account)
+                .await;
+            match outcome {
+                AttemptResult::Served(reply) => {
+                    self.remember(&session, &route, &target, &id, index);
+                    return Some(self.adapter_reply(reply, plan.clone(), started));
+                }
+                // The same account must not be tried twice in one request.
+                AttemptResult::Cooled => tried.push((target.provider.clone(), id)),
+                AttemptResult::Stop(failure @ provider::Failure::Fatal { .. }) => {
+                    return Some(failure_reply(shape, failure));
+                }
+                AttemptResult::Stop(failure) => {
+                    tried.push((target.provider.clone(), id));
+                    last = Some(failure);
+                }
+            }
         }
-        let adapter: Box<dyn provider::Provider> = match info.provider.as_str() {
-            "opencode" => Box::new(providers::opencode::Opencode::new(
-                self.client.clone(),
-                self.endpoints.get(&info.provider).cloned(),
-            )),
-            _ => return None,
-        };
-        let account = match self.account(&info.provider) {
-            Ok(account) => account,
-            Err(response) => return Some(*response),
-        };
-        let request = provider::Request {
-            inbound,
-            model: info.model.clone(),
-            headers: plan.headers.clone(),
-            body: plan.body.clone(),
-            stream: stream_requested(&plan.body),
-            session: session_key(&plan.body),
-        };
-        let reply = match adapter.send(&request, &account).await {
-            Ok(reply) => reply,
-            Err(failure) => return Some(failure_response(failure)),
-        };
-        Some(self.adapter_reply(reply, plan.clone(), started))
+        Some(self.exhausted(shape, &route, last))
     }
 
-    /// The account to bill for `provider`; the free tier needs none.
-    fn account(&self, provider: &str) -> Result<provider::Account, Box<Response>> {
-        let store = creds::Store::load(&self.state_dir).map_err(|_| {
-            Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                "credential store is unreadable",
-            ))
-        })?;
-        match store.accounts(provider).into_iter().next() {
-            Some(entry) => Ok(provider::Account::from(&entry)),
-            // The adapter sends the anonymous marker when there is no key.
-            None if provider == "opencode" => Ok(provider::Account {
-                id: "anonymous".to_owned(),
+    /// The pool, still usable after a panic elsewhere in a request.
+    fn lock_pool(&self) -> std::sync::MutexGuard<'_, pool::Pool> {
+        self.pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Provider models a routed request may try, in order.
+    fn route(&self, info: &RequestInfo) -> Option<Route> {
+        if info.provider == "combo" {
+            let combo = self.combos.get(&info.model)?.clone();
+            let targets: Vec<combo::Target> = combo
+                .targets
+                .iter()
+                .filter(|target| self.adapters.contains_key(&target.provider))
+                .cloned()
+                .collect();
+            if targets.is_empty() {
+                return None;
+            }
+            let combo = combo::Combo {
+                targets: targets.clone(),
+                ..combo
+            };
+            return Some(Route {
+                targets,
+                combo: Some(combo),
+                pin: None,
+            });
+        }
+        // `auto` and unqualified models stay with the forwarding fallback.
+        if !self.adapters.contains_key(&info.provider) {
+            return None;
+        }
+        Some(Route {
+            targets: vec![combo::Target {
+                provider: info.provider.clone(),
+                model: info.model.clone(),
+                weight: 1,
+            }],
+            combo: None,
+            pin: (info.account != "auto").then(|| info.account.clone()),
+        })
+    }
+
+    /// Mirror the credential snapshot into the pool so picks and cool-downs see it.
+    fn sync(&self, creds: &creds::Store) {
+        let mut pool = self.lock_pool();
+        for entry in creds.all() {
+            pool.add(&entry.provider, &entry.id);
+            pool.set_paused(&entry.provider, &entry.id, entry.paused);
+        }
+    }
+
+    /// The credential snapshot's copy of one account.
+    fn declared(creds: &creds::Store, provider: &str, id: &str) -> Option<provider::Account> {
+        if id == ANONYMOUS_ACCOUNT {
+            return Some(provider::Account {
+                id: ANONYMOUS_ACCOUNT.to_owned(),
                 credential: provider::Credential::None,
                 extra: Default::default(),
-            }),
-            None => Err(Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                "no account for this provider",
-            ))),
+            });
+        }
+        creds
+            .get(provider, id)
+            .map(|entry| provider::Account::from(&entry))
+    }
+
+    /// The next account to try, skipping ones this request already failed on.
+    fn step(
+        &self,
+        route: &Route,
+        session: &str,
+        tried: &[(String, String)],
+    ) -> Option<(combo::Target, String, usize)> {
+        let now = Instant::now();
+        let mut pool = self.lock_pool();
+        let seen = |provider: &str, account: &str| {
+            tried
+                .iter()
+                .any(|(failed, id)| failed == provider && id == account)
+        };
+        match &route.combo {
+            Some(combo) => {
+                let mut attempts = combo.attempt(&mut pool, session, now);
+                for (target, id) in attempts.by_ref() {
+                    if seen(&target.provider, &id) {
+                        continue;
+                    }
+                    let index = route.targets.iter().position(|item| {
+                        item.provider == target.provider && item.model == target.model
+                    })?;
+                    return Some((target.clone(), id, index));
+                }
+                None
+            }
+            None => {
+                let target = route.targets.first()?;
+                let id = pool.pick(&target.provider, session, route.pin.as_deref(), now)?;
+                if seen(&target.provider, &id) {
+                    return None;
+                }
+                Some((target.clone(), id, 0))
+            }
+        }
+    }
+
+    /// Attempts this route may make: one per account, capped.
+    fn budget(&self, route: &Route) -> usize {
+        let pool = self.lock_pool();
+        let accounts: usize = route
+            .targets
+            .iter()
+            .map(|target| pool.accounts(&target.provider).len())
+            .sum();
+        accounts.clamp(1, MAX_ATTEMPTS)
+    }
+
+    /// Whether the route may use the free tier, which needs no stored account.
+    fn free_tier(&self, route: &Route) -> bool {
+        route.combo.is_none()
+            && route.pin.is_none()
+            && route
+                .targets
+                .first()
+                .is_some_and(|target| target.provider == ANONYMOUS_PROVIDER)
+            && self.lock_pool().accounts(ANONYMOUS_PROVIDER).is_empty()
+    }
+
+    /// Send once and record how the account fared, before the client sees a byte.
+    async fn attempt(
+        &self,
+        adapter: &dyn provider::Provider,
+        request: &provider::Request,
+        provider_name: &str,
+        account: &provider::Account,
+    ) -> AttemptResult {
+        let now = Instant::now();
+        match adapter.send(request, account).await {
+            Ok(reply) => {
+                self.lock_pool()
+                    .report(provider_name, &account.id, pool::Outcome::Success, now);
+                AttemptResult::Served(reply)
+            }
+            Err(failure) => match pool::Outcome::from_failure(&failure) {
+                Some(outcome) => {
+                    self.lock_pool()
+                        .report(provider_name, &account.id, outcome, now);
+                    AttemptResult::Cooled
+                }
+                None => AttemptResult::Stop(failure),
+            },
+        }
+    }
+
+    /// Put the session back on the target and account the store remembered.
+    fn restore(&self, session: &str, route: &Route) {
+        // A pinned route overrides whatever the session used before.
+        if session.is_empty() || route.pin.is_some() {
+            return;
+        }
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let Ok(Some(row)) = store.get_session(session) else {
+            return;
+        };
+        let Some(index) = route
+            .targets
+            .iter()
+            .position(|target| format!("{}/{}", target.provider, target.model) == row.target)
+        else {
+            return;
+        };
+        let target = &route.targets[index];
+        let now = Instant::now();
+        let mut pool = self.lock_pool();
+        if !pool.bind_session(&target.provider, session, &row.account, now) {
+            return;
+        }
+        if let Some(combo) = &route.combo {
+            pool.set_session_target(session, &combo.name, index, 1, now);
+        }
+    }
+
+    /// Keep the session on the target and account that just served it.
+    fn remember(
+        &self,
+        session: &str,
+        route: &Route,
+        target: &combo::Target,
+        account: &str,
+        index: usize,
+    ) {
+        if let Some(combo) = &route.combo {
+            let now = Instant::now();
+            let mut pool = self.lock_pool();
+            let reuses = match pool.session_target(session, &combo.name) {
+                Some((kept, reuses)) if kept == index => reuses.saturating_add(1),
+                _ => 1,
+            };
+            pool.set_session_target(session, &combo.name, index, reuses, now);
+        }
+        if session.is_empty() {
+            return;
+        }
+        if let Some(store) = self.store.as_deref() {
+            let key = format!("{}/{}", target.provider, target.model);
+            if let Err(e) = store.put_session(session, &key, account) {
+                tracing::debug!(error = %e, "session pin not saved");
+            }
+        }
+    }
+
+    /// Nothing replied: say how long the route stays closed, or that it has no account.
+    fn exhausted(
+        &self,
+        shape: translate::Inbound,
+        route: &Route,
+        last: Option<provider::Failure>,
+    ) -> Response {
+        let now = Instant::now();
+        let soonest = {
+            let pool = self.lock_pool();
+            route
+                .targets
+                .iter()
+                .filter_map(|target| {
+                    pool.earliest_free(&target.provider, route.pin.as_deref(), now)
+                })
+                .min()
+        };
+        match (soonest, last) {
+            (Some(until), _) => error_reply(
+                shape,
+                StatusCode::TOO_MANY_REQUESTS,
+                "every account for this route is cooling down",
+                Some(until.saturating_duration_since(now)),
+            ),
+            (None, Some(failure)) => failure_reply(shape, failure),
+            (None, None) => {
+                let known = {
+                    let pool = self.lock_pool();
+                    route
+                        .targets
+                        .iter()
+                        .any(|target| !pool.accounts(&target.provider).is_empty())
+                };
+                let message = if known {
+                    "no usable account for this provider"
+                } else {
+                    "no account for this provider"
+                };
+                error_reply(shape, StatusCode::BAD_GATEWAY, message, None)
+            }
         }
     }
 
@@ -972,9 +1296,59 @@ fn stream_requested(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// One routed request: the provider models it may try and how it was pinned.
+struct Route {
+    targets: Vec<combo::Target>,
+    /// Set when the route was a combo, so the session can stay on its target.
+    combo: Option<combo::Combo>,
+    /// Account the route pinned with `provider@account/model`.
+    pin: Option<String>,
+}
+
+/// How one send on one account ended.
+enum AttemptResult {
+    Served(provider::Reply),
+    /// The account is cooling down now; the next pick skips it.
+    Cooled,
+    /// Not the account's fault: the route moves on to its next target.
+    Stop(provider::Failure),
+}
+
+/// The error envelope of the protocol `inbound` belongs to.
+fn wire(inbound: provider::Inbound) -> translate::Inbound {
+    match inbound {
+        provider::Inbound::Chat => translate::Inbound::Chat,
+        provider::Inbound::Responses => translate::Inbound::Responses,
+        provider::Inbound::Messages => translate::Inbound::Messages,
+    }
+}
+
+/// An error in the inbound protocol's shape, with `Retry-After` when known.
+fn error_reply(
+    shape: translate::Inbound,
+    status: StatusCode,
+    message: &str,
+    retry: Option<Duration>,
+) -> Response {
+    let body = translate::Error {
+        status: status.as_u16(),
+        message: message.to_owned(),
+    }
+    .to_body(shape);
+    let mut response = (status, Json(body)).into_response();
+    if let Some(wait) = retry {
+        let secs = wait.as_millis().div_ceil(1000).max(1);
+        if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
 /// An adapter failure as the client's status, before any byte was streamed.
-fn failure_response(failure: provider::Failure) -> Response {
+fn failure_reply(shape: translate::Inbound, failure: provider::Failure) -> Response {
     match failure {
+        // The upstream's own error body already has the shape the client expects.
         provider::Failure::Fatal { status, body } => {
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
@@ -984,18 +1358,30 @@ fn failure_response(failure: provider::Failure) -> Response {
             );
             response
         }
-        provider::Failure::Auth => {
-            json_error(StatusCode::UNAUTHORIZED, "upstream rejected the account")
-        }
-        provider::Failure::Quota { .. } => {
-            json_error(StatusCode::TOO_MANY_REQUESTS, "provider quota exhausted")
-        }
-        provider::Failure::RateLimited { .. } => {
-            json_error(StatusCode::TOO_MANY_REQUESTS, "provider rate limited")
-        }
-        provider::Failure::Retryable => {
-            json_error(StatusCode::BAD_GATEWAY, "upstream request failed")
-        }
+        provider::Failure::Auth => error_reply(
+            shape,
+            StatusCode::UNAUTHORIZED,
+            "upstream rejected the account",
+            None,
+        ),
+        provider::Failure::Quota { reset_after } => error_reply(
+            shape,
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider quota exhausted",
+            reset_after,
+        ),
+        provider::Failure::RateLimited { retry_after } => error_reply(
+            shape,
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider rate limited",
+            retry_after,
+        ),
+        provider::Failure::Retryable => error_reply(
+            shape,
+            StatusCode::BAD_GATEWAY,
+            "upstream request failed",
+            None,
+        ),
     }
 }
 
