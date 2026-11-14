@@ -3,6 +3,9 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
+    fs::{DirBuilder, OpenOptions},
+    io::ErrorKind,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,6 +14,8 @@ use std::{
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Negative means KiB; 512 KiB is plenty and keeps the process small.
 const CACHE_SIZE_KIB: i32 = -512;
+/// Sessions and usage rows older than this go when the store is opened.
+const RETENTION_DAYS: u64 = 30;
 
 /// Applied in order; `user_version` records how many have run.
 const MIGRATIONS: &[&str] = &[r#"
@@ -107,31 +112,51 @@ pub struct Session {
     pub updated_at: i64,
 }
 
-/// Per provider/model totals over a time window.
+/// Per provider/model/account totals over a time window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSummary {
     pub provider: String,
     pub model: String,
+    pub account: String,
     pub requests: u64,
+    /// Requests with `status >= 400`.
+    pub errors: u64,
     pub input: u64,
     pub cached_read: u64,
     pub cache_write: u64,
     pub output: u64,
-    /// `cached_read / (input + cached_read + cache_write)`, 0 when there was no input.
+    /// `cached_read / (input + cached_read + cache_write)`, 0 without input and
+    /// clamped to 1 because providers may report cached tokens inside `input`.
     pub cache_read_share: f64,
 }
 
 /// Shared SQLite handle. All methods are synchronous; callers use `spawn_blocking`.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Summaries only, so a report cannot queue behind a journal flush.
+    read: Mutex<Connection>,
 }
 
 impl Store {
     /// Open (creating if needed) `<state_dir>/gw.db`.
     pub fn open(state_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("create {}", state_dir.display()))?;
+        create_private_dir(state_dir)?;
         let db = state_dir.join("gw.db");
+        // SQLite would create the file 0644; do it here as 0600 instead.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&db)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", db.display())),
+        }
+        // A db written by an older build may still be 0644.
+        if let Err(e) = std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(error = %e, "could not tighten {}", db.display());
+        }
         let mut conn = Connection::open(&db).with_context(|| format!("open {}", db.display()))?;
 
         let mode: String = conn
@@ -148,14 +173,27 @@ impl Store {
         conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
         migrate(&mut conn)?;
 
-        Ok(Self {
+        let read = Connection::open(&db).with_context(|| format!("open {}", db.display()))?;
+        read.busy_timeout(BUSY_TIMEOUT)?;
+        read.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
+        read.pragma_update(None, "query_only", true)?;
+
+        let store = Self {
             conn: Mutex::new(conn),
-        })
+            read: Mutex::new(read),
+        };
+        store.prune_sessions(RETENTION_DAYS)?;
+        store.prune_usage(RETENTION_DAYS)?;
+        Ok(store)
     }
 
-    /// Take the connection, recovering from a poisoned lock so a panicked caller cannot wedge the gateway.
+    /// Recover from a poisoned lock so a panicked caller cannot wedge the gateway.
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read(&self) -> MutexGuard<'_, Connection> {
+        self.read.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Read a learned fact such as `("anthropic", "claude", "prompt_cache_retention")`.
@@ -217,10 +255,19 @@ impl Store {
 
     /// Delete pins older than `older_than_days` and return how many went.
     pub fn prune_sessions(&self, older_than_days: u64) -> Result<usize> {
-        let cutoff = now_secs() - (older_than_days as i64) * 86_400;
-        Ok(self
-            .conn()
-            .execute("DELETE FROM sessions WHERE updated_at < ?1", [cutoff])?)
+        Ok(self.conn().execute(
+            "DELETE FROM sessions WHERE updated_at < ?1",
+            [cutoff_secs(older_than_days)],
+        )?)
+    }
+
+    /// Delete usage rows older than `older_than_days` and return how many went.
+    /// No VACUUM: WAL reuses the freed pages.
+    pub fn prune_usage(&self, older_than_days: u64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM usage WHERE ts < ?1",
+            [cutoff_secs(older_than_days)],
+        )?)
     }
 
     /// Append one usage row.
@@ -263,39 +310,55 @@ impl Store {
         Ok(())
     }
 
-    /// Totals per provider/model for rows at or after `since_ts`.
+    /// Totals per provider/model/account for rows at or after `since_ts`.
     pub fn usage_summary(&self, since_ts: i64) -> Result<Vec<UsageSummary>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
-            "SELECT provider, model, COUNT(*),
+            "SELECT provider, model, account, COUNT(*), SUM(status >= 400),
                     SUM(input), SUM(cached_read), SUM(cache_write), SUM(output)
              FROM usage
              WHERE ts >= ?1
-             GROUP BY provider, model
-             ORDER BY provider, model",
+             GROUP BY provider, model, account
+             ORDER BY provider, model, account",
         )?;
         let rows = stmt.query_map([since_ts], |r| {
-            let input: i64 = r.get(3)?;
-            let cached_read: i64 = r.get(4)?;
-            let cache_write: i64 = r.get(5)?;
+            let input: i64 = r.get(5)?;
+            let cached_read: i64 = r.get(6)?;
+            let cache_write: i64 = r.get(7)?;
             let total_input = input + cached_read + cache_write;
             Ok(UsageSummary {
                 provider: r.get(0)?,
                 model: r.get(1)?,
-                requests: r.get::<_, i64>(2)? as u64,
+                account: r.get(2)?,
+                requests: r.get::<_, i64>(3)? as u64,
+                errors: r.get::<_, i64>(4)? as u64,
                 input: input as u64,
                 cached_read: cached_read as u64,
                 cache_write: cache_write as u64,
-                output: r.get::<_, i64>(6)? as u64,
+                output: r.get::<_, i64>(8)? as u64,
                 cache_read_share: if total_input == 0 {
                     0.0
                 } else {
-                    cached_read as f64 / total_input as f64
+                    (cached_read as f64 / total_input as f64).min(1.0)
                 },
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+}
+
+fn create_private_dir(dir: &Path) -> Result<()> {
+    match DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("create {}", dir.display())),
+    }
+}
+
+/// Cutoff for retention, saturating so a huge day count cannot wrap around.
+fn cutoff_secs(older_than_days: u64) -> i64 {
+    let secs = older_than_days.saturating_mul(86_400).min(i64::MAX as u64) as i64;
+    now_secs().saturating_sub(secs)
 }
 
 /// Current Unix time in seconds, the unit every timestamp column uses.
@@ -308,6 +371,12 @@ pub fn now_secs() -> i64 {
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     let mut version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version > MIGRATIONS.len() as i64 {
+        bail!(
+            "database schema v{version} is newer than this build (v{})",
+            MIGRATIONS.len()
+        );
+    }
     while (version as usize) < MIGRATIONS.len() {
         let next = version + 1;
         let tx = conn.transaction()?;
@@ -319,26 +388,27 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Temp state dir shared by the tests in this crate.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
+pub(crate) mod testutil {
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct TempDir(PathBuf);
+    pub(crate) struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(label: &str) -> Self {
+        pub(crate) fn new(label: &str) -> Self {
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("gw-store-{label}-{}-{unique}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("gw-{label}-{}-{unique}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -348,6 +418,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::TempDir;
+    use super::*;
 
     fn row(
         ts: i64,
@@ -461,6 +537,110 @@ mod tests {
     }
 
     #[test]
+    fn state_dir_and_db_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("perms");
+        let sub = dir.path().join("state");
+        let store = Store::open(&sub).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let db = sub.join("gw.db");
+        assert_eq!(mode(&sub), 0o700);
+        assert_eq!(mode(&db), 0o600);
+
+        // A db left 0644 by an older build is tightened on the next open.
+        drop(store);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Store::open(&sub).unwrap();
+        assert_eq!(mode(&db), 0o600);
+    }
+
+    #[test]
+    fn refuses_newer_schema() {
+        let dir = TempDir::new("newer");
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store
+                .conn()
+                .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+                .unwrap();
+        }
+        let err = match Store::open(dir.path()) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("newer than this build"), "{err}");
+    }
+
+    #[test]
+    fn usage_summary_counts_errors_per_account() {
+        let dir = TempDir::new("summary");
+        let store = Store::open(dir.path()).unwrap();
+        let now = now_secs();
+
+        let mut ok = row(now - 5, "openai", "m", 10, 0, 0, 1);
+        ok.account = "a1".into();
+        let mut failed = row(now - 5, "openai", "m", 10, 0, 0, 0);
+        failed.account = "a1".into();
+        failed.status = 429;
+        let mut other = row(now - 5, "openai", "m", 10, 0, 0, 1);
+        other.account = "a2".into();
+        for r in [ok, failed, other] {
+            store.append_usage(&r).unwrap();
+        }
+
+        let summary = store.usage_summary(now - 60).unwrap();
+        assert_eq!(summary.len(), 2);
+        let a1 = &summary[0];
+        assert_eq!((a1.account.as_str(), a1.requests, a1.errors), ("a1", 2, 1));
+        let a2 = &summary[1];
+        assert_eq!((a2.account.as_str(), a2.requests, a2.errors), ("a2", 1, 0));
+    }
+
+    #[test]
+    fn prune_usage_drops_old_rows() {
+        let dir = TempDir::new("prune-usage");
+        let store = Store::open(dir.path()).unwrap();
+        let now = now_secs();
+        store
+            .append_usage(&row(now - 40 * 86_400, "openai", "m", 1, 0, 0, 1))
+            .unwrap();
+        store
+            .append_usage(&row(now - 5, "openai", "m", 1, 0, 0, 1))
+            .unwrap();
+
+        assert_eq!(store.prune_usage(30).unwrap(), 1);
+        assert_eq!(store.usage_summary(0).unwrap()[0].requests, 1);
+        // A huge day count must not overflow the cutoff.
+        assert_eq!(store.prune_usage(u64::MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn open_prunes_old_rows() {
+        let dir = TempDir::new("open-prune");
+        {
+            let store = Store::open(dir.path()).unwrap();
+            let old = now_secs() - (RETENTION_DAYS as i64 + 5) * 86_400;
+            store
+                .append_usage(&row(old, "openai", "m", 1, 0, 0, 1))
+                .unwrap();
+            store
+                .append_usage(&row(now_secs(), "openai", "m", 1, 0, 0, 1))
+                .unwrap();
+            store.put_session("old", "t", "a").unwrap();
+            store
+                .conn()
+                .execute("UPDATE sessions SET updated_at = ?1", [old])
+                .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.usage_summary(0).unwrap()[0].requests, 1);
+        assert!(store.get_session("old").unwrap().is_none());
+    }
+
+    #[test]
     fn usage_summary_math() {
         let dir = TempDir::new("usage");
         let store = Store::open(dir.path()).unwrap();
@@ -486,6 +666,7 @@ mod tests {
         let openai = summary.iter().find(|s| s.provider == "openai").unwrap();
         assert_eq!(openai.model, "m");
         assert_eq!(openai.requests, 2);
+        assert_eq!(openai.errors, 0);
         assert_eq!(openai.input, 200);
         assert_eq!(openai.cached_read, 100);
         assert_eq!(openai.cache_write, 0);
