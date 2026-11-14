@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{Future, Stream, StreamExt};
+
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -15,24 +17,22 @@ use axum::{
     Json, Router,
 };
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
 
 use crate::config::Config;
 
+/// How long in-flight requests may keep the process alive after a shutdown signal.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
 /// Run the gateway on `cfg.listen` until SIGINT or SIGTERM.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
-    if !cfg.listen.ip().is_loopback() && cfg.api_key_file.is_none() {
-        anyhow::bail!(
-            "refusing to listen on {} without an api key file",
-            cfg.listen
-        );
-    }
+    guard(&cfg)?;
     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
     serve(listener, cfg).await
 }
 
 /// Serve on an already bound listener until SIGINT or SIGTERM.
 pub async fn serve(listener: tokio::net::TcpListener, cfg: Config) -> anyhow::Result<()> {
+    guard(&cfg)?;
     let state = Arc::new(Gateway::new(&cfg)?);
     let app = Router::new()
         .route("/health", get(health))
@@ -40,13 +40,44 @@ pub async fn serve(listener: tokio::net::TcpListener, cfg: Config) -> anyhow::Re
         .route("/v1/chat/completions", any(forward))
         .route("/v1/messages", any(forward))
         .route("/v1/messages/count_tokens", any(forward))
-        .route("/v1/models", get(forward))
+        .route("/v1/models", any(forward))
         .fallback(any(forward))
         .with_state(state);
     tracing::info!(addr = %listener.local_addr()?, "gw listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    serve_until(listener, app, shutdown(), SHUTDOWN_GRACE).await
+}
+
+fn guard(cfg: &Config) -> anyhow::Result<()> {
+    if !cfg.listen.ip().is_loopback() && cfg.api_key_file.is_none() {
+        anyhow::bail!(
+            "refusing to listen on {} without an api key file",
+            cfg.listen
+        );
+    }
+    Ok(())
+}
+
+/// Serve `app` until `stop` fires, then give in-flight requests at most `grace`.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    stop: impl Future<Output = ()>,
+    grace: Duration,
+) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = rx.await;
+    });
+    let mut handle = tokio::spawn(async move { server.await });
+    stop.await;
+    let _ = tx.send(());
+    match tokio::time::timeout(grace, &mut handle).await {
+        Ok(joined) => joined??,
+        Err(_) => {
+            tracing::warn!(?grace, "in-flight requests still open; stopping anyway");
+            handle.abort();
+        }
+    }
     Ok(())
 }
 
@@ -93,26 +124,27 @@ async fn health() -> impl IntoResponse {
 }
 
 /// Forward one request to the fallback upstream, byte for byte.
-// TODO: upgrade /v1/responses to a WebSocket tunnel when Responses-over-WS is needed.
 async fn forward(State(st): State<Arc<Gateway>>, req: Request) -> Response {
-    let Some(base) = st.fallback.as_deref() else {
-        return json_error(StatusCode::BAD_GATEWAY, "no upstream configured");
-    };
     let strip_authorization = match authenticate(&st, req.headers()) {
         Some(strip) => strip,
         None => return unauthorized(),
     };
+    let Some(base) = st.fallback.as_deref() else {
+        return json_error(StatusCode::BAD_GATEWAY, "no upstream configured");
+    };
+    if is_websocket_upgrade(req.headers()) {
+        return json_error(StatusCode::NOT_IMPLEMENTED, "websocket not supported yet");
+    }
     let (parts, body) = req.into_parts();
-    if let Some(len) = parts
+    let declared_len = parts
         .headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        if len > st.max_body {
-            return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-        }
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared_len.is_some_and(|len| len > st.max_body as u64) {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     }
+    let chunked = has_chunked(&parts.headers);
 
     let path_and_query = parts
         .uri
@@ -123,7 +155,7 @@ async fn forward(State(st): State<Arc<Gateway>>, req: Request) -> Response {
 
     let mut headers = HeaderMap::new();
     for (name, value) in &parts.headers {
-        if hop_by_hop(name) || name == "x-gw-key" {
+        if hop_by_hop(name) || name == "x-gw-key" || name == header::CONTENT_LENGTH {
             continue;
         }
         if strip_authorization && name == header::AUTHORIZATION {
@@ -133,22 +165,34 @@ async fn forward(State(st): State<Arc<Gateway>>, req: Request) -> Response {
     }
 
     let over = Arc::new(AtomicBool::new(false));
-    let stream = limited(body, st.max_body, over.clone());
     let mut outbound = st
         .client
         .request(parts.method.clone(), &url)
         .headers(headers);
-    // GET and HEAD carry no body; sending an empty chunked body upsets some upstreams.
-    if parts.method != axum::http::Method::GET && parts.method != axum::http::Method::HEAD {
-        outbound = outbound.body(reqwest::Body::wrap_stream(stream));
+    // HEAD has no body; other methods keep one when the client sent one. An empty body on GET
+    // would become a pointless chunked write, which some upstreams reject.
+    if parts.method != axum::http::Method::HEAD
+        && (chunked || declared_len.is_some_and(|len| len > 0))
+    {
+        // A fixed length keeps the client's framing; without one hyper re-chunks the stream.
+        if let Some(len) = declared_len {
+            outbound = outbound.header(header::CONTENT_LENGTH, len);
+        }
+        outbound = outbound.body(reqwest::Body::wrap_stream(limited(
+            body,
+            st.max_body,
+            over.clone(),
+        )));
     }
 
-    let upstream = match outbound.send().await {
+    let upstream = outbound.send().await;
+    // The stream can overflow before or after upstream answers, so check both paths.
+    if over.load(Ordering::Relaxed) {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    let upstream = match upstream {
         Ok(r) => r,
         Err(e) => {
-            if over.load(Ordering::Relaxed) {
-                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-            }
             tracing::warn!(url = %url, error = %e, "upstream request failed");
             return json_error(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
@@ -190,26 +234,43 @@ fn authenticate(st: &Gateway, headers: &HeaderMap) -> Option<bool> {
     ct_eq(direct.trim().as_bytes(), key.as_bytes()).then_some(false)
 }
 
-/// Compare in constant time so a wrong key leaks no prefix length.
+/// Compare in constant time so a wrong key leaks neither its prefix nor its length.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let mut diff = (a.len() ^ b.len()) as u64;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= u64::from(x ^ y);
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    diff == 0
+}
+
+fn has_chunked(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::TRANSFER_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+}
+
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let has = |name: &str, want: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case(want))
+    };
+    has("connection", "upgrade") && has("upgrade", "websocket")
 }
 
 fn hop_by_hop(name: &HeaderName) -> bool {
     let name = name.as_str();
     matches!(
         name,
-        "host"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "keep-alive"
-            | "upgrade"
-            | "te"
-            | "trailer"
+        "host" | "transfer-encoding" | "connection" | "keep-alive" | "upgrade" | "te" | "trailer"
     ) || name.starts_with("proxy-")
 }
 
@@ -312,7 +373,17 @@ mod tests {
         Router::new()
             .route("/status/{code}", any(status))
             .route("/stream", any(streaming))
+            .route("/head", any(head_body))
             .fallback(any(echo))
+    }
+
+    async fn head_body() -> Response {
+        let mut response = Response::new(Body::from("teapot"));
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("6"),
+        );
+        response
     }
 
     async fn echo(req: Request) -> Response {
@@ -380,6 +451,18 @@ mod tests {
 
     async fn json_body(resp: reqwest::Response) -> Value {
         serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap()
+    }
+
+    /// Send bytes straight at the gateway so upgrade and chunked framing are not rewritten.
+    async fn raw(addr: SocketAddr, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf))
+            .await
+            .ok();
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     fn names(v: &Value) -> Vec<String> {
@@ -489,10 +572,7 @@ mod tests {
         assert_eq!(body["body"], "hello");
 
         let seen = names(&body);
-        // transfer-encoding is listed here as dropped but reappears because reqwest re-chunks the
-        // streamed body; content-length is genuinely gone.
         for dropped in [
-            "content-length",
             "connection",
             "keep-alive",
             "te",
@@ -502,6 +582,9 @@ mod tests {
         ] {
             assert!(!seen.contains(&dropped.to_string()), "{dropped} forwarded");
         }
+        assert!(!seen.contains(&"transfer-encoding".to_string()));
+        // The client's declared length survives, so upstream sees the same framing.
+        assert_eq!(header(&body, "content-length").as_deref(), Some("5"));
         assert!(seen.contains(&"x-custom".to_string()));
         // reqwest sets host for the upstream; the client's value is not passed through.
         assert_eq!(
@@ -553,5 +636,194 @@ mod tests {
             ..Config::default()
         };
         assert!(run(cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_non_loopback_without_key() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let cfg = Config {
+            listen: "0.0.0.0:0".parse().unwrap(),
+            ..Config::default()
+        };
+        assert!(serve(listener, cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_is_checked_before_missing_upstream() {
+        let (addr, _key) = gateway(None, Some("secret"), 1024).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/models");
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+        let resp = client.get(&url).bearer_auth("secret").send().await.unwrap();
+        assert_eq!(resp.status(), 502);
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_body_is_413() {
+        let up = bind(upstream()).await;
+        let (addr, _key) = gateway(Some(up), None, 16).await;
+        let chunks = futures_util::stream::iter(
+            (0..8).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(b"0123456789"))),
+        );
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .body(reqwest::Body::wrap_stream(chunks))
+            .send()
+            .await;
+        assert_eq!(
+            resp.map(|r| r.status()).ok(),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_request_stays_chunked() {
+        let up = bind(upstream()).await;
+        let (addr, _key) = gateway(Some(up), None, 1 << 20).await;
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"hel")),
+            Ok(Bytes::from_static(b"lo")),
+        ]);
+        let body = json_body(
+            reqwest::Client::new()
+                .post(format!("http://{addr}/v1/messages"))
+                .body(reqwest::Body::wrap_stream(chunks))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["body"], "hello");
+        assert!(header(&body, "content-length").is_none());
+        assert_eq!(
+            header(&body, "transfer-encoding").as_deref(),
+            Some("chunked")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_body_is_forwarded_and_head_keeps_content_length() {
+        let up = bind(upstream()).await;
+        let (addr, _key) = gateway(Some(up), None, 1 << 20).await;
+        let client = reqwest::Client::new();
+
+        let body = json_body(
+            client
+                .get(format!("http://{addr}/v1/models"))
+                .body("query")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["method"], "GET");
+        assert_eq!(body["body"], "query");
+        assert_eq!(header(&body, "content-length").as_deref(), Some("5"));
+
+        // A body-less GET must not gain an empty chunked body.
+        let body = json_body(
+            client
+                .get(format!("http://{addr}/v1/models"))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["body"], "");
+        assert!(header(&body, "content-length").is_none());
+        assert!(header(&body, "transfer-encoding").is_none());
+
+        let resp = client
+            .head(format!("http://{addr}/head"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-length").unwrap(), "6");
+        assert_eq!(resp.bytes().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_is_501() {
+        let up = bind(upstream()).await;
+        let (addr, _key) = gateway(Some(up), None, 1 << 20).await;
+        let request = format!(
+            "GET /v1/responses HTTP/1.1\r\nhost: {addr}\r\nconnection: Upgrade\r\n\
+             upgrade: websocket\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             sec-websocket-version: 13\r\n\r\n"
+        );
+        let raw = raw(addr, &request).await;
+        assert!(raw.starts_with("HTTP/1.1 501"), "{raw}");
+        assert!(raw.contains("websocket not supported yet"), "{raw}");
+    }
+
+    #[test]
+    fn ct_eq_ignores_length_and_content() {
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secre"));
+        assert!(!ct_eq(b"secre", b"secret"));
+        assert!(!ct_eq(b"secret", b"secreT"));
+        assert!(!ct_eq(b"", b"s"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    static SLOW_DONE: AtomicBool = AtomicBool::new(false);
+
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        SLOW_DONE.store(true, Ordering::Relaxed);
+        "late"
+    }
+
+    async fn quick() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        "done"
+    }
+
+    fn stop_channel() -> (tokio::sync::oneshot::Sender<()>, impl Future<Output = ()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        (tx, async move {
+            let _ = rx.await;
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_after_grace_with_requests_still_in_flight() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/slow", get(slow));
+        let grace = Duration::from_millis(100);
+        let (stop, stopped) = stop_channel();
+        let serving = tokio::spawn(serve_until(listener, app, stopped, grace));
+        let inflight = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let _ = client.get(format!("http://{addr}/slow")).send().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        stop.send(()).unwrap();
+        serving.await.unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert!(!SLOW_DONE.load(Ordering::Relaxed), "request should be cut");
+
+        inflight.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_lets_in_flight_requests_finish_inside_grace() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/quick", get(quick));
+        let (stop, stopped) = stop_channel();
+        let serving = tokio::spawn(serve_until(listener, app, stopped, Duration::from_secs(5)));
+        let inflight = tokio::spawn(async move {
+            let resp = reqwest::get(format!("http://{addr}/quick")).await.unwrap();
+            resp.text().await.unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(()).unwrap();
+        serving.await.unwrap().unwrap();
+        assert_eq!(inflight.await.unwrap(), "done");
     }
 }
