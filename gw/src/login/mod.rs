@@ -4,6 +4,7 @@
 //! Tokens are never printed: progress messages name the account, never the secret.
 
 pub mod callback;
+pub mod cli;
 pub mod device;
 pub mod pkce;
 pub mod providers;
