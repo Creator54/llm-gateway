@@ -11,17 +11,16 @@ rustPlatform.buildRustPackage {
 
   src = lib.fileset.toSource {
     inherit root;
-    fileset = lib.fileset.unions [
-      (root + "/gw/Cargo.toml")
-      (root + "/gw/Cargo.lock")
-      (root + "/gw/src")
-    ];
+    fileset = lib.fileset.difference
+      (root + "/gw")
+      (lib.fileset.maybeMissing (root + "/gw/target"));
   };
 
+  # cargoRoot locates Cargo.lock for the vendor check; buildAndTestSubdir is the
+  # directory cargo runs in. Both are needed for this layout.
   cargoRoot = "gw";
   buildAndTestSubdir = "gw";
   cargoLock.lockFile = root + "/gw/Cargo.lock";
-  doCheck = true;
 
   # reqwest uses rustls, so no openssl and no runtime dependencies at all.
   meta = {

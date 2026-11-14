@@ -53,6 +53,9 @@
           program = "${self.packages.${system}.default}/bin/llm-gateway";
         };
       });
+      checks = eachSystem (system: {
+        gw = self.packages.${system}.gw;
+      });
       devShells = eachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
         in {
@@ -60,8 +63,8 @@
             packages = [ pkgs.just pkgs.git pkgs.podman pkgs.docker-compose pkgs.curl pkgs.wl-clipboard pkgs.xclip ];
             PODMAN_COMPOSE_PROVIDER = "${pkgs.docker-compose}/bin/docker-compose";
           };
-          rust = pkgs.mkShellNoCC {
-            packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.rust-analyzer ];
+          rust = pkgs.mkShell {
+            packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.rust-analyzer pkgs.bun ];
           };
         });
     };
