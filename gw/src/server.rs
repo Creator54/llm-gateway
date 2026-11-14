@@ -635,6 +635,9 @@ impl Gateway {
                 stream,
                 session: info.session.clone(),
             };
+            // Attempting it means it is not cooling, even if the gauge was never
+            // cleared after an earlier cooldown expired.
+            self.metrics.set_cooling(&target.provider, &id, false);
             let outcome = self
                 .attempt(adapter.as_ref(), &request, &target.provider, &account)
                 .await;
