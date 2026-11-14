@@ -7,6 +7,9 @@ mod response;
 mod tools;
 mod wire;
 
+#[cfg(test)]
+mod tests;
+
 use crate::provider::{Account, Credential, Failure, Inbound, Provider, Reply, Request};
 use crate::translate::{
     chat_to_messages, chat_to_responses, messages_to_chat, responses_to_chat, Inbound as Protocol,
@@ -119,6 +122,8 @@ fn is_quota(body: &str) -> bool {
         || lower.contains("quota exceeded")
         || lower.contains("monthly_request_count")
         || lower.contains("account quota")
+        || lower.contains("monthly quota")
+        || lower.contains("exhausted your")
 }
 
 /// Plain text carried by an upstream error body.
@@ -160,11 +165,11 @@ fn classify(status: StatusCode, headers: &HeaderMap, body: &str) -> Failure {
         }
         400 if lower.contains("insufficient_quota") => Failure::Quota { reset_after: None },
         status if (500..600).contains(&status) => Failure::Retryable,
-        _ => fatal(status, upsteam_message(status, body)),
+        _ => fatal(status, upstream_message(status, body)),
     }
 }
 
-fn upsteam_message(status: StatusCode, body: &str) -> String {
+fn upstream_message(status: StatusCode, body: &str) -> String {
     let text = upstream_text(body);
     let text: String = text.chars().take(500).collect();
     if text.trim().is_empty() {
@@ -192,7 +197,7 @@ impl Provider for Kiro {
             }
             let api_key = token.starts_with("ksk_");
             let builder_id = !api_key
-                && account.extra.get("profile_arn").is_none()
+                && !account.extra.contains_key("profile_arn")
                 && account
                     .extra
                     .get("auth_type")

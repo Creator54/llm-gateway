@@ -72,7 +72,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
             b = a;
             a = t1.wrapping_add(t2);
         }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h].into_iter()) {
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *slot = slot.wrapping_add(value);
         }
     }

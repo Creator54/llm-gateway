@@ -254,10 +254,7 @@ fn finish(
         "conversationId".into(),
         json!(wire::conversation_id(session)),
     );
-    state.insert(
-        "currentMessage".into(),
-        json!({ "userInputMessage": current }),
-    );
+    state.insert("currentMessage".into(), current);
     if !history.is_empty() {
         state.insert("history".into(), Value::Array(history));
     }

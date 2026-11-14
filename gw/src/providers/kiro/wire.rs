@@ -441,6 +441,10 @@ mod tests {
         );
         assert_eq!(
             normalize_model_id("kiro/claude-3-7-sonnet-20250219-high"),
+            "claude-3.7-sonnet-20250219"
+        );
+        assert_eq!(
+            normalize_model_id("kiro/claude-3-7-sonnet-20250219"),
             "claude-sonnet-3.7"
         );
         assert_eq!(normalize_model_id("kiro/auto"), "auto");
