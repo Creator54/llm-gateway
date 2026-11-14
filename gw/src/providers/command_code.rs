@@ -464,17 +464,10 @@ fn supported_effort(model: &str, requested: &str) -> Option<&'static str> {
     let ladder = effort_ladder(model)?;
     let lower = model.to_lowercase();
     let aliases_max = lower == "deepseek/deepseek-v4-flash" || lower == "zai-org/glm-5.2";
-    let wire = if requested == "xhigh" && !ladder.contains(&"xhigh") && ladder.contains(&"max") {
-        "max"
-    } else if requested == "ultra"
-        && aliases_max
-        && !ladder.contains(&"ultra")
+    let lift_to_max = !ladder.contains(&requested)
         && ladder.contains(&"max")
-    {
-        "max"
-    } else {
-        requested
-    };
+        && (requested == "xhigh" || (requested == "ultra" && aliases_max));
+    let wire = if lift_to_max { "max" } else { requested };
     ladder.iter().copied().find(|effort| *effort == wire)
 }
 
@@ -770,6 +763,8 @@ fn wire_messages(messages: &[Value]) -> Vec<Value> {
                     }
                 }
             }
+            // System text already travels in `params.system`.
+            "system" | "developer" => {}
             _ => {
                 close_pending(&mut out, &mut pending, &mut carriers);
                 let mut content: Vec<Value> = Vec::new();
@@ -1400,10 +1395,7 @@ fn stream_reply(req: &Request, response: reqwest::Response) -> Reply {
                     }
                     Some(Err(_)) => {
                         return Some((
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "command-code upstream stream failed",
-                            )),
+                            Err(std::io::Error::other("command-code upstream stream failed")),
                             (decoder, upstream),
                         ));
                     }
