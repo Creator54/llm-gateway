@@ -815,6 +815,12 @@ impl Gateway {
                         .report(provider_name, &account.id, outcome, now);
                     // Mirror the cooldown so a scrape shows which accounts are out.
                     self.metrics.set_cooling(provider_name, &account.id, true);
+                    tracing::warn!(
+                        provider = provider_name,
+                        account = %account.id,
+                        reason = reason_label(Some(&failure)),
+                        "account cannot serve; cooling it down"
+                    );
                     // Keep the failure so the metric can name the reason.
                     AttemptResult::Cooled(failure)
                 }
@@ -901,12 +907,21 @@ impl Gateway {
                 .min()
         };
         match (soonest, last) {
-            (Some(until), _) => error_reply(
-                shape,
-                StatusCode::TOO_MANY_REQUESTS,
-                "every account for this route is cooling down",
-                Some(until.saturating_duration_since(now)),
-            ),
+            (Some(until), last) => {
+                let wait = until.saturating_duration_since(now);
+                let providers: Vec<&str> = route
+                    .targets
+                    .iter()
+                    .map(|target| target.provider.as_str())
+                    .collect();
+                let message = format!(
+                    "no account for {} can serve this now ({}); retry in {}s",
+                    providers.join(", "),
+                    reason_label(last.as_ref()),
+                    wait.as_millis().div_ceil(1000).max(1),
+                );
+                error_reply(shape, StatusCode::TOO_MANY_REQUESTS, &message, Some(wait))
+            }
             (None, Some(failure)) => failure_reply(shape, failure),
             (None, None) => {
                 let known = {
@@ -1469,6 +1484,18 @@ fn error_reply(
         }
     }
     response
+}
+
+/// Why an account cannot serve right now, in words a client can read.
+fn reason_label(failure: Option<&provider::Failure>) -> &'static str {
+    match failure {
+        Some(provider::Failure::RateLimited { .. }) => "rate limited upstream",
+        Some(provider::Failure::Quota { .. }) => "quota exhausted",
+        Some(provider::Failure::Auth) => "authentication failed",
+        Some(provider::Failure::Retryable) => "upstream unreachable",
+        Some(provider::Failure::Fatal { .. }) => "upstream rejected the request",
+        None => "rate limited",
+    }
 }
 
 /// An adapter failure as the client's status, before any byte was streamed.
