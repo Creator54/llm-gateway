@@ -1,0 +1,123 @@
+//! Translate requests and replies between Responses, Chat, and Messages.
+//!
+//! Adapted from joocode (MIT).
+
+mod reply;
+mod request;
+mod sse;
+mod stream;
+
+pub use reply::{chat_to_messages, chat_to_responses};
+pub use request::{messages_to_chat, responses_to_chat};
+pub use sse::SseParser;
+pub use stream::{MessagesStream, ResponsesStream};
+
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A translation failure with the status the client should see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error {
+    /// HTTP status to return.
+    pub status: u16,
+    /// Short message safe to show the client.
+    pub message: String,
+}
+
+impl Error {
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: 400,
+            message: message.to_owned(),
+        }
+    }
+
+    fn bad_gateway(message: &str) -> Self {
+        Self {
+            status: 502,
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// A fresh id for an object the client will see.
+fn new_id(prefix: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}_{nanos:x}{count:04x}")
+}
+
+/// Seconds since the epoch, matching OpenAI's `created_at`.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn usage_number(usage: &Value, key: &str) -> u64 {
+    usage.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn prompt_tokens(usage: &Value) -> u64 {
+    usage_number(usage, "prompt_tokens")
+}
+
+fn completion_tokens(usage: &Value) -> u64 {
+    usage_number(usage, "completion_tokens")
+}
+
+fn cached_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Chat usage as a Responses `usage` object.
+fn responses_usage(usage: &Value) -> Value {
+    let prompt = prompt_tokens(usage);
+    let completion = completion_tokens(usage);
+    let total = usage_number(usage, "total_tokens");
+    json!({
+        "input_tokens": prompt,
+        "input_tokens_details": { "cached_tokens": cached_tokens(usage) },
+        "output_tokens": completion,
+        "total_tokens": if total == 0 { prompt + completion } else { total },
+    })
+}
+
+/// Chat usage as a Messages `usage` object; Anthropic counts cached input apart.
+fn messages_usage(usage: &Value) -> Value {
+    let cached = cached_tokens(usage);
+    json!({
+        "input_tokens": prompt_tokens(usage).saturating_sub(cached),
+        "cache_read_input_tokens": cached,
+        "output_tokens": completion_tokens(usage),
+    })
+}
+
+/// Anthropic stop reason for a Chat `finish_reason`.
+fn stop_reason(finish: Option<&str>, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        return "tool_use";
+    }
+    match finish {
+        Some("length") => "max_tokens",
+        Some("tool_calls") => "tool_use",
+        _ => "end_turn",
+    }
+}
