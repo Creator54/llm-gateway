@@ -5,6 +5,7 @@ pub mod connect;
 pub mod creds;
 pub mod journal;
 pub mod login;
+pub mod metrics;
 pub mod models;
 pub mod pool;
 pub mod provider;
