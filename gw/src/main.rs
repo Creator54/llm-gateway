@@ -106,6 +106,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Status => {
             report(gw::connect::status(&gw::connect::home()?, &cfg.state_dir)?);
+            report(gw::connect::usage(&cfg.state_dir)?);
             Ok(())
         }
     }

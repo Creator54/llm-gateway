@@ -1,4 +1,4 @@
-use crate::combo::Combo;
+use crate::{cache, combo::Combo, tidy};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -19,6 +19,10 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// Combos by name, selected with `combo/<name>`.
     pub combos: BTreeMap<String, Combo>,
+    /// `default` runs the token-efficiency edits; `parity` turns every one off.
+    pub profile: Profile,
+    #[serde(default)]
+    pub transforms: Transforms,
 }
 
 impl Default for Config {
@@ -30,8 +34,39 @@ impl Default for Config {
             state_dir: home().join(".config/gw"),
             max_body_bytes: 32 << 20,
             combos: BTreeMap::new(),
+            profile: Profile::Default,
+            transforms: Transforms::default(),
         }
     }
+}
+
+/// Behaviour profile: `parity` forwards request bytes exactly as the client sent them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    #[default]
+    Default,
+    Parity,
+}
+
+/// One switch per edit, each falling back to the module default when unset.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Transforms {
+    /// Run the cache edits as a group.
+    pub cache: Option<bool>,
+    /// Run tool-result cleanup.
+    pub tidy: Option<bool>,
+    pub markers: Option<bool>,
+    pub ttl_order: Option<bool>,
+    pub ttl_1h: Option<bool>,
+    pub strip_volatile: Option<bool>,
+    pub openai_cache_key: Option<bool>,
+    pub strip_ansi: Option<bool>,
+    pub collapse_redraws: Option<bool>,
+    pub collapse_repeats: Option<bool>,
+    pub trim_trailing: Option<bool>,
+    pub max_lines: Option<usize>,
 }
 
 impl Config {
@@ -49,6 +84,38 @@ impl Config {
                 Ok(Self::default())
             }
             Err(e) => Err(anyhow::anyhow!("{}: {e}", file.display())),
+        }
+    }
+
+    /// Cache edits in force for this profile.
+    pub fn cache_options(&self) -> cache::Options {
+        let defaults = cache::Options::default();
+        let t = &self.transforms;
+        if self.profile == Profile::Parity || t.cache == Some(false) {
+            return cache::Options::parity();
+        }
+        cache::Options {
+            markers: t.markers.unwrap_or(defaults.markers),
+            ttl_order: t.ttl_order.unwrap_or(defaults.ttl_order),
+            ttl_1h: t.ttl_1h.unwrap_or(defaults.ttl_1h),
+            strip_volatile: t.strip_volatile.unwrap_or(defaults.strip_volatile),
+            openai_cache_key: t.openai_cache_key.unwrap_or(defaults.openai_cache_key),
+        }
+    }
+
+    /// Tool-result cleanup in force for this profile.
+    pub fn tidy_options(&self) -> tidy::Options {
+        let defaults = tidy::Options::default();
+        let t = &self.transforms;
+        if self.profile == Profile::Parity || t.tidy == Some(false) {
+            return tidy::Options::parity();
+        }
+        tidy::Options {
+            strip_ansi: t.strip_ansi.unwrap_or(defaults.strip_ansi),
+            collapse_redraws: t.collapse_redraws.unwrap_or(defaults.collapse_redraws),
+            collapse_repeats: t.collapse_repeats.unwrap_or(defaults.collapse_repeats),
+            trim_trailing: t.trim_trailing.unwrap_or(defaults.trim_trailing),
+            max_lines: t.max_lines.or(defaults.max_lines),
         }
     }
 
