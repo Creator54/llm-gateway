@@ -516,7 +516,9 @@ async fn error_mapping_matches_the_contract() {
             403,
             vec![],
             r#"{"reason":"TEMPORARILY_SUSPENDED","message":"Account temporarily suspended"}"#,
-            Failure::Quota { reset_after: None },
+            Failure::Quota {
+                reset_after: Some(Duration::from_secs(24 * 60 * 60)),
+            },
         ),
         (500, vec![], "boom", Failure::Retryable),
         (

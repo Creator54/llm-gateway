@@ -128,6 +128,18 @@ fn is_quota(body: &str) -> bool {
         || lower.contains("exhausted your")
 }
 
+const SUSPENSION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Upstream suspended the account; the caller should stop using it for a day.
+fn is_suspension(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("temporarily_suspended")
+        || lower.contains("temporarily suspended")
+        || lower.contains("temporarily is suspended")
+        || lower.contains("locked your account")
+        || lower.contains("locked it as a")
+}
+
 /// Account-scoped refusals: suspension or an exhausted monthly allowance.
 fn is_refusal(body: &str) -> bool {
     let lower = body.to_lowercase();
@@ -158,6 +170,9 @@ fn classify(status: StatusCode, headers: &HeaderMap, body: &str) -> Failure {
         429 if is_quota(body) => Failure::Quota { reset_after: None },
         429 => Failure::RateLimited {
             retry_after: retry_after(headers, body),
+        },
+        401 | 403 if is_suspension(body) => Failure::Quota {
+            reset_after: Some(SUSPENSION_COOLDOWN),
         },
         401 | 403 if is_refusal(body) => Failure::Quota { reset_after: None },
         401 | 403 => Failure::Auth,
