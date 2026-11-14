@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 /// Anthropic allows at most four cache breakpoints on a request.
 const MAX_BREAKPOINTS: usize = 4;
 
-/// OpenAI rejects `prompt_cache_key` values longer than this.
+/// OpenAI rejects `prompt_cache_key` values longer than this, in bytes.
 const MAX_CACHE_KEY: usize = 64;
 
 const SESSION_START: &str = "<session-overview>";
@@ -85,74 +85,114 @@ pub fn rewrite(
     session: &str,
     supports: impl Fn(&str) -> Option<bool>,
 ) -> Vec<u8> {
-    let Ok(original) = serde_json::from_slice::<Value>(body) else {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
     };
-    let edited = match family {
+    let changed = match family {
         // Strip first so the churn never becomes part of a prefix we then mark.
-        Family::Anthropic => anthropic_messages(strip_volatile(original.clone(), opts), opts),
-        Family::OpenAi => openai_cache_key(original.clone(), session, opts, supports),
+        Family::Anthropic => {
+            let stripped = strip_volatile_in_place(&mut value, opts);
+            stripped | anthropic_messages_in_place(&mut value, opts)
+        }
+        Family::OpenAi => openai_cache_key_in_place(&mut value, session, opts, supports),
     };
-    if edited == original {
+    if !changed {
         return body.to_vec();
     }
-    serde_json::to_vec(&edited).unwrap_or_else(|_| body.to_vec())
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
 }
 
 /// Add missing breakpoints and repair TTL order on an Anthropic Messages body.
 pub fn anthropic_messages(mut body: Value, opts: &Options) -> Value {
+    anthropic_messages_in_place(&mut body, opts);
+    body
+}
+
+fn anthropic_messages_in_place(body: &mut Value, opts: &Options) -> bool {
     if !body.is_object() {
-        return body;
+        return false;
     }
+    let mut changed = false;
     if opts.markers {
-        add_markers(&mut body, opts.ttl_1h);
+        changed |= add_markers(body, opts.ttl_1h);
     }
     if opts.ttl_order {
-        repair_ttl_order(&mut body);
+        changed |= repair_ttl_order(body);
     }
+    changed
+}
+
+/// Remove known per-turn churn from pi system prompts after the last breakpoint.
+pub fn strip_volatile(mut body: Value, opts: &Options) -> Value {
+    strip_volatile_in_place(&mut body, opts);
     body
 }
 
-/// Remove known per-turn churn, but never before the last cache breakpoint.
-pub fn strip_volatile(mut body: Value, opts: &Options) -> Value {
+fn strip_volatile_in_place(body: &mut Value, opts: &Options) -> bool {
     if !opts.strip_volatile || !body.is_object() {
-        return body;
+        return false;
     }
-    let spots = walk(&body);
+    let spots = walk(body);
     let last = spots
         .iter()
-        .rposition(|spot| control(&body, *spot).is_some());
+        .rposition(|spot| control(body, *spot).is_some());
     // No breakpoint means nothing is cached yet, so nothing is protected.
     let from = last.map_or(0, |i| i + 1);
+    let mut changed = false;
     for spot in &spots[from..] {
-        strip_churn(&mut body, *spot);
+        // Only the pi system prompt carries these fields; message text belongs to the client.
+        if matches!(spot, Spot::System(_) | Spot::SystemStr) {
+            changed |= strip_churn(body, *spot);
+        }
     }
-    body
+    changed
 }
 
-/// Set `prompt_cache_key` to `session` unless it is already there or `supports` says no.
+/// Set `prompt_cache_key` to `session` where the provider is known to accept it.
 pub fn openai_cache_key(
     mut body: Value,
     session: &str,
     opts: &Options,
     supports: impl Fn(&str) -> Option<bool>,
 ) -> Value {
+    openai_cache_key_in_place(&mut body, session, opts, supports);
+    body
+}
+
+fn openai_cache_key_in_place(
+    body: &mut Value,
+    session: &str,
+    opts: &Options,
+    supports: impl Fn(&str) -> Option<bool>,
+) -> bool {
     let session = session.trim();
     if !opts.openai_cache_key || session.is_empty() || !body.is_object() {
-        return body;
+        return false;
     }
     if body.get("prompt_cache_key").is_some() || body.get("promptCacheKey").is_some() {
-        return body;
+        return false;
     }
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-    if supports(model) == Some(false) {
-        return body;
+    // Unknown support may 400, so only set the key where acceptance is known.
+    if supports(model) != Some(true) {
+        return false;
     }
-    let key: String = session.chars().take(MAX_CACHE_KEY).collect();
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("prompt_cache_key".into(), Value::String(key));
+    let key = clamp_key(session).to_string();
+    match body.as_object_mut() {
+        Some(obj) => obj
+            .insert("prompt_cache_key".into(), Value::String(key))
+            .is_none(),
+        None => false,
     }
-    body
+}
+
+/// Longest prefix of `session` within `MAX_CACHE_KEY` bytes, on a char boundary.
+fn clamp_key(session: &str) -> &str {
+    let mut end = session.len().min(MAX_CACHE_KEY);
+    while !session.is_char_boundary(end) {
+        end -= 1;
+    }
+    &session[..end]
 }
 
 /// Hash of what a provider can serve from cache: tools, system, messages up to the last breakpoint.
@@ -255,6 +295,7 @@ fn is_ephemeral(control: &Map<String, Value>) -> bool {
 
 fn add_markers(body: &mut Value, ttl_1h: bool) -> bool {
     let spots = walk(body);
+    // Client-sent breakpoints win: the client knows which prefix is worth caching.
     if spots.iter().any(|spot| control(body, *spot).is_some()) {
         return false;
     }
@@ -335,7 +376,8 @@ fn set_control(body: &mut Value, spot: Spot, ttl_1h: bool) -> bool {
 }
 
 /// Anthropic requires every 1h breakpoint to come before every 5m one, so any
-/// short breakpoint preceding a long one is upgraded. Unknown TTLs are left alone.
+/// short breakpoint preceding a long one is upgraded. A breakpoint with an
+/// unrecognised TTL is skipped; the rest are still repaired.
 fn repair_ttl_order(body: &mut Value) -> bool {
     let spots = walk(body);
     let mut long: Vec<usize> = Vec::new();
@@ -350,7 +392,7 @@ fn repair_ttl_order(body: &mut Value) -> bool {
         match cc.get("ttl").and_then(Value::as_str) {
             Some("1h") => long.push(i),
             None | Some("5m") => short.push(i),
-            Some(_) => return false,
+            Some(_) => {} // Unknown TTL: leave this block as the client sent it.
         }
     }
     let Some(&last_long) = long.last() else {
@@ -424,19 +466,17 @@ fn strip_recent_commits(inner: &str) -> String {
     out
 }
 
-/// Remove every line whose text starts with `field`, keeping its newline.
+/// Remove every line whose text starts with `field`, keeping its terminator.
 fn strip_lines(text: &str, field: &str) -> String {
-    let needle = format!("\n{field}");
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(&needle) {
-        out.push_str(&rest[..i]);
-        match rest[i + needle.len()..].find('\n') {
-            Some(j) => rest = &rest[i + needle.len() + j..],
-            None => return out,
+    for line in text.split_inclusive('\n') {
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        let bare = bare.strip_suffix('\r').unwrap_or(bare);
+        if bare.starts_with(field) {
+            continue;
         }
+        out.push_str(line);
     }
-    out.push_str(rest);
     out
 }
 
@@ -625,12 +665,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ttl_is_not_rewritten() {
+    fn unknown_ttl_block_is_left_as_sent() {
         let mut body = sample();
         body["tools"][0]["cache_control"] = json!({"type": "ephemeral", "ttl": "30m"});
         body["messages"][0]["content"][0]["cache_control"] =
             json!({"type": "ephemeral", "ttl": "1h"});
         assert_eq!(anthropic_messages(body.clone(), &Options::default()), body);
+    }
+
+    #[test]
+    fn unknown_ttl_skips_only_that_block_and_repairs_the_rest() {
+        let mut body = sample();
+        body["system"][0]["cache_control"] = json!({"type": "ephemeral", "ttl": "30m"});
+        body["tools"][1]["cache_control"] = json!({"type": "ephemeral"});
+        body["messages"][2]["content"][0]["cache_control"] =
+            json!({"type": "ephemeral", "ttl": "1h"});
+        let out = anthropic_messages(body, &Options::default());
+        assert_eq!(
+            block(&out, Spot::System(0)).unwrap()["cache_control"],
+            json!({"type": "ephemeral", "ttl": "30m"})
+        );
+        assert_eq!(
+            block(&out, Spot::Tool(1)).unwrap()["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
     }
 
     #[test]
@@ -665,11 +723,19 @@ mod tests {
             ),
             (
                 "<session-overview>\nLine count: 9 / 2000</session-overview>",
-                "<session-overview></session-overview>",
+                "<session-overview>\n</session-overview>",
             ),
             (
                 "<session-overview>\n## RECENT COMMITS\n\n## NEXT\nx\n</session-overview>",
                 "<session-overview>\n## NEXT\nx\n</session-overview>",
+            ),
+            (
+                "<session-overview>Working directory: Clean\nLine count: 7 / 2000\n</session-overview>",
+                "<session-overview></session-overview>",
+            ),
+            (
+                "<session-overview>\r\nWorking directory: Clean\r\n## NEXT\r\nx\r\n</session-overview>",
+                "<session-overview>\r\n## NEXT\r\nx\r\n</session-overview>",
             ),
             ("no tags at all\nLine count: 1 / 2000", "no tags at all\nLine count: 1 / 2000"),
         ];
@@ -680,6 +746,36 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    #[test]
+    fn strip_lines_handles_crlf_and_the_first_line() {
+        assert_eq!(
+            strip_lines(
+                "Working directory: dirty\r\n## CURRENT TASK\r\nLine count: 2 / 2000\r\nWorking directory: clean",
+                "Working directory:"
+            ),
+            "## CURRENT TASK\r\nLine count: 2 / 2000\r\n"
+        );
+        assert_eq!(
+            strip_lines("Line count: 1 / 2000\nkeep\n", "Line count:"),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn strips_churn_only_from_system_content() {
+        let overview = "<session-overview>\nLine count: 7 / 2000\n</session-overview>";
+        let body = parse(json!({
+            "system": [{"type": "text", "text": overview}],
+            "messages": [user_turn(overview)]
+        }));
+        let out = strip_volatile(body, &Options::default());
+        assert_eq!(
+            block(&out, Spot::System(0)).unwrap()["text"],
+            "<session-overview>\n</session-overview>"
+        );
+        assert_eq!(block(&out, Spot::Block(0, 0)).unwrap()["text"], overview);
     }
 
     #[test]
@@ -722,29 +818,48 @@ mod tests {
     }
 
     #[test]
-    fn sets_prompt_cache_key_only_when_supported() {
+    fn sets_prompt_cache_key_only_when_known_to_be_supported() {
         let body = parse(json!({"model": "gpt", "messages": []}));
         let opts = Options::default();
-        let out = openai_cache_key(body.clone(), " session-1 ", &opts, |_| None);
+        let out = openai_cache_key(body.clone(), " session-1 ", &opts, |_| Some(true));
         assert_eq!(out["prompt_cache_key"], "session-1");
         let out = openai_cache_key(body.clone(), "s", &opts, |_| Some(false));
         assert_eq!(out, body);
-        let out = openai_cache_key(body.clone(), "s", &opts, |_| Some(true));
-        assert_eq!(out["prompt_cache_key"], "s");
-        assert_eq!(openai_cache_key(body.clone(), "", &opts, |_| None), body);
+        // Unknown support is not a yes: the model family must be known to accept the key.
+        let out = openai_cache_key(body.clone(), "s", &opts, |_| None);
+        assert_eq!(out, body);
+        assert_eq!(
+            openai_cache_key(body.clone(), "", &opts, |_| Some(true)),
+            body
+        );
     }
 
     #[test]
     fn keeps_an_existing_prompt_cache_key_and_clamps_long_ones() {
         let opts = Options::default();
         let body = parse(json!({"prompt_cache_key": "client-key"}));
-        assert_eq!(openai_cache_key(body.clone(), "s", &opts, |_| None), body);
+        assert_eq!(
+            openai_cache_key(body.clone(), "s", &opts, |_| Some(true)),
+            body
+        );
         let long = "x".repeat(200);
-        let out = openai_cache_key(parse(json!({})), &long, &opts, |_| None);
+        let out = openai_cache_key(parse(json!({})), &long, &opts, |_| Some(true));
         assert_eq!(
             out["prompt_cache_key"].as_str().unwrap().len(),
             MAX_CACHE_KEY
         );
+    }
+
+    #[test]
+    fn clamps_the_key_on_a_char_boundary_within_bytes() {
+        let opts = Options::default();
+        // One byte short of the limit, then a two-byte char: a char clamp would overflow.
+        let session = format!("{}{}", "a".repeat(MAX_CACHE_KEY - 1), "é");
+        let out = openai_cache_key(parse(json!({})), &session, &opts, |_| Some(true));
+        let key = out["prompt_cache_key"].as_str().unwrap();
+        assert!(key.len() <= MAX_CACHE_KEY);
+        assert!(key.is_char_boundary(key.len()));
+        assert_eq!(key, "a".repeat(MAX_CACHE_KEY - 1));
     }
 
     #[test]
@@ -808,5 +923,27 @@ mod tests {
         });
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["prompt_cache_key"], "sess");
+        // Unknown support leaves the body byte-identical.
+        let out = rewrite(&body, Family::OpenAi, &Options::default(), "sess", |_| None);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn re_serialized_body_keeps_key_order_and_untouched_bytes() {
+        let input = br#"{"model":"claude","system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"a"},{"name":"b"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}"#;
+        let out = rewrite(input, Family::Anthropic, &Options::default(), "", |_| None);
+        // Only the system TTL changed; key order and every other byte are untouched.
+        assert_eq!(
+            out,
+            br#"{"model":"claude","system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral","ttl":"1h"}}],"tools":[{"name":"a"},{"name":"b"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}"#
+        );
+        // A non-compact body with no applicable edit comes back byte-identical.
+        let pretty = serde_json::to_vec_pretty(&json!({"messages": []})).unwrap();
+        assert_eq!(
+            rewrite(&pretty, Family::Anthropic, &Options::default(), "", |_| {
+                None
+            }),
+            pretty
+        );
     }
 }
