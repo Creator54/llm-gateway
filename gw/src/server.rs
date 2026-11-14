@@ -595,6 +595,7 @@ impl Gateway {
         let stream = stream_requested(&plan.body);
         let mut last: Option<provider::Failure> = None;
         let mut tried: Vec<(String, String)> = Vec::new();
+        let mut previous: Option<String> = None;
         let mut tries = 0;
         while tries < budget {
             let next = match self.step(&route, &session, &tried) {
@@ -605,6 +606,12 @@ impl Gateway {
                 None => break,
             };
             let (target, id, index) = next;
+            // A second and later attempt for one request is a failover.
+            if let Some(from) = previous.as_deref() {
+                self.metrics
+                    .failover(from, &id, failure_label(last.as_ref()));
+            }
+            previous = Some(id.clone());
             tries += 1;
             let Some(adapter) = self.adapters.get(&target.provider) else {
                 continue;
@@ -626,10 +633,13 @@ impl Gateway {
             match outcome {
                 AttemptResult::Served(reply) => {
                     self.remember(&session, &route, &target, &id, index);
-                    return Some(self.adapter_reply(reply, plan.clone(), started));
+                    return Some(self.adapter_reply(reply, plan.clone(), started, &id));
                 }
                 // The same account must not be tried twice in one request.
-                AttemptResult::Cooled => tried.push((target.provider.clone(), id)),
+                AttemptResult::Cooled(failure) => {
+                    last = Some(failure);
+                    tried.push((target.provider.clone(), id));
+                }
                 AttemptResult::Stop(failure @ provider::Failure::Fatal { .. }) => {
                     return Some(failure_reply(shape, failure));
                 }
@@ -790,7 +800,8 @@ impl Gateway {
                 Some(outcome) => {
                     self.lock_pool()
                         .report(provider_name, &account.id, outcome, now);
-                    AttemptResult::Cooled
+                    // Keep the failure so the metric can name the reason.
+                    AttemptResult::Cooled(failure)
                 }
                 None => AttemptResult::Stop(failure),
             },
@@ -901,9 +912,17 @@ impl Gateway {
     }
 
     /// Relay an adapter reply with the same usage accounting as a forwarded one.
-    fn adapter_reply(&self, reply: provider::Reply, plan: Plan, started: Instant) -> Response {
+    fn adapter_reply(
+        &self,
+        reply: provider::Reply,
+        plan: Plan,
+        started: Instant,
+        account: &str,
+    ) -> Response {
         let status = StatusCode::from_u16(reply.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let info = RequestInfo::of(&plan.body);
+        let mut info = RequestInfo::of(&plan.body);
+        // Label the counters with the account that actually served this request.
+        info.account = account.to_owned();
         let sse = is_event_stream(&reply.headers);
         let mut headers = HeaderMap::new();
         for (name, value) in &reply.headers {
@@ -1368,6 +1387,18 @@ fn json_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// Short label for the reason a route moved on.
+fn failure_label(failure: Option<&provider::Failure>) -> &'static str {
+    match failure {
+        Some(provider::Failure::RateLimited { .. }) => "rate_limited",
+        Some(provider::Failure::Quota { .. }) => "quota",
+        Some(provider::Failure::Auth) => "auth",
+        Some(provider::Failure::Retryable) => "retryable",
+        Some(provider::Failure::Fatal { .. }) => "fatal",
+        None => "unknown",
+    }
+}
+
 /// Whether the client asked for a streamed reply.
 fn stream_requested(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
@@ -1389,7 +1420,7 @@ struct Route {
 enum AttemptResult {
     Served(provider::Reply),
     /// The account is cooling down now; the next pick skips it.
-    Cooled,
+    Cooled(provider::Failure),
     /// Not the account's fault: the route moves on to its next target.
     Stop(provider::Failure),
 }
