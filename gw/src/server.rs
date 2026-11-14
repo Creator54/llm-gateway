@@ -114,6 +114,8 @@ struct Gateway {
     max_body: usize,
     /// Where accounts and the usage journal live; adapters read credentials from here.
     state_dir: std::path::PathBuf,
+    /// Per-provider endpoint overrides.
+    endpoints: std::collections::BTreeMap<String, String>,
     cache: cache::Options,
     tidy: tidy::Options,
     /// Learned provider quirks; `None` when the store could not be opened.
@@ -167,6 +169,7 @@ impl Gateway {
             store,
             journal,
             combos: cfg.combos.values().cloned().collect(),
+            endpoints: cfg.endpoints.clone(),
             prefix: Arc::new(Mutex::new(None)),
         })
     }
@@ -497,7 +500,7 @@ impl Gateway {
         let adapter: Box<dyn provider::Provider> = match info.provider.as_str() {
             "opencode" => Box::new(providers::opencode::Opencode::new(
                 self.client.clone(),
-                None,
+                self.endpoints.get(&info.provider).cloned(),
             )),
             _ => return None,
         };

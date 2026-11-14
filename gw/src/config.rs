@@ -19,6 +19,9 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// Combos by name, selected with `combo/<name>`.
     pub combos: BTreeMap<String, Combo>,
+    /// Per-provider endpoint overrides, e.g. a fake upstream in tests.
+    #[serde(default)]
+    pub endpoints: BTreeMap<String, String>,
     /// `default` runs the token-efficiency edits; `parity` turns every one off.
     pub profile: Profile,
     #[serde(default)]
@@ -34,6 +37,7 @@ impl Default for Config {
             state_dir: home().join(".config/gw"),
             max_body_bytes: 32 << 20,
             combos: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
             profile: Profile::Default,
             transforms: Transforms::default(),
         }
