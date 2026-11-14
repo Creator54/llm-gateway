@@ -91,11 +91,7 @@ pub fn classify(status: u16, body: &Value) -> Poll {
 }
 
 /// Authenticated JSON POST with a per-request timeout.
-pub async fn post(
-    http: &reqwest::Client,
-    url: &str,
-    body: &Value,
-) -> Result<(u16, Value)> {
+pub async fn post(http: &reqwest::Client, url: &str, body: &Value) -> Result<(u16, Value)> {
     let response = http
         .post(url)
         .timeout(FETCH_TIMEOUT)
@@ -120,7 +116,9 @@ pub async fn request_user_code(
 ) -> Result<DeviceCode> {
     let (status, body) = post(http, url, &json!({ "client_id": client_id })).await?;
     if !(200..300).contains(&status) {
-        return Err(anyhow!("device authorization request failed: HTTP {status}"));
+        return Err(anyhow!(
+            "device authorization request failed: HTTP {status}"
+        ));
     }
     let device_auth_id = non_empty(&body, "device_auth_id")
         .ok_or_else(|| anyhow!("device authorization response missing device_auth_id"))?;
@@ -150,6 +148,11 @@ where
             return Err(anyhow!("device authorization expired"));
         }
         match fetch().await? {
+            // A single poll can outlive the grant; accepting it would only move the
+            // failure to the token exchange.
+            Poll::Ready(_) if Instant::now() >= deadline => {
+                return Err(anyhow!("device authorization expired"));
+            }
             Poll::Ready(value) => return Ok(value),
             Poll::Expired => return Err(anyhow!("device authorization expired")),
             Poll::Failed(status) => {
@@ -194,7 +197,10 @@ mod tests {
     #[test]
     fn interval_is_coerced_and_bounded() {
         assert_eq!(normalize_interval(Some(&json!(2))), Duration::from_secs(2));
-        assert_eq!(normalize_interval(Some(&json!("3"))), Duration::from_secs(3));
+        assert_eq!(
+            normalize_interval(Some(&json!("3"))),
+            Duration::from_secs(3)
+        );
         // Zero, negative, non-numeric and absurd values fall back or clamp.
         assert_eq!(normalize_interval(Some(&json!(0))), DEFAULT_POLL);
         assert_eq!(normalize_interval(Some(&json!(-1))), DEFAULT_POLL);
@@ -264,14 +270,9 @@ mod tests {
     #[tokio::test]
     async fn failures_and_expiry_end_the_poll() {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let failed = poll_with(
-            || async { Ok(Poll::Failed(418)) },
-            deadline,
-            ms(1),
-            ms(1),
-        )
-        .await
-        .unwrap_err();
+        let failed = poll_with(|| async { Ok(Poll::Failed(418)) }, deadline, ms(1), ms(1))
+            .await
+            .unwrap_err();
         assert!(failed.to_string().contains("418"));
 
         let expired = poll_with(|| async { Ok(Poll::Pending) }, Instant::now(), ms(1), ms(1))

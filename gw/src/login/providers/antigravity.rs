@@ -10,8 +10,7 @@ use std::time::Duration;
 use super::{post_form, Pending};
 use crate::login::{pkce, ui, Options, Tokens};
 
-const CLIENT_ID: &str =
-    concat!("1071006060591-", "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com");
+const CLIENT_ID: &str = concat!("1071006060591-", "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com");
 const CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf");
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -93,7 +92,11 @@ fn extract_project_id(data: &Value) -> Option<String> {
         if let Some(id) = value.as_str().filter(|v| !v.is_empty()) {
             return Some(id.to_string());
         }
-        if let Some(id) = value.get("id").and_then(Value::as_str).filter(|v| !v.is_empty()) {
+        if let Some(id) = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
             return Some(id.to_string());
         }
     }
@@ -121,11 +124,7 @@ async fn post_api(
 }
 
 /// `loadCodeAssist`: the account's existing Cloud Code Assist project.
-pub async fn load_project(
-    http: &reqwest::Client,
-    api_base: &str,
-    access: &str,
-) -> Option<String> {
+pub async fn load_project(http: &reqwest::Client, api_base: &str, access: &str) -> Option<String> {
     let url = format!("{api_base}/{API_VERSION}:loadCodeAssist");
     let (status, body) = post_api(
         http,
@@ -142,11 +141,7 @@ pub async fn load_project(
 }
 
 /// `onboardUser`: create the project for an account that has none yet.
-pub async fn onboard(
-    http: &reqwest::Client,
-    api_base: &str,
-    access: &str,
-) -> Option<String> {
+pub async fn onboard(http: &reqwest::Client, api_base: &str, access: &str) -> Option<String> {
     let url = format!("{api_base}/{API_VERSION}:onboardUser");
     let body = json!({
         "tier_id": "free-tier",
@@ -258,10 +253,12 @@ pub async fn refresh(
     )
     .await?;
     let tokens = tokens(&body, Some(refresh_token))?;
-    Ok(match discover_project(http, api_base, onboard_base, &tokens.access).await {
-        Some(project) => tokens.extra("project_id", project),
-        None => tokens,
-    })
+    Ok(
+        match discover_project(http, api_base, onboard_base, &tokens.access).await {
+            Some(project) => tokens.extra("project_id", project),
+            None => tokens,
+        },
+    )
 }
 
 /// Browser PKCE login on the fixed 127.0.0.1 callback.

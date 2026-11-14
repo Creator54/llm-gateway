@@ -11,34 +11,38 @@ use crate::login::{ui, Options};
 /// Dashboard where the key is created.
 const OPENCODE_ZEN_DASHBOARD: &str = "https://opencode.ai/auth";
 
+/// A pasted key with surrounding whitespace removed.
+pub fn clean(typed: &str) -> Result<String> {
+    let key = typed.trim();
+    if key.is_empty() {
+        return Err(anyhow!("no API key entered"));
+    }
+    Ok(key.to_string())
+}
+
 /// Prompt for a key, optionally echoing the dashboard URL first.
 pub fn prompt_key(dashboard: Option<&str>) -> Result<String> {
     if let Some(url) = dashboard {
         ui::info(&format!("create a key at {url}"));
     }
-    let key = ui::prompt("Paste your opencode-zen API key:").trim().to_string();
-    if key.is_empty() {
-        return Err(anyhow!("no API key entered"));
-    }
-    Ok(key)
+    clean(&ui::prompt("Paste your opencode-zen API key:"))
 }
 
 /// Login by pasting the provider's API key.
 pub async fn login(provider: &str, _opts: &Options) -> Result<Credential> {
-    let dashboard = match provider {
-        "opencode-zen" => Some(OPENCODE_ZEN_DASHBOARD),
-        _ => None,
-    };
-    let dashboard = dashboard.map(str::to_string);
-    let key = tokio::task::spawn_blocking(move || prompt_key(dashboard.as_deref())).await??;
+    let dashboard = (provider == "opencode-zen").then_some(OPENCODE_ZEN_DASHBOARD);
+    let key = tokio::task::spawn_blocking(move || prompt_key(dashboard)).await??;
     Ok(Credential::ApiKey(key))
 }
 
 #[cfg(test)]
 mod tests {
-    /// The prompt trims; only a non-blank answer is accepted.
+    use super::*;
+
     #[test]
-    fn blank_keys_are_rejected() {
-        assert!("   ".trim().is_empty());
+    fn keys_are_trimmed_and_blank_input_is_rejected() {
+        assert_eq!(clean("  sk-abc \n").unwrap(), "sk-abc");
+        assert!(clean("   ").is_err());
+        assert!(clean("").is_err());
     }
 }

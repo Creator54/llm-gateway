@@ -35,7 +35,10 @@ impl TokenRefresher {
     async fn refresh_tokens(&self, cred: &OAuthCred) -> Result<Tokens> {
         let refresh = cred.refresh.as_deref().unwrap_or_default();
         if refresh.is_empty() {
-            return Err(anyhow!("{} has no refresh token; log in again", self.provider));
+            return Err(anyhow!(
+                "{} has no refresh token; log in again",
+                self.provider
+            ));
         }
         let http = &self.http;
         match self.provider.as_str() {

@@ -240,10 +240,13 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let tokens =
-            refresh(&reqwest::Client::new(), &format!("http://{addr}/token"), "old")
-                .await
-                .unwrap();
+        let tokens = refresh(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/token"),
+            "old",
+        )
+        .await
+        .unwrap();
         assert_eq!(tokens.access, "fresh");
         assert_eq!(tokens.refresh.as_deref(), Some("old"));
         task.abort();

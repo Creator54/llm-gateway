@@ -49,7 +49,11 @@ pub fn with_query(base: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// POST a form body, returning status and the parsed JSON payload.
-pub async fn post_form(http: &reqwest::Client, url: &str, params: &[(&str, &str)]) -> Result<(u16, Value)> {
+pub async fn post_form(
+    http: &reqwest::Client,
+    url: &str,
+    params: &[(&str, &str)],
+) -> Result<(u16, Value)> {
     let response = http
         .post(url)
         .timeout(TIMEOUT)
@@ -93,7 +97,10 @@ pub fn jwt_payload(token: &str) -> Option<Value> {
 }
 
 fn claim<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
-    payload.get(key).and_then(Value::as_str).filter(|v| !v.is_empty())
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
 }
 
 /// ChatGPT account id: top-level claim, then the `api.openai.com/auth` namespace,
@@ -193,9 +200,7 @@ pub async fn run(provider: &str, http: &reqwest::Client, opts: &Options) -> Resu
         "openai" | "chatgpt" | "codex" => oauth(openai::login(http, opts).await),
         "google-antigravity" | "antigravity" => oauth(antigravity::login(http, opts).await),
         "kiro" => kiro::login(http, opts).await,
-        "command-code" | "commandcode" => {
-            oauth(command_code::login(http, opts).await.map(|tokens| tokens))
-        }
+        "command-code" | "commandcode" => oauth(command_code::login(http, opts).await),
         "opencode-zen" | "opencode" => key::login("opencode-zen", opts).await,
         other => Err(anyhow!("unknown login provider: {other}")),
     }
@@ -208,8 +213,10 @@ mod tests {
     #[test]
     fn form_encoding_matches_url_search_params() {
         assert_eq!(encode("a b/c"), "a+b%2Fc");
-        assert_eq!(form(&[("grant_type", "authorization_code"), ("code", "a b")]),
-            "grant_type=authorization_code&code=a+b");
+        assert_eq!(
+            form(&[("grant_type", "authorization_code"), ("code", "a b")]),
+            "grant_type=authorization_code&code=a+b"
+        );
         assert_eq!(with_query("https://x/y", &[("a", "1")]), "https://x/y?a=1");
     }
 

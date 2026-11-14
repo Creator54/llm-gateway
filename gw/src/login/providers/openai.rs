@@ -13,8 +13,7 @@ use crate::login::{device, pkce, ui, Flow, Options, Tokens};
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const SCOPE: &str =
-    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const PORT: u16 = 1455;
 const PATH: &str = "/auth/callback";
 const ORIGINATOR: &str = "opencodex";
@@ -136,7 +135,14 @@ pub async fn browser(http: &reqwest::Client, opts: &Options) -> Result<Tokens> {
     ui::info("complete ChatGPT login in your browser");
     let callback = pending.wait(&url, opts).await?;
     let token_url = opts.token_url(TOKEN_URL);
-    exchange(http, &token_url, &redirect_uri, &callback.code, &pkce.verifier).await
+    exchange(
+        http,
+        &token_url,
+        &redirect_uri,
+        &callback.code,
+        &pkce.verifier,
+    )
+    .await
 }
 
 /// Device grant: ask for a user code, poll for the grant, then exchange it.
@@ -185,7 +191,14 @@ pub async fn device(http: &reqwest::Client, opts: &Options) -> Result<Tokens> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("ChatGPT device authorization response missing required fields"))?;
     let token_url = opts.token_url(TOKEN_URL);
-    exchange(http, &token_url, DEVICE_REDIRECT_URI, authorization_code, verifier).await
+    exchange(
+        http,
+        &token_url,
+        DEVICE_REDIRECT_URI,
+        authorization_code,
+        verifier,
+    )
+    .await
 }
 
 /// Pick the flow the caller asked for; browser is the default.
@@ -207,7 +220,9 @@ mod tests {
         let url = auth_url("http://localhost:1455/auth/callback", "chal", "st");
         assert!(url.starts_with("https://auth.openai.com/oauth/authorize?response_type=code"));
         assert!(url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
-        assert!(url.contains("scope=openid+profile+email+offline_access+api.connectors.read+api.connectors.invoke"));
+        assert!(url.contains(
+            "scope=openid+profile+email+offline_access+api.connectors.read+api.connectors.invoke"
+        ));
         assert!(url.contains("codex_cli_simplified_flow=true"));
         assert!(url.contains("id_token_add_organizations=true"));
         assert!(url.contains("originator=opencodex"));
@@ -221,7 +236,9 @@ mod tests {
             post(|body: String| async move {
                 assert!(body.contains("grant_type=authorization_code"));
                 assert!(body.contains("code_verifier=verifier"));
-                assert!(body.contains("redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback"));
+                assert!(body.contains(
+                    "redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback"
+                ));
                 axum::Json(json!({
                     "access_token": "access-1",
                     "refresh_token": "refresh-1",

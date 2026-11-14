@@ -197,7 +197,11 @@ fn respond(status: &str, body: &str) -> String {
 
 /// Open `url` in the desktop browser; failure is not an error, the URL was printed.
 pub fn open_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     let _ = std::process::Command::new(opener)
         .arg(url)
         .stdout(std::process::Stdio::null())
@@ -272,7 +276,9 @@ async fn serve(listener: TcpListener, path: &str, expected_state: &str) -> Resul
         let line = request.lines().next().unwrap_or_default().to_string();
         let reply = match inspect_request(&line, path) {
             Ok(callback) if callback.state.as_deref() == Some(expected_state) => {
-                let _ = socket.write_all(respond("200 OK", SUCCESS_HTML).as_bytes()).await;
+                let _ = socket
+                    .write_all(respond("200 OK", SUCCESS_HTML).as_bytes())
+                    .await;
                 let _ = socket.shutdown().await;
                 return Ok(callback);
             }
@@ -301,9 +307,8 @@ mod tests {
 
     #[test]
     fn parses_a_full_redirect_url() {
-        let parsed = parse_callback_input(
-            "http://localhost:54545/callback?code=xyz&state=abc123#ignored",
-        );
+        let parsed =
+            parse_callback_input("http://localhost:54545/callback?code=xyz&state=abc123#ignored");
         assert_eq!(parsed.kind, Kind::Url);
         assert_eq!(parsed.code.as_deref(), Some("xyz"));
         assert_eq!(parsed.state.as_deref(), Some(STATE));
@@ -327,9 +332,8 @@ mod tests {
 
     #[test]
     fn percent_escapes_are_decoded() {
-        let parsed = parse_callback_input(
-            "http://127.0.0.1:1/callback?code=a%2Fb%2Bc&state=abc123",
-        );
+        let parsed =
+            parse_callback_input("http://127.0.0.1:1/callback?code=a%2Fb%2Bc&state=abc123");
         assert_eq!(parsed.code.as_deref(), Some("a/b+c"));
         let plus = parse_callback_input("?code=a+b&state=abc123");
         assert_eq!(plus.code.as_deref(), Some("a b"));
@@ -353,9 +357,15 @@ mod tests {
 
     #[test]
     fn request_line_is_parsed_and_errors_reported() {
-        let ok = inspect_request("GET /callback?code=x&state=abc123 HTTP/1.1", "/callback").unwrap();
+        let ok =
+            inspect_request("GET /callback?code=x&state=abc123 HTTP/1.1", "/callback").unwrap();
         assert_eq!(ok.code, "x");
-        assert!(inspect_request("GET /callback?code=x HTTP/1.1", "/callback").unwrap().state.is_none());
+        assert!(
+            inspect_request("GET /callback?code=x HTTP/1.1", "/callback")
+                .unwrap()
+                .state
+                .is_none()
+        );
         assert!(inspect_request("GET /other?code=x HTTP/1.1", "/callback").is_err());
         assert!(inspect_request(
             "GET /callback?error=access_denied&error_description=nope HTTP/1.1",
@@ -370,7 +380,9 @@ mod tests {
         let (listener, port) = bind(0, false).await.unwrap();
         let task = tokio::spawn(serve(listener, "/callback", STATE));
         let body = format!("GET /callback?code=xyz&state={STATE} HTTP/1.1\r\nHost: x\r\n\r\n");
-        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         socket.write_all(body.as_bytes()).await.unwrap();
         let mut response = String::new();
         socket.read_to_string(&mut response).await.unwrap();

@@ -4,7 +4,7 @@
 //! callback; the identity is then validated with `whoami` before it is stored.
 
 use anyhow::{anyhow, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -39,10 +39,8 @@ pub fn parse_callback(body: &Value, expected_state: &str) -> Result<Callback> {
     if body.get("state").and_then(Value::as_str) != Some(expected_state) {
         return Err(anyhow!("Command Code OAuth state mismatch"));
     }
-    let get = |key: &str| {
-        field(body, key)
-            .ok_or_else(|| anyhow!("Command Code callback missing {key}"))
-    };
+    let get =
+        |key: &str| field(body, key).ok_or_else(|| anyhow!("Command Code callback missing {key}"));
     Ok(Callback {
         api_key: get("apiKey")?,
         state: expected_state.to_string(),
@@ -53,7 +51,11 @@ pub fn parse_callback(body: &Value, expected_state: &str) -> Result<Callback> {
 }
 
 /// Validate a raw pasted API key and answer with the identity it belongs to.
-pub async fn whoami(http: &reqwest::Client, base_url: &str, api_key: &str) -> Option<(String, String)> {
+pub async fn whoami(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Option<(String, String)> {
     let response = http
         .get(format!("{base_url}/alpha/whoami"))
         .timeout(Duration::from_secs(10))
@@ -102,7 +104,9 @@ pub fn parse_paste(input: &str, expected_state: &str) -> Option<String> {
     }
     if trimmed.starts_with('{') {
         let body: Value = serde_json::from_str(trimmed).ok()?;
-        return parse_callback(&body, expected_state).ok().map(|c| c.api_key);
+        return parse_callback(&body, expected_state)
+            .ok()
+            .map(|c| c.api_key);
     }
     callback::accept_paste(trimmed, expected_state)
         .ok()
@@ -155,7 +159,9 @@ async fn serve(listener: TcpListener, expected_state: String) -> Result<Callback
         let route = request_line.split_whitespace().nth(1).unwrap_or_default();
         let route = route.split('?').next().unwrap_or_default();
         if route != PATH || !is_post {
-            let _ = socket.write_all(reply("405 Method Not Allowed", r#"{"success":false}"#).as_bytes()).await;
+            let _ = socket
+                .write_all(reply("405 Method Not Allowed", r#"{"success":false}"#).as_bytes())
+                .await;
             continue;
         }
         let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -169,7 +175,9 @@ async fn serve(listener: TcpListener, expected_state: String) -> Result<Callback
             }
             Err(err) => {
                 let body = json!({"success": false, "error": err.to_string()});
-                let _ = socket.write_all(reply("400 Bad Request", &body.to_string()).as_bytes()).await;
+                let _ = socket
+                    .write_all(reply("400 Bad Request", &body.to_string()).as_bytes())
+                    .await;
             }
         }
     }
@@ -204,9 +212,7 @@ pub async fn login(http: &reqwest::Client, opts: &Options) -> Result<Tokens> {
         }
         pasted = paste_loop(http, &base_url, &state, opts.allow_paste) => pasted?,
     };
-    let account = whoami(http, &base_url, &key)
-        .await
-        .map(|(id, _)| id);
+    let account = whoami(http, &base_url, &key).await.map(|(id, _)| id);
     Ok(tokens(&key, account))
 }
 
@@ -271,7 +277,10 @@ mod tests {
             Some("k2".to_string())
         );
         assert_eq!(parse_paste("bare-key", STATE), Some("bare-key".to_string()));
-        assert_eq!(parse_paste("http://x/callback?code=k&state=no", STATE), None);
+        assert_eq!(
+            parse_paste("http://x/callback?code=k&state=no", STATE),
+            None
+        );
     }
 
     #[tokio::test]
@@ -282,7 +291,9 @@ mod tests {
             "apiKey": "k", "state": "st", "userId": "u", "userName": "n", "keyName": "cli",
         })
         .to_string();
-        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let request = format!(
             "POST /callback HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()

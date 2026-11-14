@@ -31,9 +31,9 @@ fn valid_profile_arn(value: &str) -> bool {
     };
     account.len() == 12
         && account.chars().all(|c| c.is_ascii_digit())
-        && resource
-            .strip_prefix("profile/")
-            .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && resource.strip_prefix("profile/").is_some_and(|id| {
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
         && parts.next().is_none()
 }
 
@@ -43,6 +43,15 @@ fn field(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
+}
+
+/// Only a plain https URL is shown or opened.
+fn usable_verification_uri(value: &str) -> bool {
+    value.len() <= 2048
+        && !value.chars().any(|c| c.is_control())
+        && value
+            .strip_prefix("https://")
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('@'))
 }
 
 fn millis(value: &Value, key: &str, default: u64) -> Duration {
@@ -60,12 +69,14 @@ pub async fn request_code(
     if !(200..300).contains(&status) {
         return Err(anyhow!("Kiro device authorization failed"));
     }
-    let device_code = field(&payload, "deviceCode")
-        .ok_or_else(|| anyhow!("Kiro device authorization failed"))?;
+    let device_code =
+        field(&payload, "deviceCode").ok_or_else(|| anyhow!("Kiro device authorization failed"))?;
     let user_code =
         field(&payload, "userCode").ok_or_else(|| anyhow!("Kiro device authorization failed"))?;
     let verification = field(&payload, "verificationUriComplete")
+        .filter(|uri| usable_verification_uri(uri))
         .or_else(|| field(&payload, "verificationUri"))
+        .filter(|uri| usable_verification_uri(uri))
         .ok_or_else(|| anyhow!("Kiro device authorization failed"))?;
     let interval = millis(&payload, "intervalInMilliseconds", 5_000);
     Ok((device_code, user_code, verification, interval))
@@ -79,7 +90,9 @@ pub fn tokens(grant: &Value) -> Result<Tokens> {
         .ok_or_else(|| anyhow!("Kiro device authorization response missing refreshToken"))?;
     let profile_arn = field(grant, "profileArn")
         .filter(|arn| valid_profile_arn(arn))
-        .ok_or_else(|| anyhow!("Kiro device authorization response carried no usable profile ARN"))?;
+        .ok_or_else(|| {
+            anyhow!("Kiro device authorization response carried no usable profile ARN")
+        })?;
     let expires_in = grant
         .get("expiresIn")
         .and_then(Value::as_f64)
@@ -179,10 +192,22 @@ mod tests {
     }
 
     #[test]
+    fn verification_uris_are_checked() {
+        assert!(usable_verification_uri("https://view.awsapps.com/start"));
+        assert!(!usable_verification_uri("http://view.awsapps.com/start"));
+        assert!(!usable_verification_uri("https://user@host/"));
+        assert!(!usable_verification_uri("https://host/\u{0}"));
+    }
+
+    #[test]
     fn profile_arns_are_checked() {
         assert!(valid_profile_arn(ARN));
-        assert!(!valid_profile_arn("arn:aws:codewhisperer:us-east-1:123:profile/X"));
-        assert!(!valid_profile_arn("arn:aws:codewhisperer:us-east-1:123456789012:profile/"));
+        assert!(!valid_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:123:profile/X"
+        ));
+        assert!(!valid_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/"
+        ));
         assert!(!valid_profile_arn("not-an-arn"));
         assert!(!valid_profile_arn(
             "arn:aws:codewhisperer:us-east-1:123456789012:profile/X:extra"
