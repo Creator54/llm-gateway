@@ -8,8 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+use toml_edit::{DocumentMut, Item, Table};
 
 /// Agents `gw connect` understands.
 pub const AGENTS: [&str; 4] = ["pi", "opencode", "claude", "codex"];
@@ -42,8 +46,8 @@ pub fn connect(agent: &str, opts: &Connect, home: &Path) -> anyhow::Result<Vec<S
     let sets = agent.files(opts, home)?;
     let mut lines = apply(agent.name(), &sets, &opts.state_dir, home, opts.dry_run)?;
     if agent == Agent::Codex {
-        let key = opts.key.clone().unwrap_or_else(|| "<gateway key>".into());
-        lines.push(format!("codex: export GW_API_KEY={key}"));
+        // The key itself never goes to stdout: it would end up in shell history.
+        lines.push("codex: export GW_API_KEY=$(cat <key-file>)".into());
     }
     Ok(lines)
 }
@@ -58,6 +62,7 @@ pub fn disconnect(agent: &str, home: &Path, state_dir: &Path) -> anyhow::Result<
         return Ok(vec![format!("{name}: not connected")]);
     }
     let mut lines = Vec::new();
+    let mut left = BTreeMap::new();
     for (file, records) in &files {
         let file = PathBuf::from(file);
         if !file.exists() {
@@ -67,14 +72,31 @@ pub fn disconnect(agent: &str, home: &Path, state_dir: &Path) -> anyhow::Result<
             ));
             continue;
         }
-        let kind = if file.extension().and_then(|e| e.to_str()) == Some("toml") {
-            Kind::Toml
-        } else {
-            Kind::Json
-        };
+        let kind = kind_of(&file);
         let mut doc = read_doc(&file, kind)?;
+        if doc.comments_lost() {
+            lines.push(format!(
+                "{name}: {}: has comments, left alone; restore by hand:",
+                rel(&file, home)
+            ));
+            for record in records {
+                lines.push(format!(
+                    "  {} = {}",
+                    record.key,
+                    show(&record.key, record.old.as_ref())
+                ));
+            }
+            left.insert(file.to_string_lossy().into_owned(), records.clone());
+            continue;
+        }
         let mut changed = Vec::new();
+        let mut drifted = Vec::new();
         for record in records {
+            // Only touch values that are still ours; a re-pointed client stays re-pointed.
+            if doc.get(&record.key)?.as_ref() != Some(&record.set) {
+                drifted.push(record.clone());
+                continue;
+            }
             match &record.old {
                 Some(old) => {
                     if doc.get(&record.key)?.as_ref() != Some(old) {
@@ -92,6 +114,16 @@ pub fn disconnect(agent: &str, home: &Path, state_dir: &Path) -> anyhow::Result<
                 }
             }
         }
+        for record in &drifted {
+            lines.push(format!(
+                "{name}: {}: {}: left alone (drifted)",
+                rel(&file, home),
+                record.key
+            ));
+        }
+        if !drifted.is_empty() {
+            left.insert(file.to_string_lossy().into_owned(), drifted);
+        }
         if changed.is_empty() {
             lines.push(format!("{name}: {}: unchanged", rel(&file, home)));
             continue;
@@ -105,7 +137,11 @@ pub fn disconnect(agent: &str, home: &Path, state_dir: &Path) -> anyhow::Result<
         ));
         lines.push(format!("{name}: backup: {}", rel(&backup, home)));
     }
-    manifest.agents.remove(name);
+    if left.is_empty() {
+        manifest.agents.remove(name);
+    } else {
+        manifest.agents.insert(name.to_string(), left);
+    }
     manifest.save(state_dir)?;
     Ok(lines)
 }
@@ -121,12 +157,8 @@ pub fn status(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
         lines.push(format!("{agent}: connected"));
         for (file, records) in files {
             let file = PathBuf::from(file);
+            let kind = kind_of(&file);
             for record in records {
-                let kind = if file.extension().and_then(|e| e.to_str()) == Some("toml") {
-                    Kind::Toml
-                } else {
-                    Kind::Json
-                };
                 let current = if file.exists() {
                     read_doc(&file, kind)?.get(&record.key)?
                 } else {
@@ -145,8 +177,30 @@ pub fn status(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
                 ));
             }
         }
+        if agent == "pi" {
+            if let Some(line) = client_cache_tools(home) {
+                lines.push(format!("{agent}: {line}"));
+            }
+        }
     }
     Ok(lines)
+}
+
+/// Client-side cache rewrites stay installed; gw does not touch them.
+fn client_cache_tools(home: &Path) -> Option<String> {
+    let settings = fs::read_to_string(home.join(".pi/agent/settings.json")).unwrap_or_default();
+    let mut tools = Vec::new();
+    if settings.contains("pi-cache-optimizer") {
+        tools.push("pi-cache-optimizer (~/.pi/agent/settings.json packages)");
+    }
+    if home
+        .join(".pi/agent/extensions/opencodex-anthropic.ts")
+        .exists()
+    {
+        tools.push("opencodex-anthropic.ts (~/.pi/agent/extensions)");
+    }
+    (!tools.is_empty())
+        .then(|| format!("client-side cache tools still active: {}", tools.join(", ")))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -267,12 +321,18 @@ fn key(opts: &Connect) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no gateway key: pass --key-file"))
 }
 
-/// Anthropic clients want the root URL, not the `/v1` suffix.
+fn kind_of(file: &Path) -> Kind {
+    if file.extension().and_then(|e| e.to_str()) == Some("toml") {
+        Kind::Toml
+    } else {
+        Kind::Json
+    }
+}
+
+/// Anthropic clients want the root URL, so drop a single `/v1`.
 fn anthropic_base(url: &str) -> String {
-    url.trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/')
-        .to_string()
+    let url = url.strip_suffix('/').unwrap_or(url);
+    url.strip_suffix("/v1").unwrap_or(url).to_string()
 }
 
 struct WriteSet {
@@ -317,9 +377,26 @@ fn apply(
                 pending.push((path.clone(), value.clone(), current));
             }
         }
-        manifest.set_records(agent, &set.file, next);
         if pending.is_empty() {
             lines.push(format!("{agent}: {}: unchanged", rel(&set.file, home)));
+            if !dry_run {
+                manifest.set_records(agent, &set.file, next);
+                manifest.save(state_dir)?;
+            }
+            continue;
+        }
+        if doc.comments_lost() {
+            // Rewriting would drop the user's comments, so show the edit instead.
+            lines.push(format!(
+                "{agent}: {}: has comments, not written; add by hand:",
+                rel(&set.file, home)
+            ));
+            for (path, value, _) in &pending {
+                lines.push(format!("  {path} = {}", show(path, Some(value))));
+            }
+            if pending.iter().any(|(path, ..)| is_secret(path)) {
+                lines.push("  (keys are not printed; read them from the key file)".into());
+            }
             continue;
         }
         for (path, value, current) in &pending {
@@ -342,8 +419,8 @@ fn apply(
         if let Some(backup) = backup {
             lines.push(format!("{agent}: backup: {}", rel(&backup, home)));
         }
-    }
-    if !dry_run {
+        // Record this file now so a later failure cannot lose what was written.
+        manifest.set_records(agent, &set.file, next);
         manifest.save(state_dir)?;
     }
     Ok(lines)
@@ -373,7 +450,7 @@ impl Scalar {
         }
     }
 
-    fn to_toml(&self) -> toml::Value {
+    fn to_toml(&self) -> toml_edit::Value {
         match self {
             Scalar::Bool(v) => (*v).into(),
             Scalar::Int(v) => (*v).into(),
@@ -382,13 +459,16 @@ impl Scalar {
     }
 }
 
+fn is_secret(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with("apikey") || lower.ends_with("auth_token")
+}
+
 /// Print form; values whose key looks secret are masked.
 fn show(path: &str, value: Option<&Scalar>) -> String {
-    let lower = path.to_ascii_lowercase();
-    let secret = lower.ends_with("apikey") || lower.ends_with("auth_token");
     match value {
         None => "(unset)".into(),
-        Some(_) if secret => "***".into(),
+        Some(_) if is_secret(path) => "***".into(),
         Some(Scalar::Bool(v)) => v.to_string(),
         Some(Scalar::Int(v)) => v.to_string(),
         Some(Scalar::Str(v)) => v.clone(),
@@ -405,13 +485,20 @@ fn scalar_from_json(value: &serde_json::Value) -> anyhow::Result<Option<Scalar>>
     })
 }
 
-fn scalar_from_toml(value: &toml::Value) -> anyhow::Result<Option<Scalar>> {
-    Ok(match value {
-        toml::Value::Boolean(v) => Some(Scalar::Bool(*v)),
-        toml::Value::Integer(v) => Some(Scalar::Int(*v)),
-        toml::Value::String(v) => Some(Scalar::Str(v.clone())),
-        _ => anyhow::bail!("refusing to touch a non-scalar value"),
-    })
+fn scalar_from_toml(item: &Item) -> anyhow::Result<Option<Scalar>> {
+    if item.is_none() {
+        return Ok(None);
+    }
+    if let Some(v) = item.as_str() {
+        return Ok(Some(Scalar::Str(v.into())));
+    }
+    if let Some(v) = item.as_bool() {
+        return Ok(Some(Scalar::Bool(v)));
+    }
+    if let Some(v) = item.as_integer() {
+        return Ok(Some(Scalar::Int(v)));
+    }
+    anyhow::bail!("refusing to touch a non-scalar value")
 }
 
 #[derive(Clone, Copy)]
@@ -423,14 +510,17 @@ enum Kind {
 /// A config file held as a nested table, addressed by dotted keys.
 enum Doc {
     Json(serde_json::Value),
-    Toml(toml::Value),
+    /// JSON that carried comments and must not be written back.
+    Jsonc(serde_json::Value),
+    /// Kept as text so comments and formatting survive the edit.
+    Toml(DocumentMut),
 }
 
 impl Doc {
     fn empty(kind: Kind) -> Self {
         match kind {
             Kind::Json => Doc::Json(serde_json::Value::Object(Default::default())),
-            Kind::Toml => Doc::Toml(toml::Value::Table(Default::default())),
+            Kind::Toml => Doc::Toml(DocumentMut::new()),
         }
     }
 
@@ -439,26 +529,39 @@ impl Doc {
             return Ok(Self::empty(kind));
         }
         Ok(match kind {
-            Kind::Json => Doc::Json(serde_json::from_str(text)?),
-            Kind::Toml => Doc::Toml(toml::Value::Table(toml::from_str(text)?)),
+            Kind::Json => {
+                let (text, comments) = strip_comments(text);
+                let value = serde_json::from_str(&text)?;
+                if comments {
+                    Doc::Jsonc(value)
+                } else {
+                    Doc::Json(value)
+                }
+            }
+            Kind::Toml => Doc::Toml(text.parse::<DocumentMut>()?),
         })
+    }
+
+    fn comments_lost(&self) -> bool {
+        matches!(self, Doc::Jsonc(_))
     }
 
     fn render(&self) -> anyhow::Result<String> {
         Ok(match self {
             Doc::Json(value) => format!("{}\n", serde_json::to_string_pretty(value)?),
-            Doc::Toml(value) => toml::to_string(value)?,
+            Doc::Jsonc(_) => anyhow::bail!("file has comments and cannot be rewritten"),
+            Doc::Toml(doc) => doc.to_string(),
         })
     }
 
     fn get(&self, path: &str) -> anyhow::Result<Option<Scalar>> {
         let keys: Vec<&str> = path.split('.').collect();
         Ok(match self {
-            Doc::Json(root) => json_walk(root, &keys)
+            Doc::Json(root) | Doc::Jsonc(root) => json_walk(root, &keys)
                 .map(scalar_from_json)
                 .transpose()?
                 .flatten(),
-            Doc::Toml(root) => toml_walk(root, &keys)
+            Doc::Toml(root) => toml_walk(root.as_item(), &keys)
                 .map(scalar_from_toml)
                 .transpose()?
                 .flatten(),
@@ -469,16 +572,25 @@ impl Doc {
     fn missing_ancestors(&self, path: &str) -> Vec<String> {
         let keys: Vec<&str> = path.split('.').collect();
         (1..keys.len())
-            .filter(|&depth| !is_table(self, &keys[..depth]))
+            .filter(|&depth| !self.is_table(&keys[..depth]))
             .map(|depth| keys[..depth].join("."))
             .collect()
+    }
+
+    fn is_table(&self, keys: &[&str]) -> bool {
+        match self {
+            Doc::Json(root) | Doc::Jsonc(root) => {
+                json_walk(root, keys).is_some_and(|v| v.is_object())
+            }
+            Doc::Toml(root) => toml_walk(root.as_item(), keys).is_some_and(Item::is_table),
+        }
     }
 
     fn set(&mut self, path: &str, value: Scalar) -> anyhow::Result<()> {
         let keys: Vec<&str> = path.split('.').collect();
         let (last, parents) = keys.split_last().expect("path is never empty");
         match self {
-            Doc::Json(root) => {
+            Doc::Json(root) | Doc::Jsonc(root) => {
                 let mut current = root;
                 for key in parents {
                     current = json_child(current, key)?;
@@ -489,14 +601,17 @@ impl Doc {
                 map.insert((*last).to_string(), value.to_json());
             }
             Doc::Toml(root) => {
-                let mut current = root;
+                let mut table = root.as_table_mut();
                 for key in parents {
-                    current = toml_child(current, key)?;
+                    let item = table
+                        .entry(key)
+                        .or_insert_with(|| Item::Table(Table::new()));
+                    let Some(next) = item.as_table_mut() else {
+                        anyhow::bail!("{path}: parent is not a table");
+                    };
+                    table = next;
                 }
-                let Some(map) = current.as_table_mut() else {
-                    anyhow::bail!("{path}: parent is not a table");
-                };
-                map.insert((*last).to_string(), value.to_toml());
+                table.insert(last, Item::Value(value.to_toml()));
             }
         }
         Ok(())
@@ -506,14 +621,16 @@ impl Doc {
         let keys: Vec<&str> = path.split('.').collect();
         let (last, parents) = keys.split_last().expect("path is never empty");
         match self {
-            Doc::Json(root) => {
+            Doc::Json(root) | Doc::Jsonc(root) => {
                 if let Some(serde_json::Value::Object(map)) = json_walk_mut(root, parents) {
                     map.remove(*last);
                 }
             }
             Doc::Toml(root) => {
-                if let Some(toml::Value::Table(map)) = toml_walk_mut(root, parents) {
-                    map.remove(*last);
+                if let Some(table) =
+                    toml_walk_mut(root.as_item_mut(), parents).and_then(Item::as_table_mut)
+                {
+                    table.remove(last);
                 }
             }
         }
@@ -524,19 +641,26 @@ impl Doc {
         let keys: Vec<&str> = path.split('.').collect();
         let (last, parents) = keys.split_last().expect("path is never empty");
         match self {
-            Doc::Json(root) => {
+            Doc::Json(root) | Doc::Jsonc(root) => {
                 if let Some(serde_json::Value::Object(map)) = json_walk_mut(root, parents) {
-                    let empty = map.get(*last).is_some_and(is_empty_json);
+                    let empty = map
+                        .get(*last)
+                        .is_some_and(|v| v.as_object().is_some_and(|inner| inner.is_empty()));
                     if empty {
                         map.remove(*last);
                     }
                 }
             }
             Doc::Toml(root) => {
-                if let Some(toml::Value::Table(map)) = toml_walk_mut(root, parents) {
-                    let empty = map.get(*last).is_some_and(is_empty_toml);
+                if let Some(table) =
+                    toml_walk_mut(root.as_item_mut(), parents).and_then(Item::as_table_mut)
+                {
+                    let empty = table
+                        .get(last)
+                        .and_then(Item::as_table)
+                        .is_some_and(Table::is_empty);
                     if empty {
-                        map.remove(*last);
+                        table.remove(last);
                     }
                 }
             }
@@ -544,23 +668,51 @@ impl Doc {
     }
 }
 
-fn is_table(doc: &Doc, keys: &[&str]) -> bool {
-    match doc {
-        Doc::Json(root) => json_walk(root, keys).is_some_and(is_object),
-        Doc::Toml(root) => toml_walk(root, keys).is_some_and(toml::Value::is_table),
+/// Strip `//` and `/* */` comments outside strings; reports whether any were found.
+fn strip_comments(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut found = false;
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                found = true;
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push(c);
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                found = true;
+                chars.next();
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            _ => out.push(c),
+        }
     }
-}
-
-fn is_object(value: &serde_json::Value) -> bool {
-    value.is_object()
-}
-
-fn is_empty_json(value: &serde_json::Value) -> bool {
-    value.as_object().is_some_and(|map| map.is_empty())
-}
-
-fn is_empty_toml(value: &toml::Value) -> bool {
-    value.as_table().is_some_and(|map| map.is_empty())
+    (out, found)
 }
 
 fn json_walk<'a>(mut value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
@@ -570,11 +722,11 @@ fn json_walk<'a>(mut value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a 
     Some(value)
 }
 
-fn toml_walk<'a>(mut value: &'a toml::Value, keys: &[&str]) -> Option<&'a toml::Value> {
+fn toml_walk<'a>(mut item: &'a Item, keys: &[&str]) -> Option<&'a Item> {
     for key in keys {
-        value = value.get(*key)?;
+        item = item.get(*key)?;
     }
-    Some(value)
+    Some(item)
 }
 
 fn json_walk_mut<'a>(
@@ -587,11 +739,11 @@ fn json_walk_mut<'a>(
     Some(value)
 }
 
-fn toml_walk_mut<'a>(mut value: &'a mut toml::Value, keys: &[&str]) -> Option<&'a mut toml::Value> {
+fn toml_walk_mut<'a>(mut item: &'a mut Item, keys: &[&str]) -> Option<&'a mut Item> {
     for key in keys {
-        value = value.get_mut(*key)?;
+        item = item.get_mut(*key)?;
     }
-    Some(value)
+    Some(item)
 }
 
 fn json_child<'a>(
@@ -606,50 +758,73 @@ fn json_child<'a>(
         .or_insert_with(|| serde_json::Value::Object(Default::default())))
 }
 
-fn toml_child<'a>(value: &'a mut toml::Value, key: &str) -> anyhow::Result<&'a mut toml::Value> {
-    let Some(map) = value.as_table_mut() else {
-        anyhow::bail!("refusing to replace a non-table value with table {key:?}");
-    };
-    Ok(map
-        .entry(key.to_string())
-        .or_insert_with(|| toml::Value::Table(Default::default())))
-}
-
 fn read_doc(path: &Path, kind: Kind) -> anyhow::Result<Doc> {
     let text = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     Doc::parse(kind, &text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
-/// Copy `file` to `<file>.gw-bak-<unix>` before it is rewritten.
-fn backup(file: &Path) -> anyhow::Result<PathBuf> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    let name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let backup = file.with_file_name(format!("{name}.gw-bak-{stamp}"));
-    fs::copy(file, &backup)?;
-    Ok(backup)
+fn nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Copy `file` to `<file>.gw-bak-<nanos>` before it is rewritten; never overwrites.
+fn backup(file: &Path) -> anyhow::Result<PathBuf> {
+    let stamp = nanos();
+    let name = file_name(file);
+    for attempt in 0..100 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let backup = file.with_file_name(format!("{name}.gw-bak-{stamp}{suffix}"));
+        let mut dst = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(dst) => dst,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+        io::copy(&mut fs::File::open(file)?, &mut dst)?;
+        dst.set_permissions(fs::metadata(file)?.permissions())?;
+        return Ok(backup);
+    }
+    anyhow::bail!("{}: cannot create a backup", file.display())
+}
+
+/// Write through a private tmp file so configs holding keys are never group/world readable.
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.gw-tmp-{}", std::process::id()));
-    fs::write(&tmp, bytes)?;
-    if let Ok(meta) = fs::metadata(path) {
-        fs::set_permissions(&tmp, meta.permissions())?;
+    let tmp = path.with_file_name(format!("{}.gw-tmp-{}", file_name(path), nanos()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    result
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -682,7 +857,7 @@ impl Manifest {
             Ok(text) => {
                 serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
         }
     }
@@ -694,6 +869,11 @@ impl Manifest {
         if fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
             return Ok(());
         }
+        // The manifest holds the old values it replaced, so keep it private.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state_dir)?;
         write_atomic(&path, text.as_bytes())
     }
 
@@ -717,6 +897,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Sandbox {
@@ -757,6 +938,14 @@ mod tests {
 
         fn read_toml(&self, rel: &str) -> toml::Value {
             toml::from_str(&fs::read_to_string(self.home().join(rel)).unwrap()).unwrap()
+        }
+
+        fn mode(&self, rel: &str) -> u32 {
+            fs::metadata(self.home().join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
         }
 
         fn backups(&self, rel: &str) -> usize {
@@ -872,6 +1061,53 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_keeps_the_first_original() {
+        let sandbox = pi_sandbox();
+        connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
+        connect(
+            "pi",
+            &sandbox.opts("http://127.0.0.1:9999/v1", "sk-new"),
+            &sandbox.home(),
+        )
+        .unwrap();
+        disconnect("pi", &sandbox.home(), &sandbox.state()).unwrap();
+        let models = sandbox.read_json(".pi/agent/models.json");
+        assert_eq!(
+            models["providers"]["gateway"]["baseUrl"],
+            "https://old.example/v1"
+        );
+        assert_eq!(models["providers"]["gateway"]["apiKey"], "sk-old");
+    }
+
+    #[test]
+    fn disconnect_leaves_drifted_values_alone() {
+        let sandbox = pi_sandbox();
+        connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
+
+        let mut models = sandbox.read_json(".pi/agent/models.json");
+        models["providers"]["gateway"]["apiKey"] = serde_json::json!("sk-user-rotated");
+        sandbox.write(
+            ".pi/agent/models.json",
+            &serde_json::to_string(&models).unwrap(),
+        );
+
+        let lines = disconnect("pi", &sandbox.home(), &sandbox.state()).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("left alone (drifted)")),
+            "{lines:?}"
+        );
+        let models = sandbox.read_json(".pi/agent/models.json");
+        assert_eq!(models["providers"]["gateway"]["apiKey"], "sk-user-rotated");
+        assert_eq!(
+            models["providers"]["gateway"]["baseUrl"],
+            "https://old.example/v1"
+        );
+        // The drifted record stays recorded so a later disconnect can still reach it.
+        let status = status(&sandbox.home(), &sandbox.state()).unwrap();
+        assert!(status.iter().any(|l| l.contains("drifted")), "{status:?}");
+    }
+
+    #[test]
     fn pi_dry_run_writes_nothing() {
         let sandbox = pi_sandbox();
         let before = fs::read_to_string(sandbox.home().join(".pi/agent/models.json")).unwrap();
@@ -894,6 +1130,102 @@ mod tests {
         let sandbox = Sandbox::new();
         let lines = disconnect("pi", &sandbox.home(), &sandbox.state()).unwrap();
         assert_eq!(lines, vec!["pi: not connected".to_string()]);
+    }
+
+    #[test]
+    fn state_dir_and_manifest_are_private() {
+        let sandbox = pi_sandbox();
+        // Start with no state dir so connect has to create it.
+        fs::remove_dir_all(sandbox.state()).unwrap();
+        connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
+
+        let dir = fs::metadata(sandbox.state()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir, 0o700);
+        let manifest = fs::metadata(Manifest::path(&sandbox.state()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(manifest, 0o600);
+        assert_eq!(sandbox.mode(".pi/agent/models.json"), 0o600);
+        assert_eq!(sandbox.mode(".pi/agent/settings.json"), 0o600);
+    }
+
+    #[test]
+    fn manifest_is_saved_per_file_so_earlier_writes_stay_recorded() {
+        let sandbox = pi_sandbox();
+        // A directory where settings.json belongs makes the second write fail.
+        fs::remove_file(sandbox.home().join(".pi/agent/settings.json")).unwrap();
+        fs::create_dir(sandbox.home().join(".pi/agent/settings.json")).unwrap();
+
+        connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap_err();
+
+        let text = fs::read_to_string(Manifest::path(&sandbox.state())).unwrap();
+        assert!(text.contains("models.json"), "{text}");
+    }
+
+    #[test]
+    fn backups_use_nanoseconds_and_never_collide() {
+        let sandbox = pi_sandbox();
+        let file = sandbox.home().join(".pi/agent/models.json");
+        let first = backup(&file).unwrap();
+        let second = backup(&file).unwrap();
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains(".gw-bak-"));
+        assert!(second.to_string_lossy().contains(".gw-bak-"));
+    }
+
+    #[test]
+    fn anthropic_base_trims_one_v1() {
+        assert_eq!(
+            anthropic_base("http://127.0.0.1:10204/v1"),
+            "http://127.0.0.1:10204"
+        );
+        assert_eq!(
+            anthropic_base("http://127.0.0.1:10204/v1/"),
+            "http://127.0.0.1:10204"
+        );
+        assert_eq!(anthropic_base("http://h/v1/v1"), "http://h/v1");
+        assert_eq!(anthropic_base("http://h/v1beta"), "http://h/v1beta");
+    }
+
+    #[test]
+    fn non_scalar_values_are_refused() {
+        let sandbox = Sandbox::new();
+        sandbox.write(
+            ".pi/agent/models.json",
+            r#"{"providers":{"gateway":{"baseUrl":{"nested":"x"}}}}"#,
+        );
+        let error = connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap_err();
+        assert!(error.to_string().contains("non-scalar"), "{error}");
+    }
+
+    #[test]
+    fn status_reports_client_side_cache_tools() {
+        let sandbox = pi_sandbox();
+        sandbox.write(
+            ".pi/agent/settings.json",
+            r#"{"theme":"dark","cacheWarming":"on","packages":["npm:pi-cache-optimizer"]}"#,
+        );
+        sandbox.write(".pi/agent/extensions/opencodex-anthropic.ts", "// ext\n");
+        connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
+
+        let lines = status(&sandbox.home(), &sandbox.state()).unwrap();
+        assert!(
+            lines.contains(
+                &"pi: client-side cache tools still active: pi-cache-optimizer (~/.pi/agent/settings.json packages), opencodex-anthropic.ts (~/.pi/agent/extensions)".to_string()
+            ),
+            "{lines:?}"
+        );
+        // Reported only: the package and the extension stay in place.
+        assert_eq!(
+            sandbox.read_json(".pi/agent/settings.json")["packages"][0],
+            "npm:pi-cache-optimizer"
+        );
+        assert!(sandbox
+            .home()
+            .join(".pi/agent/extensions/opencodex-anthropic.ts")
+            .exists());
     }
 
     fn opencode_sandbox() -> Sandbox {
@@ -926,6 +1258,30 @@ mod tests {
         let config = sandbox.read_json(".config/opencode/opencode.json");
         assert!(config["provider"].get("gw").is_none(), "{}", config);
         assert!(config["provider"]["headroom"].is_object());
+    }
+
+    #[test]
+    fn opencode_jsonc_with_comments_is_not_rewritten() {
+        let sandbox = Sandbox::new();
+        let body = "// keep me\n{\n  /* block */\n  \"provider\": {}\n}\n";
+        sandbox.write(".config/opencode/opencode.jsonc", body);
+
+        let lines = connect("opencode", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("has comments, not written")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains(KEY)),
+            "key leaked: {lines:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(sandbox.home().join(".config/opencode/opencode.jsonc")).unwrap(),
+            body
+        );
+        assert!(!Manifest::path(&sandbox.state()).exists());
     }
 
     #[test]
@@ -1004,8 +1360,12 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == &format!("codex: export GW_API_KEY={KEY}")),
+                .any(|l| l == "codex: export GW_API_KEY=$(cat <key-file>)"),
             "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains(KEY)),
+            "key leaked: {lines:?}"
         );
 
         let config = sandbox.read_toml(".codex/config.toml");
@@ -1043,6 +1403,23 @@ mod tests {
                 .is_none(),
             "gw table should be removed"
         );
+    }
+
+    #[test]
+    fn codex_keeps_comments_and_layout() {
+        let sandbox = Sandbox::new();
+        sandbox.write(
+            ".codex/config.toml",
+            "# top comment\nmodel = \"gpt-5\" # inline\n\n# provider note\n[model_providers.headroom]\nname = \"headroom\"\n",
+        );
+        connect("codex", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
+
+        let text = fs::read_to_string(sandbox.home().join(".codex/config.toml")).unwrap();
+        assert!(text.contains("# top comment"), "{text}");
+        assert!(text.contains("# inline"), "{text}");
+        assert!(text.contains("# provider note"), "{text}");
+        let config = sandbox.read_toml(".codex/config.toml");
+        assert_eq!(config.get("model_provider").unwrap().as_str(), Some("gw"));
     }
 
     #[test]
