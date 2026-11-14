@@ -222,6 +222,28 @@ impl Pool {
         chosen
     }
 
+    /// Put a session on an account outside a pick, e.g. one a restart remembered.
+    /// False when the account is unknown or cannot serve now.
+    pub fn bind_session(
+        &mut self,
+        provider: &str,
+        session: &str,
+        account: &str,
+        now: Instant,
+    ) -> bool {
+        let ready = self.providers.get(provider).is_some_and(|states| {
+            states.iter().any(|state| {
+                state.id == account
+                    && !state.paused
+                    && state.cooldown.is_none_or(|(until, _)| until <= now)
+            })
+        });
+        if ready {
+            self.bind(session, provider, account, now);
+        }
+        ready
+    }
+
     /// Accounts of a provider with their paused and cooldown state.
     pub fn accounts(&self, provider: &str) -> Vec<AccountInfo> {
         self.providers
