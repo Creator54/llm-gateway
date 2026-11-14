@@ -376,12 +376,20 @@ async fn forward(State(st): State<Arc<Gateway>>, req: Request) -> Response {
 
 /// Forward one request after the cache and tidy edits; any failure keeps the original bytes.
 async fn transformed(State(st): State<Arc<Gateway>>, req: Request) -> Response {
+    // Held until the response body is fully streamed, so the gauge means "in flight".
+    let _inflight = st.metrics.inflight();
     let mut plan = match prepare(&st, req).await {
         Ok(plan) => plan,
         Err(response) => return response,
     };
     if !plan.body.is_empty() && plan.method != axum::http::Method::HEAD {
+        let before = plan.body.len();
         if let Some((body, applied)) = st.edit(&plan.body, family(&plan.path_and_query)) {
+            let saved = before.saturating_sub(body.len()) as u64;
+            for name in &applied {
+                st.metrics
+                    .transform(name, metrics::TransformResult::Applied, saved);
+            }
             plan.body = body;
             plan.applied = applied;
         }
@@ -633,6 +641,8 @@ impl Gateway {
             match outcome {
                 AttemptResult::Served(reply) => {
                     self.remember(&session, &route, &target, &id, index);
+                    // Clearing on success keeps the gauge honest after a recovery.
+                    self.metrics.set_cooling(&target.provider, &id, false);
                     return Some(self.adapter_reply(reply, plan.clone(), started, &id));
                 }
                 // The same account must not be tried twice in one request.
@@ -800,6 +810,8 @@ impl Gateway {
                 Some(outcome) => {
                     self.lock_pool()
                         .report(provider_name, &account.id, outcome, now);
+                    // Mirror the cooldown so a scrape shows which accounts are out.
+                    self.metrics.set_cooling(provider_name, &account.id, true);
                     // Keep the failure so the metric can name the reason.
                     AttemptResult::Cooled(failure)
                 }
