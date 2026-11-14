@@ -1,7 +1,12 @@
+pub mod cache;
 pub mod combo;
 pub mod config;
+pub mod connect;
+pub mod creds;
+pub mod journal;
 pub mod pool;
 pub mod provider;
 pub mod route;
 pub mod server;
+pub mod store;
 pub mod translate;
