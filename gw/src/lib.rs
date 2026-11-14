@@ -14,5 +14,5 @@ pub mod server;
 pub mod store;
 pub mod tidy;
 pub mod tokens;
-pub mod ui;
 pub mod translate;
+pub mod ui;

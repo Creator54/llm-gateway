@@ -1,8 +1,27 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}
+
+{all-args}{after-help}";
+
+const EXAMPLES: &str = "\
+Examples:
+  gw serve                      run the gateway
+  gw connect pi                 point pi at the gateway
+  gw status                     show accounts and routes";
+
 #[derive(Parser)]
-#[command(name = "gw", about = "One local gateway for LLM agents")]
+#[command(
+    name = "gw",
+    version,
+    about = "One local gateway for all your LLM agents.",
+    styles = gw::ui::styles(),
+    help_template = HELP_TEMPLATE,
+    after_help = EXAMPLES
+)]
 struct Cli {
     /// Config file (default: $GW_CONFIG or ~/.config/gw/config.toml)
     #[arg(long, global = true)]
