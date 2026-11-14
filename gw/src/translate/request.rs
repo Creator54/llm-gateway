@@ -39,7 +39,7 @@ pub fn responses_to_chat(request: &Value, upstream_model: &str) -> Result<Value,
     if let Some(effort) = request.pointer("/reasoning/effort") {
         object.insert("reasoning_effort".into(), effort.clone());
     }
-    if let Some(tools) = chat_tools(request.get("tools")) {
+    if let Some(tools) = chat_tools(request.get("tools"))? {
         object.insert("tools".into(), Value::Array(tools));
     }
     if let Some(choice) = request.get("tool_choice") {
@@ -91,18 +91,28 @@ pub fn messages_to_chat(request: &Value, upstream_model: &str) -> Result<Value, 
     copy(request, object, "top_p", "top_p");
     copy(request, object, "stop_sequences", "stop");
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
-        let tools: Vec<Value> = tools
-            .iter()
-            .filter_map(|tool| {
-                Some(json!({ "type": "function", "function": {
-                    "name": tool.get("name")?,
-                    "description": tool.get("description").cloned().unwrap_or(Value::Null),
-                    "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({ "type": "object" })),
-                }}))
-            })
-            .collect();
-        if !tools.is_empty() {
-            object.insert("tools".into(), Value::Array(tools));
+        let mut converted = Vec::new();
+        for tool in tools {
+            match tool.get("type").and_then(Value::as_str) {
+                // Older clients send custom tools without a type.
+                None | Some("custom") => {}
+                Some(other) => {
+                    return Err(Error::bad_request(&format!(
+                        "unsupported tool type '{other}'"
+                    )))
+                }
+            }
+            let name = tool
+                .get("name")
+                .ok_or_else(|| Error::bad_request("tool is missing 'name'"))?;
+            converted.push(json!({ "type": "function", "function": {
+                "name": name,
+                "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({ "type": "object" })),
+            }}));
+        }
+        if !converted.is_empty() {
+            object.insert("tools".into(), Value::Array(converted));
         }
     }
     if let Some(choice) = request.get("tool_choice") {
@@ -118,11 +128,11 @@ fn copy(source: &Value, target: &mut Map<String, Value>, from: &str, to: &str) {
 }
 
 fn responses_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Error> {
-    match item
+    let kind = item
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("message")
-    {
+        .unwrap_or("message");
+    match kind {
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = item
@@ -131,22 +141,40 @@ fn responses_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Error> 
             messages.push(json!({ "role": role, "content": content_to_chat(content) }));
         }
         "function_call" => {
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-            messages.push(json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
-                    "type": "function",
-                    "function": { "name": name, "arguments": arguments_text(item.get("arguments")) }
-                }]
-            }));
+            let call = json!({
+                "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    "arguments": arguments_text(item.get("arguments")),
+                }
+            });
+            let merge = messages.last().is_some_and(|last| {
+                last.get("role").and_then(Value::as_str) == Some("assistant")
+                    && last.get("tool_calls").is_some_and(Value::is_array)
+            });
+            if !merge {
+                messages.push(json!({ "role": "assistant", "content": null, "tool_calls": [call] }));
+                return Ok(());
+            }
+            if let Some(calls) = messages
+                .last_mut()
+                .and_then(|last| last.get_mut("tool_calls"))
+                .and_then(Value::as_array_mut)
+            {
+                calls.push(call);
+            }
         }
         "function_call_output" => messages.push(json!({
             "role": "tool",
             "tool_call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
             "content": content_to_text(item.get("output").unwrap_or(&Value::Null)),
         })),
-        _ => {}
+        other => {
+            return Err(Error::bad_request(&format!(
+                "unsupported input item type '{other}'"
+            )))
+        }
     }
     Ok(())
 }
@@ -240,7 +268,12 @@ fn messages_message(message: &Value, messages: &mut Vec<Value>) {
     // Tool results must directly follow the assistant tool calls in Chat.
     messages.extend(results);
     if !calls.is_empty() {
-        messages.push(json!({ "role": "assistant", "content": "", "tool_calls": calls }));
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        messages.push(json!({ "role": role, "content": text, "tool_calls": calls }));
     } else if !parts.is_empty() {
         messages.push(json!({ "role": role, "content": parts }));
     }
@@ -259,23 +292,34 @@ fn messages_tool_choice(choice: &Value) -> Value {
     }
 }
 
-fn chat_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
-    let tools: Vec<Value> = tools?
-        .as_array()?
-        .iter()
-        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
-        .filter_map(|tool| {
-            if let Some(function) = tool.get("function") {
-                return Some(json!({ "type": "function", "function": function }));
+fn chat_tools(tools: Option<&Value>) -> Result<Option<Vec<Value>>, Error> {
+    let Some(tools) = tools.and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut converted = Vec::new();
+    for tool in tools {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") => {}
+            // Older clients omit `type` and send `function` or `name` directly.
+            None if tool.get("function").is_some() || tool.get("name").is_some() => {}
+            Some(other) => {
+                return Err(Error::bad_request(&format!(
+                    "unsupported tool type '{other}'"
+                )))
             }
-            Some(json!({ "type": "function", "function": {
-                "name": tool.get("name")?,
+            None => return Err(Error::bad_request("tool is missing 'type'")),
+        }
+        let function = match tool.get("function") {
+            Some(function) => function.clone(),
+            None => json!({
+                "name": tool.get("name").ok_or_else(|| Error::bad_request("tool is missing 'name'"))?,
                 "description": tool.get("description").cloned().unwrap_or(Value::Null),
                 "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
-            }}))
-        })
-        .collect();
-    (!tools.is_empty()).then_some(tools)
+            }),
+        };
+        converted.push(json!({ "type": "function", "function": function }));
+    }
+    Ok((!converted.is_empty()).then_some(converted))
 }
 
 fn arguments_text(value: Option<&Value>) -> Value {
@@ -444,6 +488,80 @@ mod tests {
         assert_eq!(
             messages_to_chat(&request, "m").unwrap()["tool_choice"],
             "required"
+        );
+    }
+
+    #[test]
+    fn merges_messages_text_and_tool_use_into_one_turn() {
+        let request = json!({
+            "model": "m",
+            "messages": [{ "role": "assistant", "content": [
+                { "type": "text", "text": "one" },
+                { "type": "text", "text": "two" },
+                { "type": "tool_use", "id": "toolu_1", "name": "read", "input": { "path": "a" } }
+            ]}]
+        });
+        let chat = messages_to_chat(&request, "m").unwrap();
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["messages"][0]["role"], "assistant");
+        assert_eq!(chat["messages"][0]["content"], "one\ntwo");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
+    }
+
+    #[test]
+    fn merges_consecutive_function_calls() {
+        let request = json!({
+            "model": "m",
+            "input": [
+                { "type": "message", "role": "user", "content": "go" },
+                { "type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}" },
+                { "type": "function_call", "call_id": "call_2", "name": "write", "arguments": "{}" }
+            ]
+        });
+        let chat = responses_to_chat(&request, "m").unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], Value::Null);
+        let calls = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[1]["id"], "call_2");
+    }
+
+    #[test]
+    fn rejects_unknown_input_item_type() {
+        let request = json!({
+            "model": "m",
+            "input": [
+                { "type": "function_call", "call_id": "c", "name": "read", "arguments": "{}" },
+                { "type": "reasoning", "summary": [] }
+            ]
+        });
+        let error = responses_to_chat(&request, "m").unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("reasoning"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_unsupported_tool_types() {
+        let responses = json!({ "model": "m", "input": "hi",
+            "tools": [{ "type": "web_search" }] });
+        let error = responses_to_chat(&responses, "m").unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("web_search"), "{}", error.message);
+
+        let messages = json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "computer_20241022", "name": "computer" }] });
+        let error = messages_to_chat(&messages, "m").unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(
+            error.message.contains("computer_20241022"),
+            "{}",
+            error.message
         );
     }
 }

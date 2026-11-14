@@ -3,8 +3,13 @@
 use super::{messages_usage, new_id, now, responses_usage, stop_reason, Error};
 use serde_json::{json, Value};
 
-/// Chat reply as a Responses object.
-pub fn chat_to_responses(chat: &Value, requested_model: &str) -> Result<Value, Error> {
+/// Chat reply as a Responses object. `parallel_tool_calls` echoes the request
+/// when the client sent one.
+pub fn chat_to_responses(
+    chat: &Value,
+    requested_model: &str,
+    parallel_tool_calls: Option<bool>,
+) -> Result<Value, Error> {
     let message = chat
         .pointer("/choices/0/message")
         .ok_or_else(|| Error::bad_gateway("upstream response has no choices"))?;
@@ -19,12 +24,19 @@ pub fn chat_to_responses(chat: &Value, requested_model: &str) -> Result<Value, E
     for call in &calls {
         output.push(function_call_item(call, "completed"));
     }
-    Ok(json!({
+    let finish = finish_reason(chat);
+    let truncated = finish == Some("length");
+    let mut response = json!({
         "id": new_id("resp"), "object": "response", "created_at": now(),
-        "status": "completed", "error": null, "model": requested_model,
-        "output": output, "parallel_tool_calls": true,
+        "status": if truncated { "incomplete" } else { "completed" },
+        "error": null, "model": requested_model,
+        "output": output, "parallel_tool_calls": parallel_tool_calls.unwrap_or(true),
         "usage": responses_usage(&usage_of(chat)),
-    }))
+    });
+    if truncated {
+        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    }
+    Ok(response)
 }
 
 /// Chat reply as a Messages object.
@@ -45,19 +57,22 @@ pub fn chat_to_messages(chat: &Value, requested_model: &str) -> Result<Value, Er
             "input": input_of(call),
         }));
     }
-    let finish = chat
-        .pointer("/choices/0/finish_reason")
-        .and_then(Value::as_str);
     Ok(json!({
         "id": new_id("msg"), "type": "message", "role": "assistant",
         "model": requested_model, "content": content,
-        "stop_reason": stop_reason(finish, !calls.is_empty()), "stop_sequence": null,
+        "stop_reason": stop_reason(finish_reason(chat), !calls.is_empty()),
+        "stop_sequence": null,
         "usage": messages_usage(&usage_of(chat)),
     }))
 }
 
 pub(super) fn usage_of(chat: &Value) -> Value {
     chat.get("usage").cloned().unwrap_or_else(|| json!({}))
+}
+
+pub(super) fn finish_reason(chat: &Value) -> Option<&str> {
+    chat.pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
 }
 
 pub(super) fn text_of(message: &Value) -> Option<&str> {
@@ -119,6 +134,7 @@ mod tests {
                 "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
             }),
             "provider/model",
+            None,
         )
         .unwrap();
         assert_eq!(response["object"], "response");
@@ -128,6 +144,8 @@ mod tests {
         assert_eq!(response["usage"]["input_tokens"], 10);
         assert_eq!(response["usage"]["output_tokens"], 3);
         assert_eq!(response["usage"]["total_tokens"], 13);
+        assert_eq!(response["parallel_tool_calls"], true);
+        assert!(response.get("incomplete_details").is_none());
     }
 
     #[test]
@@ -141,6 +159,7 @@ mod tests {
                 }
             }),
             "m",
+            None,
         )
         .unwrap();
         assert_eq!(response["usage"]["input_tokens"], 100);
@@ -158,6 +177,7 @@ mod tests {
                 "function": { "name": "read", "arguments": "{\"path\":\"a\"}" }
             }]}, "finish_reason": "tool_calls" }] }),
             "m",
+            None,
         )
         .unwrap();
         let item = &response["output"][0];
@@ -199,7 +219,29 @@ mod tests {
 
     #[test]
     fn rejects_reply_without_choices() {
-        assert_eq!(chat_to_messages(&json!({}), "m").unwrap_err().status, 502);
-        assert_eq!(chat_to_responses(&json!({}), "m").unwrap_err().status, 502);
+        assert_eq!(
+            chat_to_messages(&json!({}), "m").unwrap_err().status,
+            502
+        );
+        assert_eq!(
+            chat_to_responses(&json!({}), "m", None).unwrap_err().status,
+            502
+        );
+    }
+
+    #[test]
+    fn maps_length_finish_to_incomplete_response() {
+        let response = chat_to_responses(
+            &json!({ "choices": [{ "message": { "content": "cut" }, "finish_reason": "length" }] }),
+            "m",
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(response["parallel_tool_calls"], false);
     }
 }
