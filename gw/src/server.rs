@@ -20,8 +20,8 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::{
-    cache, config::Config, journal::Journal, models, route, store::Store, tidy, tokens,
-    translate::SseParser, usage,
+    cache, config::Config, creds, journal::Journal, models, provider, providers, route,
+    store::Store, tidy, tokens, translate::SseParser, usage,
 };
 
 /// How long in-flight requests may keep the process alive after a shutdown signal.
@@ -112,6 +112,8 @@ struct Gateway {
     /// Key clients must send; `None` disables auth.
     key: Option<Arc<str>>,
     max_body: usize,
+    /// Where accounts and the usage journal live; adapters read credentials from here.
+    state_dir: std::path::PathBuf,
     cache: cache::Options,
     tidy: tidy::Options,
     /// Learned provider quirks; `None` when the store could not be opened.
@@ -159,6 +161,7 @@ impl Gateway {
             fallback: cfg.fallback.clone(),
             key,
             max_body: cfg.max_body_bytes,
+            state_dir: cfg.state_dir.clone(),
             cache: cfg.cache_options(),
             tidy: cfg.tidy_options(),
             store,
@@ -281,7 +284,11 @@ async fn prepare(st: &Gateway, req: Request) -> Result<Plan, Response> {
 /// Forward one request to the fallback upstream, byte for byte.
 async fn forward(State(st): State<Arc<Gateway>>, req: Request) -> Response {
     match prepare(&st, req).await {
-        Ok(plan) => st.send(plan).await,
+        // A provider with a native adapter is served here; everything else is forwarded.
+        Ok(plan) => match st.native(&plan).await {
+            Some(response) => response,
+            None => st.send(plan).await,
+        },
         Err(response) => response,
     }
 }
@@ -465,6 +472,108 @@ impl Gateway {
     }
 
     /// Pass the upstream reply through untouched except for the transforms header.
+    /// Serve a request through a native adapter when the route names one.
+    ///
+    /// Returns `None` when no adapter owns the provider, so the caller falls back
+    /// to plain forwarding.
+    async fn native(&self, plan: &Plan) -> Option<Response> {
+        let started = Instant::now();
+        let inbound = match plan.path_and_query.split('?').next().unwrap_or_default() {
+            "/v1/messages" => provider::Inbound::Messages,
+            "/v1/responses" => provider::Inbound::Responses,
+            "/v1/chat/completions" => provider::Inbound::Chat,
+            _ => return None,
+        };
+        let info = RequestInfo::of(&plan.body);
+        // Routing already resolved `provider/model`; an unqualified model has no adapter.
+        if info.provider.is_empty() || info.provider == "combo" || info.provider == "auto" {
+            return None;
+        }
+        let adapter: Box<dyn provider::Provider> = match info.provider.as_str() {
+            "opencode" => Box::new(providers::opencode::Opencode::new(
+                self.client.clone(),
+                None,
+            )),
+            _ => return None,
+        };
+        let account = match self.account(&info.provider) {
+            Ok(account) => account,
+            Err(response) => return Some(*response),
+        };
+        let request = provider::Request {
+            inbound,
+            model: info.model.clone(),
+            headers: plan.headers.clone(),
+            body: plan.body.clone(),
+            stream: stream_requested(&plan.body),
+            session: session_key(&plan.body),
+        };
+        let reply = match adapter.send(&request, &account).await {
+            Ok(reply) => reply,
+            Err(failure) => return Some(failure_response(failure)),
+        };
+        Some(self.adapter_reply(reply, plan.clone(), started))
+    }
+
+    /// The account to bill for `provider`; the free tier needs none.
+    fn account(&self, provider: &str) -> Result<provider::Account, Box<Response>> {
+        let store = creds::Store::load(&self.state_dir).map_err(|_| {
+            Box::new(json_error(
+                StatusCode::BAD_GATEWAY,
+                "credential store is unreadable",
+            ))
+        })?;
+        match store.accounts(provider).into_iter().next() {
+            Some(entry) => Ok(provider::Account::from(&entry)),
+            // The adapter sends the anonymous marker when there is no key.
+            None if provider == "opencode" => Ok(provider::Account {
+                id: "anonymous".to_owned(),
+                credential: provider::Credential::None,
+                extra: Default::default(),
+            }),
+            None => Err(Box::new(json_error(
+                StatusCode::BAD_GATEWAY,
+                "no account for this provider",
+            ))),
+        }
+    }
+
+    /// Relay an adapter reply with the same usage accounting as a forwarded one.
+    fn adapter_reply(&self, reply: provider::Reply, plan: Plan, started: Instant) -> Response {
+        let status = StatusCode::from_u16(reply.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let info = RequestInfo::of(&plan.body);
+        let sse = is_event_stream(&reply.headers);
+        let mut headers = HeaderMap::new();
+        for (name, value) in &reply.headers {
+            if hop_by_hop(name) {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
+        }
+        if let Some(value) = plan.header() {
+            headers.insert(TRANSFORMS, value);
+        }
+        let tracked = Tracked {
+            inner: reply.body,
+            sse: sse.then(SseParser::new),
+            full: None,
+            tokens: usage::Tokens::default(),
+            track: Some(Track {
+                path: plan.path_and_query.clone(),
+                info,
+                status: status.as_u16(),
+                started,
+                hash: prefix(&plan.body),
+                journal: self.journal.clone(),
+                prefix: Arc::clone(&self.prefix),
+            }),
+        };
+        let mut response = Response::new(Body::from_stream(tracked));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        response
+    }
+
     fn reply(&self, upstream: reqwest::Response, plan: Plan, started: Instant) -> Response {
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -487,7 +596,10 @@ impl Gateway {
             headers.insert(TRANSFORMS, value);
         }
         let tracked = Tracked {
-            inner: Box::pin(upstream.bytes_stream()),
+            inner: upstream
+                .bytes_stream()
+                .map(|c| c.map_err(std::io::Error::other))
+                .boxed(),
             sse: sse.then(SseParser::new),
             // An SSE reply is read as events, never as one JSON body.
             full: (buffered && !sse).then(Vec::new),
@@ -755,7 +867,7 @@ impl Track {
 
 /// Passes upstream bytes through unchanged while reading token usage from them.
 struct Tracked {
-    inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     /// An SSE reply, parsed event by event.
     sse: Option<SseParser>,
     /// A small JSON reply, kept whole to parse at the end.
@@ -842,6 +954,41 @@ fn json_error(status: StatusCode, message: &str) -> Response {
         Json(serde_json::json!({"error": {"message": message}})),
     )
         .into_response()
+}
+
+/// Whether the client asked for a streamed reply.
+fn stream_requested(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// An adapter failure as the client's status, before any byte was streamed.
+fn failure_response(failure: provider::Failure) -> Response {
+    match failure {
+        provider::Failure::Fatal { status, body } => {
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }
+        provider::Failure::Auth => {
+            json_error(StatusCode::UNAUTHORIZED, "upstream rejected the account")
+        }
+        provider::Failure::Quota { .. } => {
+            json_error(StatusCode::TOO_MANY_REQUESTS, "provider quota exhausted")
+        }
+        provider::Failure::RateLimited { .. } => {
+            json_error(StatusCode::TOO_MANY_REQUESTS, "provider rate limited")
+        }
+        provider::Failure::Retryable => {
+            json_error(StatusCode::BAD_GATEWAY, "upstream request failed")
+        }
+    }
 }
 
 fn unauthorized() -> Response {

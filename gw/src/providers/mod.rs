@@ -5,5 +5,4 @@ pub mod antigravity;
 pub mod command_code;
 pub mod kiro;
 pub mod openai;
-pub mod opencode_cli;
-pub mod opencode_zen;
+pub mod opencode;
