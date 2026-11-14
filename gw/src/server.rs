@@ -285,10 +285,7 @@ async fn prepare(st: &Gateway, req: Request) -> Result<Plan, Response> {
 async fn forward(State(st): State<Arc<Gateway>>, req: Request) -> Response {
     match prepare(&st, req).await {
         // A provider with a native adapter is served here; everything else is forwarded.
-        Ok(plan) => match st.native(&plan).await {
-            Some(response) => response,
-            None => st.send(plan).await,
-        },
+        Ok(plan) => dispatch(&st, plan).await,
         Err(response) => response,
     }
 }
@@ -305,7 +302,15 @@ async fn transformed(State(st): State<Arc<Gateway>>, req: Request) -> Response {
             plan.applied = applied;
         }
     }
-    st.send(plan).await
+    dispatch(&st, plan).await
+}
+
+/// Serve a prepared request through a native adapter, else forward it untouched.
+async fn dispatch(st: &Gateway, plan: Plan) -> Response {
+    match st.native(&plan).await {
+        Some(response) => response,
+        None => st.send(plan).await,
+    }
 }
 
 /// Local `count_tokens`: an estimate, so the request never reaches an upstream.

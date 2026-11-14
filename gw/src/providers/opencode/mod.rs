@@ -35,6 +35,15 @@ const MAX_ERROR_BODY: usize = 64 * 1024;
 /// Largest non-streaming reply buffered for translation.
 const MAX_NON_STREAM_BODY: usize = 32 * 1024 * 1024;
 
+/// Inline retries when the free tier answers a transient 429.
+const RETRY_ATTEMPTS: u32 = 3;
+
+/// Longest `Retry-After` still worth waiting for inside one request.
+const RETRY_WINDOW: Duration = Duration::from_secs(3);
+
+/// Pause before the second and third attempt; doubled each time.
+const RETRY_BACKOFF: Duration = Duration::from_millis(400);
+
 #[derive(Clone)]
 pub struct Opencode {
     client: reqwest::Client,
@@ -58,21 +67,35 @@ impl Opencode {
     async fn turn(&self, req: &Request, account: &Account) -> Result<Reply, Failure> {
         let body = outbound_body(req)?;
         let url = format!("{}/zen/v1/chat/completions", self.base);
-        let headers = self.outbound_headers(req, account);
 
-        let response = match self
-            .client
-            .post(&url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(url = %url, %error, "opencode upstream request failed");
-                return Err(Failure::Retryable);
+        let mut attempt = 1;
+        let response = loop {
+            let headers = self.outbound_headers(req, account);
+            let sent = self
+                .client
+                .post(&url)
+                .headers(headers)
+                .body(body.clone())
+                .send()
+                .await;
+            let response = match sent {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(url = %url, %error, "opencode upstream request failed");
+                    return Err(Failure::Retryable);
+                }
+            };
+            // A 429 without a long Retry-After is the free tier's intermittent
+            // refusal; a long one means the budget is spent and waiting is futile.
+            let transient = response.status() == StatusCode::TOO_MANY_REQUESTS
+                && retry_after(response.headers()).is_none_or(|wait| wait <= RETRY_WINDOW);
+            if !transient || attempt >= RETRY_ATTEMPTS {
+                break response;
             }
+            let pause = RETRY_BACKOFF * (1 << (attempt - 1));
+            tracing::debug!(attempt, ?pause, "opencode asked to slow down; retrying");
+            tokio::time::sleep(pause).await;
+            attempt += 1;
         };
 
         let status = response.status();
@@ -638,6 +661,78 @@ mod tests {
             Err(failure) => failure,
         };
         assert!(matches!(failure, Failure::Quota { .. }));
+    }
+
+    /// Upstream answers `failures` 429s, then `status` with the usual body.
+    async fn spawn_flaky(failures: usize, status: u16) -> (String, Arc<Mutex<usize>>) {
+        let hits = Arc::new(Mutex::new(0usize));
+        #[derive(Clone)]
+        struct Stateful {
+            hits: Arc<Mutex<usize>>,
+            failures: usize,
+            status: u16,
+        }
+        async fn answer(State(state): State<Stateful>) -> axum::response::Response {
+            let mut hits = state.hits.lock().unwrap();
+            *hits += 1;
+            let seen = *hits;
+            drop(hits);
+            let (code, body) = if seen <= state.failures {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"type":"error","error":{"type":"FreeUsageLimitError","message":"x"}}"#,
+                )
+            } else {
+                (
+                    StatusCode::from_u16(state.status).unwrap(),
+                    r#"{"id":"c","object":"chat.completion","model":"m","choices":[]}"#,
+                )
+            };
+            axum::response::Response::builder()
+                .status(code)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+        let state = Stateful {
+            hits: hits.clone(),
+            failures,
+            status,
+        };
+        let app = Router::new().fallback(any(answer)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn transient_429_is_retried_then_served() {
+        let (base, hits) = spawn_flaky(2, 200).await;
+        let adapter = Opencode::new(reqwest::Client::new(), Some(base));
+        let body = serde_json::json!({"model":"beam-free","messages":[]});
+        let reply = adapter
+            .send(&request(Inbound::Chat, body, false), &anonymous())
+            .await
+            .expect("third attempt should succeed");
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(*hits.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_429_stops_after_the_attempt_limit() {
+        let (base, hits) = spawn_flaky(usize::MAX, 200).await;
+        let adapter = Opencode::new(reqwest::Client::new(), Some(base));
+        let body = serde_json::json!({"model":"beam-free","messages":[]});
+        let failure = match adapter
+            .send(&request(Inbound::Chat, body, false), &anonymous())
+            .await
+        {
+            Ok(_) => panic!("expected a quota failure"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(failure, Failure::Quota { .. }));
+        assert_eq!(*hits.lock().unwrap(), RETRY_ATTEMPTS as usize);
     }
 
     #[test]
