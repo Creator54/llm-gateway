@@ -1,10 +1,12 @@
 //! Combos: try targets in order and move on when one fails before the client got a byte.
 
 use crate::pool::{Outcome, Pool};
+use serde::Deserialize;
 use std::time::Instant;
 
 /// How a combo orders the targets it tries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Strategy {
     /// Listed order, falling back to the next target until one replies.
     Failover,
@@ -13,26 +15,26 @@ pub enum Strategy {
 }
 
 /// One provider model a combo can use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Target {
     /// Provider id, as the account pool keys it.
     pub provider: String,
-    /// Provider's own model id.
     pub model: String,
-    /// Share of new sessions that start here; round-robin only.
+    /// Share of new sessions that start here; round-robin only, zero means one.
+    #[serde(default)]
     pub weight: u32,
 }
 
 /// An ordered set of targets and how to pick between them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Combo {
-    /// Name used by `combo/<name>`.
+    /// Filled in from the config key by `Config::resolve`.
+    #[serde(skip)]
     pub name: String,
-    /// How targets are ordered.
     pub strategy: Strategy,
-    /// Targets in listed order; each weight defaults to 1 when zero.
     pub targets: Vec<Target>,
     /// Requests a session keeps a round-robin target before rotating to the next one.
+    #[serde(default)]
     pub sticky_limit: u16,
 }
 
@@ -58,6 +60,7 @@ impl Combo {
             pos: 0,
             again: None,
             last: None,
+            done: false,
         }
     }
 
@@ -96,12 +99,17 @@ pub struct Attempt<'a> {
     /// Target whose account just cooled down and may still have another account free.
     again: Option<usize>,
     last: Option<(usize, String)>,
+    /// Set once the request is served; no further attempt may be handed out.
+    done: bool,
 }
 
 impl<'a> Iterator for Attempt<'a> {
     type Item = (&'a Target, String);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
         // An account move stays inside the same target before the target itself is given up.
         if let Some(index) = self.again.take() {
             if let Some(item) = self.try_target(index) {
@@ -115,6 +123,7 @@ impl<'a> Iterator for Attempt<'a> {
             }
         }
         self.last = None;
+        self.done = true;
         None
     }
 }
@@ -130,34 +139,42 @@ impl<'a> Attempt<'a> {
         Some((target, account))
     }
 
-    /// Record how the attempt just handed out went.
-    pub fn report(&mut self, outcome: Outcome) {
+    /// Record how the attempt just handed out went; false when there was none.
+    pub fn report(&mut self, outcome: Outcome) -> bool {
         let Some((index, account)) = self.last.take() else {
-            return;
+            return false;
         };
         let provider = self.combo.targets[index].provider.as_str();
-        self.pool.report(provider, &account, outcome, self.now);
-        if outcome != Outcome::Success {
+        let recorded = self.pool.report(provider, &account, outcome, self.now);
+        debug_assert!(recorded, "an account the pool picked must be known");
+        if outcome == Outcome::Success {
+            self.done = true;
+        } else {
             // The cooled account cannot be picked again at this `now`, so this terminates.
             self.again = Some(index);
         }
+        recorded
     }
 
     /// Record that the attempt just handed out is replying; the session stays on this target.
-    pub fn note_success(&mut self) {
-        let Some((index, account)) = &self.last else {
-            return;
+    /// Returns false when there was no attempt to record.
+    pub fn note_success(&mut self) -> bool {
+        let Some((index, account)) = self.last.take() else {
+            return false;
         };
-        let provider = self.combo.targets[*index].provider.as_str();
-        let index = *index;
-        self.pool
-            .report(provider, account, Outcome::Success, self.now);
+        let provider = self.combo.targets[index].provider.as_str();
+        let recorded = self
+            .pool
+            .report(provider, &account, Outcome::Success, self.now);
+        debug_assert!(recorded, "an account the pool picked must be known");
         let reuses = match self.pool.session_target(self.session, &self.combo.name) {
             Some((kept, reuses)) if kept == index => reuses.saturating_add(1),
             _ => 1,
         };
         self.pool
-            .set_session_target(self.session, &self.combo.name, index, reuses);
+            .set_session_target(self.session, &self.combo.name, index, reuses, self.now);
+        self.done = true;
+        recorded
     }
 
     /// Soonest time a skipped target could serve again; `None` when no cooldown will end.
@@ -320,6 +337,33 @@ mod tests {
             })
             .collect();
         assert_eq!(starts, ["a", "a", "a", "b"]);
+    }
+
+    #[test]
+    fn a_served_attempt_hands_out_nothing_more() {
+        let mut pool = pool(&[("a", "a1"), ("b", "b1")]);
+        let combo = combo(Strategy::Failover, &["a", "b"]);
+        let now = Instant::now();
+        let mut attempts = combo.attempt(&mut pool, "s1", now);
+        attempts.next().unwrap();
+        attempts.note_success();
+        assert!(attempts.next().is_none());
+        // Reporting after the request is served records nothing.
+        assert!(!attempts.note_success());
+        assert!(!attempts.report(Outcome::Auth));
+    }
+
+    #[test]
+    fn failover_ignores_sticky_limit() {
+        let mut pool = pool(&[("a", "a1"), ("b", "b1")]);
+        let mut combo = combo(Strategy::Failover, &["a", "b"]);
+        combo.sticky_limit = 1;
+        let now = Instant::now();
+        for _ in 0..5 {
+            let mut attempts = combo.attempt(&mut pool, "s1", now);
+            assert_eq!(attempts.next().unwrap().0.provider, "a");
+            assert!(attempts.note_success());
+        }
     }
 
     #[test]
