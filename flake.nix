@@ -20,12 +20,8 @@
     in {
       nixosModules.default = { pkgs, ... }: {
         imports = [ ./module.nix ];
-        services.llm-gateway = {
-          package         = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.opencodex;
-          headroomPackage = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.headroom;
-          ocxImageStream  = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.ocx-image;
-          headroomImageStream = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.headroom-image;
-        };
+        # The default package is ./nix/gw.nix; opencodex and headroom stay
+        # available for the Compose images but are no longer services here.
       };
       packages = eachSystem (system:
         let
@@ -55,6 +51,11 @@
       });
       checks = eachSystem (system: {
         gw = self.packages.${system}.gw;
+        module = import ./tests/module.nix {
+          nixpkgs = nixpkgs;
+          module = self.nixosModules.default;
+          inherit system;
+        };
       });
       devShells = eachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
