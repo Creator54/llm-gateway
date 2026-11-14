@@ -203,9 +203,8 @@ impl Credential {
             Credential::OAuth(tokens) => tokens.entry(provider, label),
             Credential::ApiKey(key) => creds::Entry {
                 provider: provider.to_string(),
-                id: pkce::random_bytes(6)
-                    .map(|b| b.iter().map(|v| format!("{v:02x}")).collect())
-                    .unwrap_or_else(|_| "account".to_string()),
+                // Derived from the key so a second login updates the same account.
+                id: pkce::fingerprint(&key),
                 label,
                 paused: false,
                 needs_reauth: false,
@@ -226,4 +225,69 @@ pub async fn login(provider: &str, opts: Options) -> Result<creds::Entry> {
     store.save()?;
     ui::ok(&format!("saved {provider} account {}", entry.id));
     Ok(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let seed = format!("{:?}", std::time::SystemTime::now());
+        let dir = std::env::temp_dir().join(format!("gw-login-{}", pkce::fingerprint(&seed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn oauth_tokens() -> Tokens {
+        Tokens {
+            access: "secret-token-value".into(),
+            refresh: Some("refresh".into()),
+            expires_at: Some(now_secs() + 3600),
+            account: Some("acct-1".into()),
+            email: Some("a@b.c".into()),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn oauth_entries_carry_routing_metadata() {
+        let entry = oauth_tokens().entry("anthropic", Some("work".into()));
+        assert_eq!(entry.provider, "anthropic");
+        assert_eq!(entry.id, "acct-1");
+        assert_eq!(entry.label.as_deref(), Some("work"));
+        assert!(!entry.needs_reauth);
+        let creds::Secret::OAuth(cred) = &entry.credential else {
+            panic!("expected an OAuth credential");
+        };
+        assert_eq!(cred.extra.get("account_id").unwrap(), "acct-1");
+        assert_eq!(cred.extra.get("email").unwrap(), "a@b.c");
+        // Tokens must not leak through Debug.
+        assert!(!format!("{cred:?}").contains("secret-token-value"));
+    }
+
+    #[test]
+    fn api_key_entries_are_stable_and_typed() {
+        let first = Credential::ApiKey("sk-test".into()).entry("opencode-zen", None);
+        let second = Credential::ApiKey("sk-test".into()).entry("opencode-zen", None);
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.id, pkce::fingerprint("sk-test"));
+        let creds::Secret::ApiKey { key } = &first.credential else {
+            panic!("expected an API key credential");
+        };
+        assert_eq!(key, "sk-test");
+    }
+
+    #[test]
+    fn entries_round_trip_through_the_store() {
+        let dir = temp_dir();
+        let entry = oauth_tokens().entry("openai", None);
+        let store = creds::Store::load(&dir).unwrap();
+        store.upsert(entry.clone());
+        store.save().unwrap();
+
+        let reloaded = creds::Store::load(&dir).unwrap();
+        let saved = reloaded.get("openai", "acct-1").unwrap();
+        assert_eq!(saved, entry);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

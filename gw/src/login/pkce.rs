@@ -47,6 +47,11 @@ pub fn generate() -> Result<Pkce> {
     })
 }
 
+/// Stable, non-reversible account id for a credential that carries no account id.
+pub fn fingerprint(secret: &str) -> String {
+    b64url(&Sha256::digest(secret.as_bytes()))[..12].to_string()
+}
+
 /// A CSRF `state` value: 16 random bytes as lowercase hex.
 pub fn state() -> Result<String> {
     Ok(random_bytes(STATE_BYTES)?
@@ -79,6 +84,13 @@ mod tests {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert_eq!(pkce.challenge.len(), 43);
         assert_ne!(pkce.verifier, generate().unwrap().verifier);
+    }
+
+    #[test]
+    fn fingerprints_are_stable_and_short() {
+        assert_eq!(fingerprint("key"), fingerprint("key"));
+        assert_ne!(fingerprint("key"), fingerprint("other"));
+        assert_eq!(fingerprint("key").len(), 12);
     }
 
     #[test]
