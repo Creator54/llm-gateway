@@ -6,3 +6,4 @@
 *.log
 /result
 /.direnv/
+/gw/target/
