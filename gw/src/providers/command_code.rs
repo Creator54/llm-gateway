@@ -102,6 +102,13 @@ impl CommandCode {
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
             let body = response.bytes().await.unwrap_or_default();
+            // Upstream refusals are otherwise invisible; log enough to diagnose.
+            let preview = String::from_utf8_lossy(&body);
+            tracing::warn!(
+                status = %status,
+                body = %preview.chars().take(200).collect::<String>(),
+                "command-code refused the request"
+            );
             return Err(classify(status, retry_after, &body));
         }
         if req.stream {
@@ -121,6 +128,20 @@ fn bearer(account: &Account) -> Result<&str, Failure> {
 }
 
 fn classify(status: StatusCode, retry_after: Option<Duration>, body: &Bytes) -> Failure {
+    // Cloudflare answers 403 with its own error page when it dislikes the client
+    // (error code 1010 and friends). That is a transport block, not a bad token,
+    // so treat it as retryable instead of cooling the account for minutes.
+    if status == StatusCode::FORBIDDEN && cloudflare_block(body) {
+        return Failure::Retryable;
+    }
+    // A 403 that names an unknown model is a request problem: retrying or cooling
+    // the account would only hide the mistake and take the account out of service.
+    if status == StatusCode::FORBIDDEN && unknown_model(body) {
+        return Failure::Fatal {
+            status,
+            body: body.clone(),
+        };
+    }
     match status.as_u16() {
         401 | 403 => Failure::Auth,
         429 if quota_exhausted(body) => Failure::Quota {
@@ -143,6 +164,39 @@ fn quota_exhausted(body: &Bytes) -> bool {
     ["quota", "credit", "allowance", "usage limit"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+/// The API says the model or provider id is not one it serves.
+fn unknown_model(body: &Bytes) -> bool {
+    let text = String::from_utf8_lossy(body).to_lowercase();
+    [
+        "model/provider not recognized",
+        "model not recognized",
+        "unknown model",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// Whether a 403 came from Cloudflare rather than from the API itself.
+///
+/// The edge returns a short `error code: NNNN` page for bot and TLS-fingerprint
+/// rules; the API returns a JSON body with its own error shape.
+fn cloudflare_block(body: &Bytes) -> bool {
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("{") {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    [
+        "error code:",
+        "cloudflare",
+        "attention required",
+        "just a moment",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// `Retry-After` in seconds, else a millisecond/seconds field in the error body.
@@ -396,9 +450,15 @@ fn translate_failure(error: &crate::translate::Error, inbound: Inbound) -> Failu
 fn canonical_model(model: &str) -> String {
     match model {
         "deepseek-v4-flash" => "deepseek/deepseek-v4-flash".into(),
+        "deepseek-v4.1-flash" => "deepseek/deepseek-v4.1-flash".into(),
+        "deepseek-v4.1" => "deepseek/deepseek-v4.1".into(),
         "kimi-k3" => "moonshotai/Kimi-K3".into(),
         "glm-5.3" => "zai-org/GLM-5.3".into(),
         "glm-5.2" => "zai-org/GLM-5.2".into(),
+        // A bare DeepSeek id reaches the API as `anthropic:<id>` and is refused.
+        other if other.starts_with("deepseek") && !other.contains('/') => {
+            format!("deepseek/{other}")
+        }
         other => other.to_owned(),
     }
 }
@@ -986,15 +1046,18 @@ fn chat_usage(usage: &Value) -> Value {
         .get("outputTokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cached = usage
+        .pointer("/inputTokenDetails/cacheReadTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // Chat shape: `prompt_tokens` includes whatever came from the cache, and
+    // `inputTokens` upstream already counts the cached part.
     let mut chat = json!({
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input + output,
     });
-    if let Some(cached) = usage
-        .pointer("/inputTokenDetails/cacheReadTokens")
-        .and_then(Value::as_u64)
-    {
+    if cached > 0 {
         chat["prompt_tokens_details"] = json!({ "cached_tokens": cached });
     }
     chat
@@ -1415,5 +1478,60 @@ fn stream_reply(req: &Request, response: reqwest::Response) -> Reply {
         status: StatusCode::OK,
         headers: stream_headers(),
         body,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cf_page() -> Bytes {
+        Bytes::from_static(b"error code: 1010")
+    }
+
+    #[test]
+    fn deepseek_variants_get_their_provider_prefix() {
+        assert_eq!(canonical_model("deepseek-v4.1"), "deepseek/deepseek-v4.1");
+        assert_eq!(
+            canonical_model("deepseek-v4.1-flash"),
+            "deepseek/deepseek-v4.1-flash"
+        );
+        // Already qualified stays untouched.
+        assert_eq!(
+            canonical_model("deepseek/deepseek-v4.1"),
+            "deepseek/deepseek-v4.1"
+        );
+        // Other providers are passed through.
+        assert_eq!(canonical_model("claude-opus-5-5"), "claude-opus-5-5");
+    }
+
+    #[test]
+    fn cloudflare_403_is_retryable_not_an_auth_failure() {
+        let failure = classify(StatusCode::FORBIDDEN, None, &cf_page());
+        assert!(matches!(failure, Failure::Retryable));
+    }
+
+    #[test]
+    fn a_real_403_with_a_json_body_is_still_auth() {
+        let body = Bytes::from_static(br#"{"error":"forbidden"}"#);
+        let failure = classify(StatusCode::FORBIDDEN, None, &body);
+        assert!(matches!(failure, Failure::Auth));
+    }
+
+    #[test]
+    fn a_401_is_auth() {
+        let failure = classify(StatusCode::UNAUTHORIZED, None, &Bytes::new());
+        assert!(matches!(failure, Failure::Auth));
+    }
+
+    #[test]
+    fn a_json_403_mentioning_cloudflare_still_counts_as_auth() {
+        // The API never returns Cloudflare branding in valid JSON, so a JSON
+        // body keeps the auth reading even if the text is odd.
+        let body = Bytes::from_static(br#"{"error":"cloudflare"}"#);
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN, None, &body),
+            Failure::Auth
+        ));
     }
 }

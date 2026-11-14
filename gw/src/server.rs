@@ -967,7 +967,8 @@ impl Gateway {
         let tracked = Tracked {
             inner: reply.body,
             sse: sse.then(SseParser::new),
-            full: None,
+            // A buffered, non-streamed adapter reply still carries usage.
+            full: (!sse).then(Vec::new),
             tokens: usage::Tokens::default(),
             track: Some(Track {
                 path: plan.path_and_query.clone(),
