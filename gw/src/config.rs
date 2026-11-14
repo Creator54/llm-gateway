@@ -1,4 +1,9 @@
 use crate::{cache, combo::Combo, tidy};
+/// Serde default that keeps a switch on unless the config says otherwise.
+fn yes() -> bool {
+    true
+}
+
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -26,6 +31,9 @@ pub struct Config {
     pub profile: Profile,
     #[serde(default)]
     pub transforms: Transforms,
+    /// Serve `GET /metrics` on the same port; still behind the gateway key.
+    #[serde(default = "yes")]
+    pub metrics: bool,
 }
 
 impl Default for Config {
@@ -39,6 +47,7 @@ impl Default for Config {
             combos: BTreeMap::new(),
             endpoints: BTreeMap::new(),
             profile: Profile::Default,
+            metrics: true,
             transforms: Transforms::default(),
         }
     }

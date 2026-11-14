@@ -20,7 +20,7 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::{
-    cache, config::Config, creds, journal::Journal, models, provider, providers, route,
+    cache, config::Config, creds, journal::Journal, metrics, models, provider, providers, route,
     store::Store, tidy, tokens, translate::SseParser, usage,
 };
 
@@ -45,6 +45,7 @@ pub async fn serve(listener: tokio::net::TcpListener, cfg: Config) -> anyhow::Re
     let state = Arc::new(Gateway::new(&cfg)?);
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/responses", any(transformed))
         .route("/v1/chat/completions", any(transformed))
         .route("/v1/messages", any(transformed))
@@ -126,6 +127,10 @@ struct Gateway {
     combos: Vec<crate::combo::Combo>,
     /// Prefix hash and cache read of the last reply, for the cache-break detector.
     prefix: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Request counters rendered at `/metrics`.
+    metrics: Arc<metrics::Metrics>,
+    /// Serve `/metrics` at all; off keeps the port for proxying only.
+    metrics_on: bool,
 }
 
 impl Gateway {
@@ -171,12 +176,37 @@ impl Gateway {
             combos: cfg.combos.values().cloned().collect(),
             endpoints: cfg.endpoints.clone(),
             prefix: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(metrics::Metrics::new()),
+            metrics_on: cfg.metrics,
         })
     }
 }
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok": true}))
+}
+
+/// Prometheus scrape endpoint; authenticated exactly like the proxy routes.
+async fn metrics_endpoint(State(st): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
+    if !st.metrics_on {
+        return json_error(StatusCode::NOT_FOUND, "metrics are disabled");
+    }
+    // A scrape carries no model, so only the key is checked here.
+    if st.key.is_some() && authenticate(&st, &headers).is_none() {
+        return unauthorized();
+    }
+    let (dropped, lost) = st
+        .journal
+        .as_deref()
+        .map(|journal| (journal.dropped(), journal.lost()))
+        .unwrap_or_default();
+    let body = st.metrics.render(&metrics::Extra::new(dropped, lost));
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response
 }
 
 /// One request as it will go upstream; also the original to fall back to.
@@ -574,6 +604,8 @@ impl Gateway {
                 hash: prefix(&plan.body),
                 journal: self.journal.clone(),
                 prefix: Arc::clone(&self.prefix),
+                metrics: Arc::clone(&self.metrics),
+                ttfb: None,
             }),
         };
         let mut response = Response::new(Body::from_stream(tracked));
@@ -620,6 +652,8 @@ impl Gateway {
                 hash: prefix(&plan.body),
                 journal: self.journal.clone(),
                 prefix: Arc::clone(&self.prefix),
+                metrics: Arc::clone(&self.metrics),
+                ttfb: None,
             }),
         };
         let mut response = Response::new(Body::from_stream(tracked));
@@ -645,6 +679,8 @@ impl Gateway {
             hash: None,
             journal: self.journal.clone(),
             prefix: Arc::clone(&self.prefix),
+            metrics: Arc::clone(&self.metrics),
+            ttfb: None,
         }
         .finish(tokens);
     }
@@ -826,11 +862,24 @@ struct Track {
     hash: Option<u64>,
     journal: Option<Arc<Journal>>,
     prefix: Arc<Mutex<Option<(u64, u64)>>>,
+    metrics: Arc<metrics::Metrics>,
+    /// Time to the first body chunk; `None` until it arrives.
+    ttfb: Option<f64>,
+}
+
+impl Track {
+    /// Record when the first chunk reached the client, once.
+    fn first_chunk(&mut self) {
+        if self.ttfb.is_none() {
+            self.ttfb = Some(self.started.elapsed().as_secs_f64());
+        }
+    }
 }
 
 impl Track {
     fn finish(self, tokens: usage::Tokens) {
         self.check_cache_break(tokens.cached_read);
+        self.count(&tokens);
         let Some(journal) = self.journal.as_deref() else {
             return;
         };
@@ -851,6 +900,34 @@ impl Track {
     }
 
     /// Remember this prefix's cache read, and log a break when the share drops.
+    /// A request as Prometheus sees it: status class, latency, tokens.
+    fn count(&self, tokens: &usage::Tokens) {
+        let provider = &self.info.provider;
+        let model = &self.info.model;
+        let account = &self.info.account;
+        self.metrics.request(
+            provider,
+            model,
+            account,
+            &format!("{}xx", self.status / 100),
+        );
+        self.metrics
+            .observe_duration(provider, self.started.elapsed().as_secs_f64());
+        if let Some(ttfb) = self.ttfb {
+            self.metrics.observe_ttfb(provider, ttfb);
+        }
+        for (kind, n) in [
+            (metrics::TokenKind::Input, tokens.input),
+            (metrics::TokenKind::Output, tokens.output),
+            (metrics::TokenKind::CacheRead, tokens.cached_read),
+            (metrics::TokenKind::CacheWrite, tokens.cache_write),
+        ] {
+            if n > 0 {
+                self.metrics.tokens(provider, model, kind, n);
+            }
+        }
+    }
+
     fn check_cache_break(&self, cached_read: u64) {
         let Some(hash) = self.hash else {
             return;
@@ -930,6 +1007,9 @@ impl Stream for Tracked {
         let this = self.as_mut().get_mut();
         match this.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(track) = this.track.as_mut() {
+                    track.first_chunk();
+                }
                 this.observe(&chunk);
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }

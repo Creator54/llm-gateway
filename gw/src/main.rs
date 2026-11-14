@@ -57,6 +57,15 @@ enum Cmd {
     },
     /// Show which agents are connected
     Status,
+    /// Show usage from the local database
+    Stats {
+        /// Window to summarise, e.g. 24h, 7d, 30m
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Print rows as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Log in to a provider and store the account
     Login {
         /// One of: anthropic, claude, openai, google-antigravity, kiro, command-code, opencode-zen
@@ -163,6 +172,7 @@ async fn run() -> anyhow::Result<()> {
             report(gw::connect::usage(&cfg.state_dir)?);
             Ok(())
         }
+        Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
         Cmd::Login {
             provider,
             device,
@@ -204,6 +214,73 @@ fn report(lines: Vec<String>) {
     for line in lines {
         println!("{line}");
     }
+}
+
+/// `gw stats`: summarise the local usage database.
+fn stats(state_dir: &std::path::Path, since: &str, json: bool) -> anyhow::Result<()> {
+    let seconds = parse_window(since)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let store = gw::store::Store::open(state_dir)?;
+    let rows = store.usage_summary(now - seconds)?;
+
+    if json {
+        // Hand-rolled so the shape stays stable and needs no derive.
+        let objects: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "provider": row.provider,
+                    "model": row.model,
+                    "account": row.account,
+                    "requests": row.requests,
+                    "errors": row.errors,
+                    "input": row.input,
+                    "cached_read": row.cached_read,
+                    "cache_write": row.cache_write,
+                    "output": row.output,
+                    "cache_read_share": row.cache_read_share,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&objects)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("no usage in the last {since}");
+        return Ok(());
+    }
+    let (headers, cells) = gw::metrics::stats_table(&rows);
+    let borrowed: Vec<Vec<&str>> = cells
+        .iter()
+        .map(|row| row.iter().map(String::as_str).collect())
+        .collect();
+    let view: Vec<&[&str]> = borrowed.iter().map(Vec::as_slice).collect();
+    println!("{}", gw::ui::Ui::from_env().render_table(&headers, &view));
+    Ok(())
+}
+
+/// `24h`, `7d`, `90m`, `45s`, or a bare count of seconds.
+fn parse_window(text: &str) -> anyhow::Result<i64> {
+    let text = text.trim();
+    let (value, unit) = text.split_at(text.len().saturating_sub(1));
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "" => 1,
+        _ => anyhow::bail!("unknown window unit in {text:?}; use s, m, h or d"),
+    };
+    let count: i64 = if unit.is_empty() {
+        text.parse()?
+    } else {
+        value.parse()?
+    };
+    Ok(count.saturating_mul(scale))
 }
 
 /// Read the gateway key, if any; a missing file is an error, a missing option is not.
