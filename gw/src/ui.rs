@@ -322,7 +322,10 @@ fn truncate(text: &str, width: usize, dots: &str) -> String {
     if chars(text) <= width {
         return text.to_string();
     }
-    let keep = width.saturating_sub(chars(dots));
+    if width <= chars(dots) {
+        return text.chars().take(width).collect();
+    }
+    let keep = width - chars(dots);
     let mut out: String = text.chars().take(keep).collect();
     out.push_str(dots);
     out
@@ -484,6 +487,8 @@ mod tests {
         assert_eq!(truncate("abc", 5, "…"), "abc");
         assert_eq!(truncate("abcdef", 4, "…"), "abc…");
         assert_eq!(truncate("abcdef", 4, "..."), "a...");
+        assert_eq!(pad("abcdef", 1, "..."), "a");
+        assert_eq!(pad("abcdef", 3, "..."), "abc");
     }
 
     #[test]
