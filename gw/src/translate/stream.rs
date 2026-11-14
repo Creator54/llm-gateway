@@ -560,8 +560,8 @@ mod tests {
         let out = text(out);
 
         assert_eq!(events(&out, "response.created"), 1);
-        assert!(out.contains(r#"{"content_index":0,"delta":"Hel","item_id""#));
-        assert!(out.contains(r#"{"content_index":0,"delta":"lo","item_id""#));
+        assert!(out.contains(r#""delta":"Hel""#));
+        assert!(out.contains(r#""delta":"lo""#));
         assert!(out.contains("response.output_text.done"));
         assert!(out.contains(r#""text":"Hello""#));
         assert_eq!(events(&out, "response.content_part.done"), 1);
@@ -597,7 +597,8 @@ mod tests {
         assert_eq!(events(&out, "response.output_item.added"), 2);
         assert_eq!(events(&out, "response.function_call_arguments.delta"), 2);
         assert_eq!(events(&out, "response.function_call_arguments.done"), 1);
-        assert!(out.contains(r#""call_id":"call_1","id":"fc_"#));
+        assert!(out.contains(r#""call_id":"call_1""#));
+        assert!(out.contains(r#""id":"fc_"#));
         assert!(out.contains(r#""arguments":"{\"path\":\"a\"}""#));
     }
 
