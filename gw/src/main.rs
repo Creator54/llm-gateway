@@ -11,6 +11,8 @@ const EXAMPLES: &str = "\
 Examples:
   gw serve                      run the gateway
   gw connect pi                 point pi at the gateway
+  gw login anthropic            log in and store the account
+  gw account list               show stored accounts
   gw status                     show accounts and routes";
 
 #[derive(Parser)]
@@ -55,6 +57,58 @@ enum Cmd {
     },
     /// Show which agents are connected
     Status,
+    /// Log in to a provider and store the account
+    Login {
+        /// One of: anthropic, claude, openai, google-antigravity, kiro, command-code, opencode-zen
+        provider: String,
+        /// Force the device-code flow (openai only)
+        #[arg(long)]
+        device: bool,
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Account label (default: the provider name)
+        #[arg(long)]
+        label: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage stored accounts
+    Account {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// Import accounts from an opencodex directory
+    Import {
+        /// Source directory (default: ~/.opencodex)
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Show what would be stored without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// List stored accounts
+    List {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one stored account
+    Remove {
+        provider: String,
+        id: String,
+        /// Machine-readable output and no confirmation prompt
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -109,6 +163,40 @@ async fn run() -> anyhow::Result<()> {
             report(gw::connect::usage(&cfg.state_dir)?);
             Ok(())
         }
+        Cmd::Login {
+            provider,
+            device,
+            no_browser,
+            label,
+            json,
+        } => {
+            let args = gw::login::cli::Login {
+                provider,
+                device,
+                no_browser,
+                label,
+                json,
+            };
+            gw::login::cli::login(args, cfg.state_dir).await
+        }
+        Cmd::Account { cmd } => match cmd {
+            AccountCmd::Import {
+                from,
+                dry_run,
+                json,
+            } => gw::login::cli::import(
+                gw::login::cli::Import {
+                    from,
+                    dry_run,
+                    json,
+                },
+                cfg.state_dir,
+            ),
+            AccountCmd::List { json } => gw::login::cli::list(json, cfg.state_dir),
+            AccountCmd::Remove { provider, id, json } => {
+                gw::login::cli::remove(&provider, &id, json, &cfg.state_dir)
+            }
+        },
     }
 }
 
