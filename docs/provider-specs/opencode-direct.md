@@ -56,6 +56,30 @@ The CLI reads `https://models.opencode.ai/api.json` (provider `opencode`, all
 models use `@ai-sdk/openai-compatible`, so every model is chat/completions).
 Free models end in `-free`. The server also has `/zen/v1/models`.
 
+## Free tier gate (identified 2026-11-15)
+
+Free models need no key, but the server accepts a request only when
+`x-opencode-session` / `x-opencode-session-id` is a **descending encoded id
+with a non-zero counter**. Nothing else is checked: no cookie, no TLS
+fingerprint, no registry, no pre-registration, and `x-opencode-request` is
+ignored (garbage values pass).
+
+Ids come from `~/opencode/packages/schema/src/identifier.ts`: 26 chars, the
+first 12 hex encode `~(((ms << 12) | counter) & 0xffffffffffff)`, then 14 random
+chars. The server rejects `counter == 0` and rejects ascending ids.
+
+Measured, same body, direct to `/zen/v1/chat/completions`, 3 runs each:
+
+| Session id | Result |
+|---|---|
+| real CLI session | 200 |
+| forged descending, counter ≥ 1 | 200, 200, 200 |
+| forged descending, counter 0 | 429, 429, 429 |
+| forged ascending, counter 1 | 429, 429, 429 |
+| wrong length / random hex | 429 |
+
+Headers, user-agent, body, IP family and HTTP version make no difference.
+
 ## gw mapping
 
 - One `opencode` adapter covers free (no key) and paid (key) models; it
@@ -81,7 +105,7 @@ Upstream (`~/opencode`, `packages/core/src/session/model-request.ts:281-291`)
 also sends `x-session-affinity`, `X-Session-Id` and `promptCacheKey` (the
 session id without `ses_`); 1.19.5 did not. Match the version gw claims.
 
-## Live test (2026-11-14)
+## Live test
 
 - Direct calls with the exact CLI headers reach the model API. No 403;
   the request format is accepted.
