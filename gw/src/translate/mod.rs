@@ -1,6 +1,6 @@
 //! Translate requests and replies between Responses, Chat, and Messages.
 //!
-//! Adapted from joocode (MIT).
+//! Adapted from joocode (MIT); see `LICENSE-joocode`.
 
 mod reply;
 mod request;
@@ -13,6 +13,14 @@ pub use sse::SseParser;
 pub use stream::{MessagesStream, ResponsesStream};
 
 use serde_json::{json, Value};
+
+/// The protocol a client spoke, which picks its error envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inbound {
+    Chat,
+    Responses,
+    Messages,
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,17 +34,38 @@ pub struct Error {
 }
 
 impl Error {
-    fn bad_request(message: &str) -> Self {
+    pub fn bad_request(message: &str) -> Self {
         Self {
             status: 400,
             message: message.to_owned(),
         }
     }
 
-    fn bad_gateway(message: &str) -> Self {
+    pub fn bad_gateway(message: &str) -> Self {
         Self {
             status: 502,
             message: message.to_owned(),
+        }
+    }
+
+    /// Error body in the shape the inbound protocol expects.
+    pub fn to_body(&self, inbound: Inbound) -> Value {
+        let kind = if self.status < 500 {
+            "invalid_request_error"
+        } else {
+            "upstream_error"
+        };
+        match inbound {
+            Inbound::Messages => json!({
+                "type": "error",
+                "error": {
+                    "type": if self.status < 500 { kind } else { "api_error" },
+                    "message": self.message,
+                }
+            }),
+            Inbound::Chat | Inbound::Responses => json!({
+                "error": { "message": self.message, "type": kind }
+            }),
         }
     }
 }
@@ -119,5 +148,31 @@ fn stop_reason(finish: Option<&str>, has_tool_calls: bool) -> &'static str {
         Some("length") => "max_tokens",
         Some("tool_calls") => "tool_use",
         _ => "end_turn",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_openai_and_anthropic_error_bodies() {
+        let error = Error::bad_request("bad input");
+        assert_eq!(
+            error.to_body(Inbound::Chat),
+            json!({ "error": { "message": "bad input", "type": "invalid_request_error" } })
+        );
+        assert_eq!(error.to_body(Inbound::Responses), error.to_body(Inbound::Chat));
+        assert_eq!(
+            error.to_body(Inbound::Messages),
+            json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "bad input" } })
+        );
+
+        let error = Error::bad_gateway("upstream failed");
+        assert_eq!(
+            error.to_body(Inbound::Chat)["error"]["type"],
+            "upstream_error"
+        );
+        assert_eq!(error.to_body(Inbound::Messages)["error"]["type"], "api_error");
     }
 }
