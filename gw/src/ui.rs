@@ -249,7 +249,8 @@ pub fn colors_enabled(
     if forced(force_color) || forced(clicolor_force) {
         return true;
     }
-    if no_color.is_some() {
+    // An empty NO_COLOR has no effect (no-color.org).
+    if no_color.is_some_and(|v| !v.is_empty()) {
         return false;
     }
     if term == Some("dumb") {
