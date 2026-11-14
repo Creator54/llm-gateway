@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod models;
 pub mod pool;
 pub mod provider;
+pub mod providers;
 pub mod route;
 pub mod rules;
 pub mod server;

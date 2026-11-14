@@ -28,7 +28,7 @@ pub struct Request {
     pub session: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Credential {
     None,
     ApiKey(String),
@@ -39,10 +39,24 @@ pub enum Credential {
     },
 }
 
+// Never print secrets, even in debug logs.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Credential::None => "None",
+            Credential::ApiKey(_) => "ApiKey(<redacted>)",
+            Credential::OAuth { .. } => "OAuth(<redacted>)",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Account {
     pub id: String,
     pub credential: Credential,
+    /// Non-secret provider fields kept with the login, e.g. `chatgpt_account_id`,
+    /// antigravity `project`, kiro `profile_arn` and `region`.
+    pub extra: std::collections::BTreeMap<String, String>,
 }
 
 /// Response already in the client's protocol, streamed as bytes.

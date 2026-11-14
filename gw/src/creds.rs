@@ -120,9 +120,18 @@ impl From<&Entry> for Account {
     fn from(entry: &Entry) -> Self {
         // `provider::Credential` derives `Debug`, which would print the secret: log
         // accounts through `RedactedAccount`, never with `{:?}` on the account itself.
+        let extra = match &entry.credential {
+            Secret::OAuth(c) => c
+                .extra
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect(),
+            Secret::ApiKey { .. } => Default::default(),
+        };
         Account {
             id: entry.id.clone(),
             credential: entry.credential.to_credential(),
+            extra,
         }
     }
 }
