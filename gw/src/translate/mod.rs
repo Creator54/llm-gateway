@@ -162,7 +162,10 @@ mod tests {
             error.to_body(Inbound::Chat),
             json!({ "error": { "message": "bad input", "type": "invalid_request_error" } })
         );
-        assert_eq!(error.to_body(Inbound::Responses), error.to_body(Inbound::Chat));
+        assert_eq!(
+            error.to_body(Inbound::Responses),
+            error.to_body(Inbound::Chat)
+        );
         assert_eq!(
             error.to_body(Inbound::Messages),
             json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "bad input" } })
@@ -173,6 +176,9 @@ mod tests {
             error.to_body(Inbound::Chat)["error"]["type"],
             "upstream_error"
         );
-        assert_eq!(error.to_body(Inbound::Messages)["error"]["type"], "api_error");
+        assert_eq!(
+            error.to_body(Inbound::Messages)["error"]["type"],
+            "api_error"
+        );
     }
 }

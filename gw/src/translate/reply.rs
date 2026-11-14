@@ -219,10 +219,7 @@ mod tests {
 
     #[test]
     fn rejects_reply_without_choices() {
-        assert_eq!(
-            chat_to_messages(&json!({}), "m").unwrap_err().status,
-            502
-        );
+        assert_eq!(chat_to_messages(&json!({}), "m").unwrap_err().status, 502);
         assert_eq!(
             chat_to_responses(&json!({}), "m", None).unwrap_err().status,
             502

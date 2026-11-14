@@ -154,7 +154,8 @@ fn responses_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Error> 
                     && last.get("tool_calls").is_some_and(Value::is_array)
             });
             if !merge {
-                messages.push(json!({ "role": "assistant", "content": null, "tool_calls": [call] }));
+                messages
+                    .push(json!({ "role": "assistant", "content": null, "tool_calls": [call] }));
                 return Ok(());
             }
             if let Some(calls) = messages
