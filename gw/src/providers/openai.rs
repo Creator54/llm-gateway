@@ -70,7 +70,7 @@ impl OpenAi {
     }
 
     async fn turn(&self, req: &Request, account: &Account) -> Result<Reply, Failure> {
-        if req.inbound != Inbound::Responses {
+        if req.inbound == Inbound::Messages {
             return Err(unsupported(req.inbound));
         }
         // The pool identity is mandatory; without it the backend answers with a generic 401.
@@ -81,7 +81,21 @@ impl OpenAi {
             return Err(Failure::Auth);
         };
 
-        let body = outbound_body(&req.body, &req.model, req.fast.unwrap_or(false))?;
+        let chat = req.inbound == Inbound::Chat;
+        let chat_body: Option<Value> = if chat {
+            serde_json::from_slice(&req.body).map_err(|_| bad_body())?
+        } else {
+            None
+        };
+        let raw = match &chat_body {
+            Some(value) => {
+                let translated = crate::translate::chat_request_to_responses(value, &req.model)
+                    .map_err(|error| bad_request(&error))?;
+                Bytes::from(serde_json::to_vec(&translated).map_err(|_| bad_body())?)
+            }
+            None => req.body.clone(),
+        };
+        let body = outbound_body(&raw, &req.model, req.fast.unwrap_or(false))?;
         let headers = outbound_headers(&req.headers, access, account_id, &body);
         let url = format!("{}/responses", self.base);
         let bytes = serde_json::to_vec(&body).map_err(|_| Failure::Retryable)?;
@@ -106,10 +120,20 @@ impl OpenAi {
         }
 
         let mut headers = reply_headers(response.headers());
-        let body = if req.stream {
+        let body = if chat && req.stream {
+            let include_usage = chat_body
+                .as_ref()
+                .and_then(|value| value.pointer("/stream_options/include_usage"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            chat_stream(response, &req.model, include_usage)
+        } else if req.stream {
             relay(response)
         } else {
-            let folded = fold(response).await?;
+            let mut folded = fold(response).await?;
+            if chat {
+                folded = chat_fold(folded, &req.model).await?;
+            }
             headers.remove(http::header::CONTENT_LENGTH);
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             folded
@@ -140,6 +164,15 @@ fn access_token(account: &Account) -> Option<&str> {
     match &account.credential {
         Credential::OAuth { access, .. } if !access.is_empty() => Some(access),
         _ => None,
+    }
+}
+
+fn bad_request(error: &Error) -> Failure {
+    let body =
+        serde_json::to_vec(&error.to_body(crate::translate::Inbound::Chat)).unwrap_or_default();
+    Failure::Fatal {
+        status: StatusCode::BAD_REQUEST,
+        body: Bytes::from(body),
     }
 }
 
@@ -690,6 +723,76 @@ fn relay(response: reqwest::Response) -> BoxStream<'static, Result<Bytes, std::i
         .boxed()
 }
 
+/// Upstream Responses SSE rewritten as Chat completion chunks.
+fn chat_stream(
+    response: reqwest::Response,
+    model: &str,
+    include_usage: bool,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    let state = (
+        response.bytes_stream().boxed(),
+        SseParser::new(),
+        crate::translate::ChatStream::new(model, include_usage),
+        false,
+    );
+    stream::unfold(
+        state,
+        |(mut source, mut parser, mut encoder, ended)| async move {
+            if ended {
+                return None;
+            }
+            loop {
+                match source.next().await {
+                    Some(Ok(chunk)) => {
+                        let Ok(payloads) = parser.push(&chunk) else {
+                            let out = encoder.finish();
+                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
+                        };
+                        let out: Vec<u8> = payloads
+                            .iter()
+                            .flat_map(|payload| encoder.push_event(payload))
+                            .collect();
+                        if !out.is_empty() {
+                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, false)));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        return Some((
+                            Err(std::io::Error::other(error)),
+                            (source, parser, encoder, true),
+                        ));
+                    }
+                    None => {
+                        let out = encoder.finish();
+                        if out.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// Folded Responses JSON rewritten as a Chat completion.
+async fn chat_fold(
+    folded: BoxStream<'static, Result<Bytes, std::io::Error>>,
+    model: &str,
+) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Failure> {
+    let mut bytes = Vec::new();
+    let mut folded = folded;
+    while let Some(chunk) = folded.next().await {
+        bytes.extend_from_slice(&chunk.map_err(|_| Failure::Retryable)?);
+    }
+    let response: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::Retryable)?;
+    let chat = crate::translate::responses_reply_to_chat(&response, model)
+        .map_err(|_| Failure::Retryable)?;
+    let bytes = serde_json::to_vec(&chat).map_err(|_| Failure::Retryable)?;
+    Ok(stream::once(async move { Ok(Bytes::from(bytes)) }).boxed())
+}
+
 /// Non-streaming reply: fold the SSE terminal event into one JSON Responses object.
 async fn fold(
     response: reqwest::Response,
@@ -1141,6 +1244,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_inbound_is_translated_both_ways() {
+        let upstream =
+            Upstream::start("200 OK", &[("content-type", "text/event-stream")], SSE).await;
+        let body = serde_json::json!({
+            "model": "gpt-5.1-codex",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream_options": {"include_usage": true},
+        });
+        let reply = adapter(&upstream)
+            .send(&request(Inbound::Chat, &[], &body, true), &account())
+            .await
+            .unwrap();
+        let text = body_text(reply).await;
+        assert!(text.contains("chat.completion.chunk"), "{text}");
+        assert!(text.contains("\"content\":\"hi\""), "{text}");
+        assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        let sent = upstream.requests.lock().unwrap()[0].clone();
+        assert!(sent.contains("\"input\""), "{sent}");
+        assert!(!sent.contains("\"messages\""), "{sent}");
+
+        let reply = adapter(&upstream)
+            .send(&request(Inbound::Chat, &[], &body, false), &account())
+            .await
+            .unwrap();
+        let chat: Value = serde_json::from_str(&body_text(reply).await).unwrap();
+        assert_eq!(chat["object"], "chat.completion");
+        assert_eq!(chat["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[tokio::test]
     async fn non_streaming_reply_folds_the_terminal_event() {
         let upstream =
             Upstream::start("200 OK", &[("content-type", "text/event-stream")], SSE).await;
@@ -1243,8 +1376,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_and_messages_inbound_are_rejected() {
-        for inbound in [Inbound::Chat, Inbound::Messages] {
+    async fn messages_inbound_is_rejected() {
+        {
+            let inbound = Inbound::Messages;
             let upstream = Upstream::start("200 OK", &[], "").await;
             let request = request(inbound, &[], &serde_json::json!({"model": "m"}), false);
             match failure(&adapter(&upstream), &request).await {

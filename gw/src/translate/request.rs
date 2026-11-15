@@ -1,7 +1,245 @@
-//! Client requests in Responses or Messages form, rewritten for a Chat upstream.
+//! Client requests in Chat, Responses, or Messages form, rewritten for the upstream wire.
 
-use super::Error;
+use super::{new_id, Error};
 use serde_json::{json, Map, Value};
+
+/// Chat completions request as an equivalent Responses request body.
+///
+/// `stream_options` has no Responses equivalent: the upstream always reports usage in its
+/// terminal event, so the stream encoder decides whether the client sees it.
+pub fn chat_to_responses(request: &Value, upstream_model: &str) -> Result<Value, Error> {
+    if !request.is_object() {
+        return Err(Error::bad_request("request body must be a JSON object"));
+    }
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::bad_request("missing 'messages'"))?;
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in messages {
+        chat_message(message, &mut instructions, &mut input)?;
+    }
+    if instructions.is_empty() && input.is_empty() {
+        return Err(Error::bad_request(
+            "messages must include at least one turn",
+        ));
+    }
+
+    let mut body = json!({
+        "model": upstream_model,
+        "input": input,
+        "stream": request.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        "store": false,
+    });
+    let object = body.as_object_mut().expect("object");
+    if !instructions.is_empty() {
+        object.insert(
+            "instructions".into(),
+            Value::String(instructions.join("\n\n")),
+        );
+    }
+    if let Some(tools) = responses_tools(request.get("tools"))? {
+        object.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(choice) = request.get("tool_choice") {
+        object.insert("tool_choice".into(), responses_tool_choice(choice)?);
+    }
+    copy(request, object, "temperature", "temperature");
+    copy(request, object, "top_p", "top_p");
+    copy(request, object, "user", "user");
+    copy(
+        request,
+        object,
+        "parallel_tool_calls",
+        "parallel_tool_calls",
+    );
+    copy(request, object, "service_tier", "service_tier");
+    if let Some(max) = request
+        .get("max_completion_tokens")
+        .or_else(|| request.get("max_tokens"))
+    {
+        object.insert("max_output_tokens".into(), max.clone());
+    }
+    if let Some(effort) = request.get("reasoning_effort") {
+        object.insert(
+            "reasoning".into(),
+            json!({ "effort": effort, "summary": "auto" }),
+        );
+    }
+    Ok(body)
+}
+
+/// One Chat message as Responses `instructions` text or `input` items.
+fn chat_message(
+    message: &Value,
+    instructions: &mut Vec<String>,
+    input: &mut Vec<Value>,
+) -> Result<(), Error> {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    match role {
+        "system" | "developer" => {
+            let text = message
+                .get("content")
+                .map(content_to_text)
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                instructions.push(text.trim().to_owned());
+            }
+        }
+        "user" => {
+            let parts = user_parts(message.get("content"))?;
+            if !parts.is_empty() {
+                input.push(json!({ "type": "message", "role": "user", "content": parts }));
+            }
+        }
+        "assistant" => {
+            let text = message
+                .get("content")
+                .map(content_to_text)
+                .unwrap_or_default();
+            if !text.is_empty() {
+                input.push(json!({ "type": "message", "role": "assistant",
+                    "content": [{ "type": "output_text", "text": text }] }));
+            }
+            for call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                input.push(chat_function_call(call));
+            }
+        }
+        "tool" => {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::bad_request("tool messages require 'tool_call_id'"))?;
+            let output = message
+                .get("content")
+                .map(content_to_text)
+                .unwrap_or_default();
+            input.push(json!({ "type": "function_call_output", "call_id": call_id,
+                "output": output }));
+        }
+        other => {
+            return Err(Error::bad_request(&format!(
+                "unsupported message role '{other}'"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Chat user content as Responses input parts; images keep their URL.
+fn user_parts(content: Option<&Value>) -> Result<Vec<Value>, Error> {
+    let Some(content) = content else {
+        return Ok(Vec::new());
+    };
+    match content {
+        Value::String(text) => {
+            if text.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![json!({ "type": "input_text", "text": text })])
+        }
+        Value::Array(parts) => {
+            let mut converted = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => converted.push(json!({ "type": "input_text",
+                        "text": part.get("text").and_then(Value::as_str).unwrap_or_default() })),
+                    Some("image_url") => {
+                        let url = part
+                            .get("image_url")
+                            .and_then(|value| value.get("url").or(Some(value)))
+                            .or_else(|| part.get("url"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        converted.push(json!({ "type": "input_image", "image_url": url }));
+                    }
+                    other => {
+                        return Err(Error::bad_request(&format!(
+                            "unsupported content part '{}'",
+                            other.unwrap_or("missing type")
+                        )))
+                    }
+                }
+            }
+            Ok(converted)
+        }
+        _ => Err(Error::bad_request("'content' must be a string or array")),
+    }
+}
+
+fn chat_function_call(call: &Value) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call.get("id").cloned().unwrap_or_else(|| json!(new_id("call"))),
+        "name": call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool"),
+        "arguments": call.pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    })
+}
+
+fn responses_tools(tools: Option<&Value>) -> Result<Option<Vec<Value>>, Error> {
+    let Some(tools) = tools.and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut converted = Vec::new();
+    for tool in tools {
+        if let Some(other) = tool
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| *kind != "function")
+        {
+            return Err(Error::bad_request(&format!(
+                "unsupported tool type '{other}'"
+            )));
+        }
+        // Older clients send the function fields without the `function` wrapper.
+        let function = tool.get("function").unwrap_or(tool);
+        let name = function
+            .get("name")
+            .ok_or_else(|| Error::bad_request("tool is missing 'name'"))?;
+        let mut entry = json!({
+            "type": "function",
+            "name": name,
+            "description": function.get("description").cloned().unwrap_or(Value::Null),
+            "parameters": function.get("parameters").cloned()
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+        });
+        if let Some(strict) = function.get("strict") {
+            entry["strict"] = strict.clone();
+        }
+        converted.push(entry);
+    }
+    Ok((!converted.is_empty()).then_some(converted))
+}
+
+fn responses_tool_choice(choice: &Value) -> Result<Value, Error> {
+    let Some(kind) = choice.get("type").and_then(Value::as_str) else {
+        // `auto`, `none`, and `required` are spelled the same on both wires.
+        return Ok(choice.clone());
+    };
+    match kind {
+        "function" => {
+            let name = choice
+                .pointer("/function/name")
+                .or_else(|| choice.get("name"))
+                .ok_or_else(|| Error::bad_request("tool_choice is missing 'name'"))?;
+            Ok(json!({ "type": "function", "name": name }))
+        }
+        other => Err(Error::bad_request(&format!(
+            "unsupported tool_choice type '{other}'"
+        ))),
+    }
+}
 
 /// Responses request as an equivalent Chat completions body.
 pub fn responses_to_chat(request: &Value, upstream_model: &str) -> Result<Value, Error> {

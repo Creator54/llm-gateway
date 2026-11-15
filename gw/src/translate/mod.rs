@@ -7,10 +7,12 @@ mod request;
 mod sse;
 mod stream;
 
-pub use reply::{chat_to_messages, chat_to_responses};
-pub use request::{messages_to_chat, responses_to_chat};
+pub use reply::{chat_to_messages, chat_to_responses, responses_reply_to_chat};
+pub use request::{
+    chat_to_responses as chat_request_to_responses, messages_to_chat, responses_to_chat,
+};
 pub use sse::SseParser;
-pub use stream::{MessagesStream, ResponsesStream};
+pub use stream::{ChatStream, MessagesStream, ResponsesStream};
 
 use serde_json::{json, Value};
 
@@ -114,6 +116,28 @@ fn cached_tokens(usage: &Value) -> u64 {
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// Responses `usage` object as a Chat `usage` object.
+fn chat_usage(usage: &Value) -> Value {
+    let prompt = usage_number(usage, "input_tokens");
+    let completion = usage_number(usage, "output_tokens");
+    let total = usage_number(usage, "total_tokens");
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": if total == 0 { prompt + completion } else { total },
+        "prompt_tokens_details": { "cached_tokens": cached },
+        "completion_tokens_details": { "reasoning_tokens": reasoning },
+    })
 }
 
 /// Chat usage as a Responses `usage` object.

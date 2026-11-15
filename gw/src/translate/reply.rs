@@ -1,7 +1,70 @@
-//! Whole (non-streamed) Chat replies in Responses or Messages form.
+//! Whole (non-streamed) Chat replies in Responses or Messages form, and the inverse.
 
-use super::{messages_usage, new_id, now, responses_usage, stop_reason, Error};
+use super::{chat_usage, messages_usage, new_id, now, responses_usage, stop_reason, Error};
 use serde_json::{json, Value};
+
+/// Responses reply as a Chat completion; text and tool calls keep their order.
+pub fn responses_reply_to_chat(response: &Value, requested_model: &str) -> Result<Value, Error> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| Error::bad_gateway("upstream response is not an object"))?;
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for item in object
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                        text.push_str(part.get("text").and_then(Value::as_str).unwrap_or_default());
+                    }
+                }
+            }
+            Some("function_call") => calls.push(json!({
+                "id": item.get("call_id").or_else(|| item.get("id"))
+                    .cloned().unwrap_or_else(|| json!(new_id("call"))),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or_default(),
+                },
+            })),
+            _ => {}
+        }
+    }
+    let finish = if !calls.is_empty() {
+        "tool_calls"
+    } else if object.get("status").and_then(Value::as_str) == Some("incomplete") {
+        "length"
+    } else {
+        "stop"
+    };
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) },
+    });
+    if !calls.is_empty() {
+        message["tool_calls"] = Value::Array(calls);
+    }
+    Ok(json!({
+        "id": object.get("id").and_then(Value::as_str).map(str::to_owned)
+            .unwrap_or_else(|| new_id("chatcmpl")),
+        "object": "chat.completion",
+        "created": object.get("created_at").and_then(Value::as_u64).unwrap_or_else(now),
+        "model": requested_model,
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+        "usage": chat_usage(object.get("usage").unwrap_or(&Value::Null)),
+    }))
+}
 
 /// Chat reply as a Responses object. `parallel_tool_calls` echoes the request
 /// when the client sent one.

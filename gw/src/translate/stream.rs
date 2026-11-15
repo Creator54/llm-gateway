@@ -1,6 +1,6 @@
 //! Live Chat chunks rewritten as Responses or Messages events.
 
-use super::{messages_usage, new_id, now, responses_usage, stop_reason};
+use super::{chat_usage, messages_usage, new_id, now, responses_usage, stop_reason};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
@@ -59,6 +59,156 @@ impl CallState {
             "id": self.item_id, "type": "function_call", "status": status,
             "call_id": self.call_id, "name": self.name, "arguments": arguments,
         })
+    }
+}
+
+/// Turns Responses SSE events into Chat completion chunks.
+pub struct ChatStream {
+    id: String,
+    model: String,
+    created: u64,
+    include_usage: bool,
+    /// Tool call slot per Responses item id, in announcement order.
+    calls: Vec<String>,
+    started: bool,
+    done: bool,
+}
+
+impl ChatStream {
+    /// Start a stream; `include_usage` mirrors the client's `stream_options`.
+    pub fn new(model: impl Into<String>, include_usage: bool) -> Self {
+        Self {
+            id: new_id("chatcmpl"),
+            model: model.into(),
+            created: now(),
+            include_usage,
+            calls: Vec::new(),
+            started: false,
+            done: false,
+        }
+    }
+
+    fn frame(&self, delta: Value, finish: Option<&str>, usage: Option<Value>) -> Vec<u8> {
+        let mut data = json!({
+            "id": self.id, "object": "chat.completion.chunk",
+            "created": self.created, "model": self.model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+        });
+        if let Some(usage) = usage {
+            data["usage"] = usage;
+            data["choices"] = json!([]);
+        }
+        let data = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+        format!("data: {data}\n\n").into_bytes()
+    }
+
+    fn open(&mut self) -> Vec<u8> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        self.frame(json!({ "role": "assistant", "content": "" }), None, None)
+    }
+
+    fn slot(&self, item_id: &str) -> Option<usize> {
+        self.calls.iter().position(|known| known == item_id)
+    }
+
+    /// Feed one Responses SSE payload and get the Chat chunks it produces.
+    pub fn push_event(&mut self, data: &str) -> Vec<u8> {
+        if self.done {
+            return Vec::new();
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "response.output_text.delta" => {
+                out.extend(self.open());
+                let text = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                if !text.is_empty() {
+                    out.extend(self.frame(json!({ "content": text }), None, None));
+                }
+            }
+            "response.output_item.added" => {
+                let item = &event["item"];
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    out.extend(self.open());
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                    self.calls.push(item_id.to_owned());
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(item_id);
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    out.extend(self.frame(
+                        json!({ "tool_calls": [{
+                            "index": self.calls.len() - 1, "id": call_id, "type": "function",
+                            "function": { "name": name, "arguments": "" }
+                        }] }),
+                        None,
+                        None,
+                    ));
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = event.get("item_id").and_then(Value::as_str).unwrap_or("");
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                if let (Some(index), false) = (self.slot(item_id), delta.is_empty()) {
+                    out.extend(self.frame(
+                        json!({ "tool_calls": [{
+                            "index": index, "function": { "arguments": delta }
+                        }] }),
+                        None,
+                        None,
+                    ));
+                }
+            }
+            kind @ ("response.completed" | "response.incomplete") => {
+                out.extend(self.open());
+                let finish = if !self.calls.is_empty() {
+                    "tool_calls"
+                } else if kind == "response.incomplete" {
+                    "length"
+                } else {
+                    "stop"
+                };
+                out.extend(self.frame(json!({}), Some(finish), None));
+                if self.include_usage {
+                    if let Some(usage) = event.pointer("/response/usage") {
+                        out.extend(self.frame(json!({}), None, Some(chat_usage(usage))));
+                    }
+                }
+                out.extend_from_slice(b"data: [DONE]\n\n");
+                self.done = true;
+            }
+            "response.failed" | "error" => {
+                let message = event
+                    .pointer("/response/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream failed");
+                let error = json!({ "error": { "message": message, "type": "upstream_error" } });
+                out.extend(format!("data: {error}\n\n").into_bytes());
+                out.extend_from_slice(b"data: [DONE]\n\n");
+                self.done = true;
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Closing frames if the upstream ended without a terminal event.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        let mut out = self.open();
+        out.extend(self.frame(json!({}), Some("stop"), None));
+        out.extend_from_slice(b"data: [DONE]\n\n");
+        out
     }
 }
 
