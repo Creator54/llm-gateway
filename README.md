@@ -69,7 +69,8 @@ server is down.
 On by default: stable prefixes, session stickiness, cache markers, stripping
 changing sections, cache-break detection, local `/v1/models` and `count_tokens`.
 Every transform is deterministic, fail-open, and switchable. `profile = "parity"`
-turns all of them off so traffic matches a plain forwarder byte for byte.
+turns all of them off; only the edits an upstream requires (such as the bare
+model id) remain.
 
 ## Development
 

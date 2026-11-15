@@ -53,7 +53,9 @@ impl Default for Config {
     }
 }
 
-/// Behaviour profile: `parity` forwards request bytes exactly as the client sent them.
+/// Behaviour profile: `parity` turns off every optional transform (cache edits, tidy),
+/// so a passthrough forwards the client's bytes. Adapters still apply the wire edits
+/// their upstream requires, such as the bare model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
