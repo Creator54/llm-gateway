@@ -980,6 +980,7 @@ impl Gateway {
                 prefix: Arc::clone(&self.prefix),
                 metrics: Arc::clone(&self.metrics),
                 ttfb: None,
+                store: self.store.clone(),
             }),
         };
         let mut response = Response::new(Body::from_stream(tracked));
@@ -1028,6 +1029,7 @@ impl Gateway {
                 prefix: Arc::clone(&self.prefix),
                 metrics: Arc::clone(&self.metrics),
                 ttfb: None,
+                store: self.store.clone(),
             }),
         };
         let mut response = Response::new(Body::from_stream(tracked));
@@ -1055,6 +1057,7 @@ impl Gateway {
             prefix: Arc::clone(&self.prefix),
             metrics: Arc::clone(&self.metrics),
             ttfb: None,
+            store: self.store.clone(),
         }
         .finish(tokens);
     }
@@ -1239,6 +1242,8 @@ struct Track {
     metrics: Arc<metrics::Metrics>,
     /// Time to the first body chunk; `None` until it arrives.
     ttfb: Option<f64>,
+    /// Used to remember that an upstream accepts `prompt_cache_key`.
+    store: Option<Arc<Store>>,
 }
 
 impl Track {
@@ -1254,6 +1259,7 @@ impl Track {
     fn finish(self, tokens: usage::Tokens) {
         self.check_cache_break(tokens.cached_read);
         self.count(&tokens);
+        self.learn_cache_key(&tokens);
         let Some(journal) = self.journal.as_deref() else {
             return;
         };
@@ -1274,6 +1280,36 @@ impl Track {
     }
 
     /// Remember this prefix's cache read, and log a break when the share drops.
+    /// Remember that this provider/model serves cache reads.
+    ///
+    /// A cache hit proves the upstream accepts a cache key, which is the only
+    /// evidence the gateway can get without hardcoding a provider list.
+    fn learn_cache_key(&self, tokens: &usage::Tokens) {
+        // Only a genuine cache hit proves the upstream takes a cache key.
+        if tokens.cached_read == 0 {
+            return;
+        }
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        if store
+            .get_quirk(&self.info.provider, &self.info.model, "prompt_cache_key")
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        if let Err(error) = store.set_quirk(
+            &self.info.provider,
+            &self.info.model,
+            "prompt_cache_key",
+            "true",
+        ) {
+            tracing::debug!(%error, "could not record prompt_cache_key support");
+        }
+    }
+
     /// A request as Prometheus sees it: status class, latency, tokens.
     fn count(&self, tokens: &usage::Tokens) {
         let provider = &self.info.provider;

@@ -166,3 +166,97 @@ async fn a_spent_budget_surfaces_as_a_quota_failure() {
     // Three attempts, then give up rather than looping.
     assert_eq!(hits.load(Ordering::SeqCst), 3);
 }
+
+/// A cache hit teaches the gateway that this upstream takes a cache key, so the
+/// OpenAI-style `prompt_cache_key` can be sent on later requests.
+#[tokio::test]
+async fn a_cache_hit_records_cache_key_support() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc as StdArc;
+
+    #[derive(Clone)]
+    struct Cached {
+        hits: StdArc<AtomicUsize>,
+    }
+
+    async fn answer(axum::extract::State(state): axum::extract::State<Cached>) -> Response {
+        let first = state.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let cached = if first { 0 } else { 4096 };
+        let body = format!(
+            r#"{{"id":"c","object":"chat.completion","model":"beam-free","choices":[{{"index":0,"message":{{"role":"assistant","content":"pong"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":4200,"completion_tokens":2,"total_tokens":4202,"prompt_tokens_details":{{"cached_tokens":{cached}}}}}}}"#
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    let hits = StdArc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .fallback(any(answer))
+        .with_state(Cached { hits: hits.clone() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = std::env::temp_dir().join(format!(
+        "gw-quirk-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        // Probe before the gateway starts, then release the connection so the
+        // gateway's own handle is the only writer.
+        let store = gw::store::Store::open(&dir).unwrap();
+        assert!(store
+            .get_quirk("opencode", "beam-free", "prompt_cache_key")
+            .unwrap()
+            .is_none());
+    }
+
+    // Go through the gateway so `Track::finish` sees the usage.
+    let cfg = gw::config::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        state_dir: dir.clone(),
+        profile: gw::config::Profile::Parity,
+        endpoints: std::collections::BTreeMap::from([(
+            "opencode".to_owned(),
+            format!("http://{addr}"),
+        )]),
+        ..gw::config::Config::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gw::server::serve(listener, cfg).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    for _ in 0..2 {
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"opencode/beam-free","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .expect("request");
+        let _ = response.text().await;
+    }
+
+    // The quirk is written while the reply streams out.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let reopened = gw::store::Store::open(&dir).unwrap();
+    let learned = reopened
+        .get_quirk("opencode", "beam-free", "prompt_cache_key")
+        .unwrap();
+    assert_eq!(
+        learned.as_deref(),
+        Some("true"),
+        "cache hit must be learned"
+    );
+}
