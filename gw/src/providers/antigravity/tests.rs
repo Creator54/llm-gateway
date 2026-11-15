@@ -110,6 +110,7 @@ fn request(inbound: Wire, stream: bool, body: Value) -> Request {
         body: Bytes::from(body.to_string()),
         stream,
         session: "s1".into(),
+        fast: None,
     }
 }
 

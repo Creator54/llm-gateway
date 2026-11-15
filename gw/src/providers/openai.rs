@@ -81,7 +81,7 @@ impl OpenAi {
             return Err(Failure::Auth);
         };
 
-        let body = outbound_body(&req.body, &req.model)?;
+        let body = outbound_body(&req.body, &req.model, req.fast.unwrap_or(false))?;
         let headers = outbound_headers(&req.headers, access, account_id, &body);
         let url = format!("{}/responses", self.base);
         let bytes = serde_json::to_vec(&body).map_err(|_| Failure::Retryable)?;
@@ -207,7 +207,10 @@ fn hint_component(value: &Value, max: usize) -> Option<&str> {
 }
 
 /// Caller body rewritten for the canonical backend, keeping the caller's key order.
-fn outbound_body(raw: &Bytes, model: &str) -> Result<Value, Failure> {
+///
+/// `--fast` is the client's only way to ask for the priority tier, so it sets `service_tier`
+/// unless the caller already chose a tier itself.
+fn outbound_body(raw: &Bytes, model: &str, fast: bool) -> Result<Value, Failure> {
     let mut body: Value = serde_json::from_slice(raw).map_err(|_| bad_body())?;
     if !body.is_object() {
         return Err(bad_body());
@@ -231,6 +234,10 @@ fn outbound_body(raw: &Bytes, model: &str) -> Result<Value, Failure> {
     }
     object.remove("truncation");
     fold_system_messages(object);
+    object.insert("model".into(), Value::String(model.to_owned()));
+    if fast && object.get("service_tier").is_none_or(Value::is_null) {
+        object.insert("service_tier".into(), Value::String("priority".into()));
+    }
     if object.get("store").and_then(Value::as_bool) == Some(false) {
         strip_continuation_markers(object);
     }
@@ -891,6 +898,7 @@ mod tests {
             body: Bytes::from(serde_json::to_vec(body).unwrap()),
             stream,
             session: "session-1".into(),
+            fast: None,
         }
     }
 
@@ -1034,6 +1042,43 @@ mod tests {
             None
         );
         assert_eq!(body["input"][0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn fast_suffix_sends_the_routed_model_and_the_priority_tier() {
+        let upstream = Upstream::start("200 OK", &[], "").await;
+        let body = serde_json::json!({"model": "gpt-6.1-sol--fast", "input": "hi"});
+        let mut req = request(Inbound::Responses, &[], &body, true);
+        req.model = "gpt-6.1-sol".into();
+        req.fast = Some(true);
+        adapter(&upstream).send(&req, &account()).await.unwrap();
+
+        let captured = upstream.captured();
+        let sent: Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(sent["model"], "gpt-6.1-sol");
+        assert_eq!(sent["service_tier"], "priority");
+        assert_eq!(
+            captured.header(ROUTING_HINT),
+            Some("model=gpt-6.1-sol;tier=priority")
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_suffix_keeps_a_tier_the_caller_chose() {
+        let upstream = Upstream::start("200 OK", &[], "").await;
+        let body = serde_json::json!({
+            "model": "gpt-6.1-sol--fast",
+            "service_tier": "flex",
+            "input": "hi"
+        });
+        let mut req = request(Inbound::Responses, &[], &body, true);
+        req.model = "gpt-6.1-sol".into();
+        req.fast = Some(true);
+        adapter(&upstream).send(&req, &account()).await.unwrap();
+
+        let captured = upstream.captured();
+        let sent: Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(sent["service_tier"], "flex");
     }
 
     #[tokio::test]

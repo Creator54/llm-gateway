@@ -143,6 +143,8 @@ struct Gateway {
     journal: Option<Arc<Journal>>,
     /// Combos from the config, so a route can expand to its targets.
     combos: BTreeMap<String, combo::Combo>,
+    /// Provider a bare model id routes to; `None` leaves it to the fallback.
+    default_provider: Option<String>,
     /// Prefix hash and cache read of the last reply, for the cache-break detector.
     prefix: Arc<Mutex<Option<(u64, u64)>>>,
     /// Request counters rendered at `/metrics`.
@@ -229,6 +231,11 @@ impl Gateway {
             prefix: Arc::new(Mutex::new(None)),
             metrics: Arc::new(metrics::Metrics::new()),
             metrics_on: cfg.metrics,
+            default_provider: cfg
+                .default_provider
+                .as_deref()
+                .map(alias)
+                .map(str::to_owned),
         })
     }
 }
@@ -413,7 +420,7 @@ async fn count_tokens(State(st): State<Arc<Gateway>>, req: Request) -> Response 
         Err(response) => return response,
     };
     let count = tokens::estimate(&plan.body);
-    let info = RequestInfo::of(&plan.body);
+    let info = RequestInfo::of(&plan.body, st.default_provider.as_deref());
     let mut response = Response::new(Body::from(tokens::response(count)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -554,7 +561,7 @@ impl Gateway {
             Err(e) => {
                 tracing::warn!(url = %url, error = %e, "upstream request failed");
                 let status = StatusCode::BAD_GATEWAY;
-                let info = RequestInfo::of(&plan.body);
+                let info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
                 self.finish(
                     &plan.path_and_query,
                     &info,
@@ -582,7 +589,7 @@ impl Gateway {
             _ => return None,
         };
         let shape = wire(inbound);
-        let info = RequestInfo::of(&plan.body);
+        let info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
         let route = self.route(&info)?;
         let creds = match creds::Store::load(&self.state_dir) {
             Ok(creds) => creds,
@@ -634,6 +641,7 @@ impl Gateway {
                 body: plan.body.clone(),
                 stream,
                 session: info.session.clone(),
+                fast: info.fast.then_some(true),
             };
             // Attempting it means it is not cooling, even if the gauge was never
             // cleared after an earlier cooldown expired.
@@ -950,7 +958,7 @@ impl Gateway {
         account: &str,
     ) -> Response {
         let status = StatusCode::from_u16(reply.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut info = RequestInfo::of(&plan.body);
+        let mut info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
         // Label the counters with the account that actually served this request.
         info.account = account.to_owned();
         let sse = is_event_stream(&reply.headers);
@@ -992,7 +1000,7 @@ impl Gateway {
     fn reply(&self, upstream: reqwest::Response, plan: Plan, started: Instant) -> Response {
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let info = RequestInfo::of(&plan.body);
+        let info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
         let sse = is_event_stream(upstream.headers());
         let buffered = upstream
             .headers()
@@ -1150,6 +1158,19 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.split(';').next().unwrap_or(v).trim() == "text/event-stream")
 }
 
+/// Provider names clients still send from the opencodex era, mapped to the adapter that
+/// serves them now.
+fn alias(provider: &str) -> &str {
+    match provider {
+        "opencode-cli" | "opencode-zen" | "opencode-free" => "opencode",
+        "google-antigravity" => "antigravity",
+        other => other,
+    }
+}
+
+/// Client suffix asking for the fast tier; a single `-fast` is a real model id.
+const FAST: &str = "--fast";
+
 /// `provider/model` split as the router reads it; an empty namespace when it is not a model id.
 fn route_of(model: &str) -> (String, String) {
     match route::parse(model) {
@@ -1167,23 +1188,30 @@ struct RequestInfo {
     provider: String,
     account: String,
     model: String,
+    /// The client's `--fast` suffix, already stripped from `model`.
+    fast: bool,
 }
 
 impl RequestInfo {
-    fn of(body: &[u8]) -> Self {
+    /// Read what the client asked for. `default_provider` owns bare model ids.
+    fn of(body: &[u8], default_provider: Option<&str>) -> Self {
         let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
         let asked = value
             .pointer("/model")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let (asked, fast) = match asked.strip_suffix(FAST) {
+            Some(model) if !model.is_empty() => (model.to_owned(), true),
+            _ => (asked.clone(), false),
+        };
         let (provider, model, account) = match route::parse(&asked) {
             Some(route::Target::Model {
                 provider,
                 account,
                 model,
             }) => (
-                provider,
+                alias(&provider).to_owned(),
                 model,
                 account.unwrap_or_else(|| "auto".to_owned()),
             ),
@@ -1191,13 +1219,20 @@ impl RequestInfo {
             Some(route::Target::Auto(profile)) => {
                 ("auto".to_owned(), asked, profile.unwrap_or_default())
             }
-            None => (String::new(), asked, String::new()),
+            // A bare model id belongs to the configured default provider, when it has an adapter.
+            None => match default_provider.map(alias) {
+                Some(provider) if !asked.is_empty() && providers::is_provider(provider) => {
+                    (provider.to_owned(), asked, "auto".to_owned())
+                }
+                _ => (String::new(), asked, String::new()),
+            },
         };
         Self {
             session: session_of(&value),
             provider,
             account,
             model,
+            fast,
         }
     }
 }
@@ -1713,6 +1748,8 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_key_file: key_file.as_ref().map(|k| k.0.clone()),
             fallback: fallback.map(|a| format!("http://{a}")),
+            // These tests are about forwarding, so no provider claims a bare model id.
+            default_provider: None,
             max_body_bytes: max_body,
             state_dir: temp_state(),
             ..Config::default()
@@ -1772,6 +1809,73 @@ mod tests {
             .iter()
             .find(|h| h[0] == name)
             .map(|h| h[1].as_str().unwrap().to_string())
+    }
+
+    fn routed(cfg: &Config, model: &str) -> (RequestInfo, Vec<String>) {
+        let st = Gateway::new(cfg).expect("gateway");
+        let body = json!({ "model": model }).to_string();
+        let info = RequestInfo::of(body.as_bytes(), st.default_provider.as_deref());
+        let route = st.route(&info).expect("routed");
+        let targets = route
+            .targets
+            .iter()
+            .map(|target| format!("{}/{}", target.provider, target.model))
+            .collect();
+        (info, targets)
+    }
+
+    fn default_config() -> Config {
+        Config {
+            state_dir: temp_state(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_model_routes_to_the_default_provider() {
+        let (info, targets) = routed(&default_config(), "gpt-6.1-sol");
+        assert_eq!(info.provider, "openai");
+        assert_eq!(info.model, "gpt-6.1-sol");
+        assert!(!info.fast);
+        assert_eq!(targets, ["openai/gpt-6.1-sol"]);
+    }
+
+    #[tokio::test]
+    async fn fast_suffix_is_stripped_from_the_routed_model() {
+        let (info, targets) = routed(&default_config(), "gpt-6.1-sol--fast");
+        assert!(info.fast);
+        assert_eq!(info.provider, "openai");
+        assert_eq!(info.model, "gpt-6.1-sol");
+        assert_eq!(targets, ["openai/gpt-6.1-sol"]);
+        // A single dash is part of the model id, not a tier request.
+        let (info, targets) = routed(&default_config(), "gpt-6.1-sol-fast");
+        assert!(!info.fast);
+        assert_eq!(info.model, "gpt-6.1-sol-fast");
+        assert_eq!(targets, ["openai/gpt-6.1-sol-fast"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_names_resolve_to_their_adapter() {
+        let (info, targets) = routed(&default_config(), "opencode-cli/glm-5.3-flash-free");
+        assert_eq!(info.provider, "opencode");
+        assert_eq!(info.model, "glm-5.3-flash-free");
+        assert_eq!(targets, ["opencode/glm-5.3-flash-free"]);
+        let (info, targets) = routed(&default_config(), "google-antigravity/gemini-3.1-pro");
+        assert_eq!(info.provider, "antigravity");
+        assert_eq!(targets, ["antigravity/gemini-3.1-pro"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_default_provider_leaves_a_bare_model_to_the_fallback() {
+        let cfg = Config {
+            default_provider: Some("nope".into()),
+            ..default_config()
+        };
+        let st = Gateway::new(&cfg).expect("gateway");
+        let body = json!({ "model": "gpt-6.1-sol" }).to_string();
+        let info = RequestInfo::of(body.as_bytes(), st.default_provider.as_deref());
+        assert_eq!(info.provider, "");
+        assert!(st.route(&info).is_none());
     }
 
     #[tokio::test]
@@ -2146,6 +2250,7 @@ mod tests {
             fallback: Some(format!("http://{up}")),
             state_dir: temp_state(),
             profile: crate::config::Profile::Parity,
+            default_provider: None,
             ..Config::default()
         };
         let addr = gateway_with(cfg).await;
@@ -2213,6 +2318,7 @@ mod tests {
         let cfg = Config {
             fallback: Some(format!("http://{up}")),
             state_dir: state.clone(),
+            default_provider: None,
             ..Config::default()
         };
         let addr = gateway_with(cfg).await;

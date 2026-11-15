@@ -126,6 +126,7 @@ fn test_request(inbound: Inbound, body: Value, stream: bool) -> Request {
         body: Bytes::from(serde_json::to_vec(&body).unwrap()),
         stream,
         session: "sess-1".into(),
+        fast: None,
     }
 }
 

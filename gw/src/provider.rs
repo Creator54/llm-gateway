@@ -26,6 +26,8 @@ pub struct Request {
     pub stream: bool,
     /// Stable per conversation; keeps a session on one account.
     pub session: String,
+    /// The client asked for the fast tier with a trailing `--fast` on its model.
+    pub fast: Option<bool>,
 }
 
 #[derive(Clone)]

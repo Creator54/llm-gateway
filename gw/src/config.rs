@@ -20,6 +20,8 @@ pub struct Config {
     pub api_key_file: Option<PathBuf>,
     /// Upstream used for anything not handled natively (e.g. opencodex).
     pub fallback: Option<String>,
+    /// Provider a bare model id (no `provider/` prefix) routes to; `None` forwards it.
+    pub default_provider: Option<String>,
     pub state_dir: PathBuf,
     pub max_body_bytes: usize,
     /// Combos by name, selected with `combo/<name>`.
@@ -42,6 +44,7 @@ impl Default for Config {
             listen: ([127, 0, 0, 1], 10204).into(),
             api_key_file: None,
             fallback: None,
+            default_provider: Some("openai".to_owned()),
             state_dir: home().join(".config/gw"),
             max_body_bytes: 32 << 20,
             combos: BTreeMap::new(),
@@ -184,6 +187,14 @@ weight = 2
         assert_eq!(combo.targets[1].weight, 2);
         // An absent weight is zero and counts as one.
         assert_eq!(combo.targets[0].weight, 0);
+    }
+
+    #[test]
+    fn bare_models_default_to_openai() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.default_provider.as_deref(), Some("openai"));
+        let cfg: Config = toml::from_str("default_provider = \"opencode\"").unwrap();
+        assert_eq!(cfg.default_provider.as_deref(), Some("opencode"));
     }
 
     #[test]

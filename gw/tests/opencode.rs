@@ -95,6 +95,7 @@ fn request(inbound: Inbound, body: Value) -> Request {
         body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         stream: false,
         session: "conversation-1".into(),
+        fast: None,
     }
 }
 

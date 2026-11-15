@@ -173,6 +173,7 @@ fn request(inbound: Inbound, body: serde_json::Value, stream: bool) -> Request {
         body: Bytes::from(serde_json::to_vec(&body).expect("body")),
         stream,
         session: "session-1".into(),
+        fast: None,
     }
 }
 

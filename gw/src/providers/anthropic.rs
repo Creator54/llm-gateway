@@ -1021,6 +1021,7 @@ mod tests {
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
             body: Bytes::from(body.to_string()),
             session: "session".into(),
+            fast: None,
         }
     }
 

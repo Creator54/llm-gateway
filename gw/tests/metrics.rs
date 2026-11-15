@@ -60,6 +60,9 @@ fn config(fallback: String, key: Option<&str>) -> Config {
         state_dir: dir,
         profile: Profile::Parity,
         endpoints: BTreeMap::new(),
+        // The metrics test posts a bare `claude-sonnet-4`; without a default
+        // provider it stays non-openai so the request reaches the fallback.
+        default_provider: None,
         ..Config::default()
     }
 }

@@ -558,6 +558,7 @@ mod tests {
             body: Bytes::from(serde_json::to_vec(&body).unwrap()),
             stream,
             session: "session-abc".into(),
+            fast: None,
         }
     }
 
