@@ -299,12 +299,43 @@ fn add_markers(body: &mut Value, ttl_1h: bool) -> bool {
     if spots.iter().any(|spot| control(body, *spot).is_some()) {
         return false;
     }
-    let targets = marker_spots(body);
-    let mut changed = false;
-    for spot in targets {
+    let mut changed = blockify(body);
+    for spot in marker_spots(body) {
         changed |= set_control(body, spot, ttl_1h);
     }
     changed
+}
+
+/// Turn a plain-string `system` and plain-string user turns into one text block
+/// each so they can carry a breakpoint. Applied to every turn, not just the marked
+/// ones, so earlier turns keep the same bytes as the conversation grows.
+fn blockify(body: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(system) = body.get_mut("system") {
+        changed |= text_block(system);
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages {
+            if msg.get("role").and_then(Value::as_str) == Some("user") {
+                if let Some(content) = msg.get_mut("content") {
+                    changed |= text_block(content);
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn text_block(slot: &mut Value) -> bool {
+    let Value::String(text) = slot else {
+        return false;
+    };
+    if text.is_empty() {
+        return false;
+    }
+    let text = std::mem::take(text);
+    *slot = serde_json::json!([{"type": "text", "text": text}]);
+    true
 }
 
 /// Last system block, last tool, then the last two user turns; four at most.
@@ -622,16 +653,38 @@ mod tests {
     }
 
     #[test]
-    fn skips_string_content_and_thinking_blocks() {
+    fn skips_thinking_blocks() {
         let body = parse(json!({
-            "system": "plain string",
             "messages": [
-                {"role": "user", "content": "string content"},
                 {"role": "user", "content": [{"type": "thinking", "thinking": "x"}]}
             ]
         }));
+        let out = anthropic_messages(body.clone(), &Options::default());
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn string_system_and_user_turns_become_marked_text_blocks() {
+        let body = parse(json!({
+            "system": "be brief",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "second"},
+                {"role": "user", "content": "third"}
+            ]
+        }));
         let out = anthropic_messages(body, &Options::default());
-        assert!(breakpoints(&out).is_empty());
+        assert_eq!(
+            breakpoints(&out),
+            vec![Spot::System(0), Spot::Block(2, 0), Spot::Block(3, 0)]
+        );
+        // Unmarked turns are still converted, so the prefix is stable next turn.
+        assert_eq!(
+            out["messages"][0]["content"],
+            json!([{"type": "text", "text": "first"}])
+        );
+        assert_eq!(out["messages"][1]["content"], "ok");
     }
 
     #[test]

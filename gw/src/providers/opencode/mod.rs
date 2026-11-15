@@ -181,17 +181,28 @@ impl Provider for Opencode {
 
 /// Chat-shaped upstream body for any inbound protocol.
 fn outbound_body(req: &Request) -> Result<Vec<u8>, Failure> {
-    if req.inbound == Inbound::Chat {
-        return Ok(req.body.to_vec());
-    }
     let value: Value = serde_json::from_slice(&req.body)
         .map_err(|_| invalid("request body is not valid JSON", req.inbound))?;
-    let chat = match req.inbound {
+    let mut chat = match req.inbound {
         Inbound::Responses => responses_to_chat(&value, &req.model),
         Inbound::Messages => messages_to_chat(&value, &req.model),
         Inbound::Chat => Ok(value),
     }
     .map_err(|error| translate_failure(&error, req.inbound))?;
+    let Some(object) = chat.as_object_mut() else {
+        return Err(invalid("request body is not a JSON object", req.inbound));
+    };
+    // The routed id, without the `opencode/` prefix the client used to pick us.
+    object.insert("model".into(), Value::String(req.model.clone()));
+    // Without this the stream carries no usage, so spend and cache hits go unrecorded.
+    if object.get("stream").and_then(Value::as_bool) == Some(true) {
+        let options = object
+            .entry("stream_options")
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Some(options) = options.as_object_mut() {
+            options.entry("include_usage").or_insert(Value::Bool(true));
+        }
+    }
     serde_json::to_vec(&chat).map_err(|_| invalid("request body is not serializable", req.inbound))
 }
 
@@ -566,18 +577,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_requests_pass_through_unchanged() {
+    async fn chat_requests_send_the_bare_model_id() {
         let (base, captured) = spawn(200).await;
         let adapter = Opencode::new(reqwest::Client::new(), Some(base));
-        let body =
-            serde_json::json!({"model":"beam-free","messages":[{"role":"user","content":"hi"}]});
+        let body = serde_json::json!({"model":"opencode/beam-free","messages":[{"role":"user","content":"hi"}]});
         let _ = adapter
-            .send(&request(Inbound::Chat, body.clone(), false), &anonymous())
+            .send(&request(Inbound::Chat, body, false), &anonymous())
             .await
             .unwrap();
         let seen = captured.lock().unwrap().clone().unwrap();
         assert_eq!(seen.path, "/zen/v1/chat/completions");
-        assert_eq!(serde_json::from_slice::<Value>(&seen.body).unwrap(), body);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&seen.body).unwrap(),
+            serde_json::json!({"model":"beam-free","messages":[{"role":"user","content":"hi"}]})
+        );
+    }
+
+    #[test]
+    fn streams_ask_for_usage() {
+        let body = serde_json::json!({"model":"opencode/beam-free","stream":true,"messages":[]});
+        let out: Value =
+            serde_json::from_slice(&outbound_body(&request(Inbound::Chat, body, true)).unwrap())
+                .unwrap();
+        assert_eq!(out["stream_options"]["include_usage"], true);
+        let body = serde_json::json!({"model":"x","stream":true,"stream_options":{"include_usage":false},"messages":[]});
+        let out: Value =
+            serde_json::from_slice(&outbound_body(&request(Inbound::Chat, body, true)).unwrap())
+                .unwrap();
+        assert_eq!(out["stream_options"]["include_usage"], false);
     }
 
     #[tokio::test]

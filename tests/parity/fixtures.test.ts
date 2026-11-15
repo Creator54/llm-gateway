@@ -53,7 +53,8 @@ describe("golden fixtures", () => {
       expect(fixture.url.endsWith("/chat/completions")).toBe(true);
       expect(header(fixture, "authorization")).toMatch(/^Bearer /);
       const body = JSON.parse(fixture.body);
-      expect(body.model).toBeTruthy();
+      // gw routes on the `opencode/` prefix and must send the bare id upstream.
+      expect(body.model).toBe("beam-free");
       expect(Array.isArray(body.messages)).toBe(true);
     }
   });
