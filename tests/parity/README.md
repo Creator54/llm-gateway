@@ -31,3 +31,20 @@ compared, not masked. Headers are compared as a name-to-values multiset; add
 prints the request index and what changed:
 
     bun tests/parity/diff.ts /tmp/old.jsonl /tmp/new.jsonl
+
+## Golden fixtures
+
+`fixtures/*.jsonl` hold one recorded request per protocol, checked in so the
+egress contract is tested rather than assumed. They were recorded with:
+
+    bun tests/parity/recorder.ts --port 10370 --out /tmp/parity-gw.jsonl
+
+with gw started against `--endpoints` pointing at that recorder, then:
+
+    curl -X POST localhost:<gw>/v1/chat/completions -d '{"model":"opencode/beam-free",...}'
+
+`fixtures.test.ts` asserts what those recordings prove: the endpoint, the
+`x-opencode-*` header set, that client tools survive unchanged, that a Messages
+request keeps its shape and gains a cache breakpoint, and that a Responses
+request is translated to the chat shape. To add a protocol or provider, record
+it the same way and drop the line in.
