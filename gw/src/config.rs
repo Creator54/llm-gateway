@@ -26,6 +26,8 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// Combos by name, selected with `combo/<name>`.
     pub combos: BTreeMap<String, Combo>,
+    /// Models to list per provider, beyond the combo targets (`provider = [\"model\", …]`).
+    pub models: BTreeMap<String, Vec<String>>,
     /// Per-provider endpoint overrides, e.g. a fake upstream in tests.
     #[serde(default)]
     pub endpoints: BTreeMap<String, String>,
@@ -48,6 +50,7 @@ impl Default for Config {
             state_dir: home().join(".config/gw"),
             max_body_bytes: 32 << 20,
             combos: BTreeMap::new(),
+            models: BTreeMap::new(),
             endpoints: BTreeMap::new(),
             profile: Profile::Default,
             metrics: true,
@@ -201,5 +204,16 @@ weight = 2
     fn unknown_combo_is_an_error() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.resolve("nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod models_tests {
+    use super::*;
+
+    #[test]
+    fn parses_per_provider_model_lists() {
+        let cfg: Config = toml::from_str("[models]\nanthropic = [\"claude-haiku-5-5\"]\n").unwrap();
+        assert_eq!(cfg.models["anthropic"], ["claude-haiku-5-5"]);
     }
 }

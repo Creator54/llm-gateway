@@ -143,6 +143,7 @@ struct Gateway {
     journal: Option<Arc<Journal>>,
     /// Combos from the config, so a route can expand to its targets.
     combos: BTreeMap<String, combo::Combo>,
+    models: BTreeMap<String, Vec<String>>,
     /// Provider a bare model id routes to; `None` leaves it to the fallback.
     default_provider: Option<String>,
     /// Prefix hash and cache read of the last reply, for the cache-break detector.
@@ -215,6 +216,7 @@ impl Gateway {
             journal,
             adapters,
             pool: Mutex::new(pool::Pool::new()),
+            models: cfg.models.clone(),
             combos: cfg
                 .combos
                 .iter()
@@ -503,13 +505,22 @@ impl Gateway {
 
     /// Models this gateway can route, or empty when the config names none.
     fn model_list(&self) -> Vec<models::Entry> {
-        let mut entries = Vec::new();
-        for target in self.combos.values().flat_map(|combo| &combo.targets) {
-            let id = format!("{}/{}", target.provider, target.model);
-            if !entries.iter().any(|entry: &models::Entry| entry.id == id) {
+        let listed = self.models.iter().flat_map(|(provider, ids)| {
+            ids.iter()
+                .map(move |model| (provider.as_str(), model.as_str()))
+        });
+        let targets = self
+            .combos
+            .values()
+            .flat_map(|combo| &combo.targets)
+            .map(|t| (t.provider.as_str(), t.model.as_str()));
+        let mut entries: Vec<models::Entry> = Vec::new();
+        for (provider, model) in listed.chain(targets) {
+            let id = format!("{provider}/{model}");
+            if !entries.iter().any(|entry| entry.id == id) {
                 entries.push(models::Entry {
                     id,
-                    provider: target.provider.clone(),
+                    provider: provider.to_owned(),
                     context_window: 0,
                     max_output: 0,
                 });
