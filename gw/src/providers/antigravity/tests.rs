@@ -187,7 +187,7 @@ async fn egress_matches_the_envelope_shape() {
             "request"
         ]
     );
-    assert_eq!(seen.body["model"], "gemini-3.1-pro");
+    assert_eq!(seen.body["model"], "gemini-pro-agent");
     assert_eq!(seen.body["userAgent"], "antigravity");
     assert_eq!(seen.body["requestType"], "agent");
     assert_eq!(seen.body["project"], "proj-1");

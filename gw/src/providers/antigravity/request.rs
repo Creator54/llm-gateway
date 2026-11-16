@@ -70,7 +70,7 @@ pub fn build(
 
     Prepared {
         body: json!({
-            "model": model,
+            "model": wire_model(model, chat.get("reasoning_effort").and_then(Value::as_str)),
             "userAgent": "antigravity",
             "requestType": "agent",
             "project": project,
@@ -401,6 +401,28 @@ fn tool_config(chat: &Value, names: &ToolNames, claude: bool) -> Option<Value> {
     (!config.is_empty()).then(|| json!({ "functionCallingConfig": config }))
 }
 
+/// Picker ids that CCA only serves under tiered wire ids (mirrors opencodex's
+/// `ANTIGRAVITY_EFFORT_WIRE_MAP`; defaults are Google's recommended tiers).
+fn wire_model(model: &str, effort: Option<&str>) -> String {
+    let tier = match effort {
+        Some("low") => "low",
+        Some("medium") => "medium",
+        Some("high" | "xhigh" | "max") => "high",
+        _ => "",
+    };
+    match model {
+        "gemini-3.8-flash" => format!(
+            "gemini-3.8-flash-{}",
+            if tier.is_empty() { "medium" } else { tier }
+        ),
+        "gemini-3.1-pro" if tier == "low" => "gemini-3.1-pro-low".into(),
+        "gemini-3.1-pro" | "gemini-3.1-pro-high" | "gemini-3.1-pro-preview" => {
+            "gemini-pro-agent".into()
+        }
+        other => other.into(),
+    }
+}
+
 fn generation_config(chat: &Value, model: &str) -> Option<Value> {
     let mut config = Map::new();
     if let Some(tokens) = chat
@@ -463,4 +485,30 @@ fn is_pro(model: &str) -> bool {
         rest = &rest[pos + 3..];
     }
     false
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::wire_model;
+
+    #[test]
+    fn picker_ids_map_to_tiered_wire_ids() {
+        assert_eq!(
+            wire_model("gemini-3.8-flash", None),
+            "gemini-3.8-flash-medium"
+        );
+        assert_eq!(
+            wire_model("gemini-3.8-flash", Some("low")),
+            "gemini-3.8-flash-low"
+        );
+        assert_eq!(wire_model("gemini-3.1-pro", None), "gemini-pro-agent");
+        assert_eq!(
+            wire_model("gemini-3.1-pro", Some("low")),
+            "gemini-3.1-pro-low"
+        );
+        assert_eq!(
+            wire_model("claude-sonnet-4-6", Some("low")),
+            "claude-sonnet-4-6"
+        );
+    }
 }
