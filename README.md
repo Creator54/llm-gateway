@@ -51,7 +51,7 @@ gw disconnect codex
 |---|---|
 | `provider/model` | that provider |
 | `provider@account/model` | a named account |
-| `combo/<name>` | try each entry in order |
+| `combo/<name>` | a named chain of targets, see Combos below |
 | `auto[/profile]` | pick by profile |
 
 Failover happens before the first byte reaches the client. A quota or 429 cools
