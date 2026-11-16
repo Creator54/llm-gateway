@@ -441,15 +441,7 @@ impl Drop for InflightGuard<'_> {
 /// Headers and formatted rows for the `stats` table in [`crate::ui`].
 pub fn stats_table(rows: &[store::UsageSummary]) -> (Vec<&'static str>, Vec<Vec<String>>) {
     let headers = vec![
-        "provider",
-        "model",
-        "account",
-        "requests",
-        "errors",
-        "input",
-        "output",
-        "cache read",
-        "cache share",
+        "provider", "model", "account", "reqs", "errs", "in", "out", "cached", "hit",
     ];
     let body = rows
         .iter()
@@ -818,7 +810,7 @@ mod tests {
     fn stats_table_headers_and_rows() {
         let (headers, rows) = stats_table(&[summary()]);
         assert_eq!(headers.len(), 9);
-        assert_eq!(headers[8], "cache share");
+        assert_eq!(headers[8], "hit");
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row[0], "openai");

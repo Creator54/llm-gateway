@@ -431,7 +431,18 @@ fn stats(state_dir: &std::path::Path, since: &str, json: bool) -> anyhow::Result
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let store = gw::store::Store::open(state_dir)?;
-    let rows = store.usage_summary(now - seconds)?;
+    let mut rows = store.usage_summary(now - seconds)?;
+    // Usage is keyed by account id; show the name the user gave it.
+    let names: std::collections::HashMap<String, String> = gw::creds::Store::load(state_dir)?
+        .all()
+        .into_iter()
+        .filter_map(|e| e.label.map(|label| (e.id, label)))
+        .collect();
+    for row in &mut rows {
+        if let Some(label) = names.get(&row.account) {
+            row.account.clone_from(label);
+        }
+    }
 
     if json {
         // Hand-rolled so the shape stays stable and needs no derive.
