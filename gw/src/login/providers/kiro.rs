@@ -138,7 +138,48 @@ pub async fn login(http: &reqwest::Client, opts: &Options) -> Result<Credential>
         Duration::from_secs(5),
     )
     .await?;
-    Ok(Credential::OAuth(tokens(&grant)?))
+    let mut tokens = tokens(&grant)?;
+    // The profile ARN is shared by every login under one organisation, so it cannot tell
+    // accounts apart; the signed-in user can.
+    if let Some((user_id, email)) = identity(http, &tokens).await {
+        tokens.account = Some(user_id);
+        tokens.email = email;
+    }
+    Ok(Credential::OAuth(tokens))
+}
+
+/// The signed-in user's id and email from the usage endpoint, or `None` if it can't be read.
+async fn identity(http: &reqwest::Client, tokens: &Tokens) -> Option<(String, Option<String>)> {
+    let arn = tokens.extra.get("profile_arn")?.as_str()?;
+    let body = json!({"origin": "AI_EDITOR", "isEmailRequired": true, "profileArn": arn});
+    let reply = http
+        .post(format!("https://management.{REGION}.kiro.dev/"))
+        .query(&[
+            ("origin", "AI_EDITOR"),
+            ("isEmailRequired", "true"),
+            ("profileArn", arn),
+        ])
+        .bearer_auth(&tokens.access)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
+        .header("x-amzn-codewhisperer-optout", "true")
+        .body(body.to_string())
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let reply: Value = serde_json::from_str(&reply).ok()?;
+    let user = reply.get("userInfo")?;
+    let id = user.get("userId")?.as_str()?.to_owned();
+    let email = user
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::to_lowercase);
+    Some((id, email))
 }
 
 /// Refresh against the desktop endpoint; the region comes from the stored account.
