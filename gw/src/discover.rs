@@ -8,43 +8,87 @@ use crate::config::Config;
 use crate::creds::{self, Entry};
 use crate::providers::{anthropic, antigravity};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const FILE: &str = "models.json";
 
-/// Provider id → model ids, as saved by the last refresh.
-pub type Discovered = BTreeMap<String, Vec<String>>;
+/// Provider id → account name → model ids, as saved by the last refresh.
+pub type Accounts = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
 /// Models saved by the last refresh; empty when there is none or it is unreadable.
-pub fn load(state_dir: &Path) -> Discovered {
+pub fn load_accounts(state_dir: &Path) -> Accounts {
     std::fs::read(state_dir.join(FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-/// Query every supported provider with a usable account and save the result.
-/// A provider that fails keeps its previously saved list; the error is returned per provider.
+/// Provider id → every model any of its accounts can use.
+pub fn load(state_dir: &Path) -> BTreeMap<String, Vec<String>> {
+    load_accounts(state_dir)
+        .into_iter()
+        .map(|(provider, accounts)| {
+            let all: BTreeSet<String> = accounts.into_values().flatten().collect();
+            (provider, all.into_iter().collect())
+        })
+        .collect()
+}
+
+/// Query every account of every supported provider and save the result. An account that
+/// fails keeps its previously saved list. Each provider reports its model count, or the
+/// first account error when none succeeded.
 pub async fn refresh(cfg: &Config) -> anyhow::Result<Vec<(String, anyhow::Result<usize>)>> {
     let store = creds::Store::load(&cfg.state_dir)?;
     let client = reqwest::Client::new();
-    let mut saved = load(&cfg.state_dir);
+    let mut saved = load_accounts(&cfg.state_dir);
     let mut report = Vec::new();
     for provider in ["anthropic", "antigravity"] {
-        let result = discover(cfg, &store, &client, provider).await;
+        let accounts = store.accounts(provider);
+        let mut first_error = None;
+        let mut succeeded = false;
+        for entry in accounts
+            .into_iter()
+            .filter(|e| !e.paused && !e.needs_reauth)
+        {
+            let name = entry.label.clone().unwrap_or_else(|| entry.id.clone());
+            match discover(cfg, &store, &client, provider, entry).await {
+                Ok(ids) => {
+                    succeeded = true;
+                    saved
+                        .entry(provider.to_owned())
+                        .or_default()
+                        .insert(name, ids);
+                }
+                Err(e) => {
+                    first_error.get_or_insert_with(|| e.context(format!("account {name}")));
+                }
+            }
+        }
+        let count = load_union(&saved, provider);
         report.push((
             provider.to_owned(),
-            result.map(|ids| {
-                let count = ids.len();
-                saved.insert(provider.to_owned(), ids);
-                count
-            }),
+            match (succeeded, first_error) {
+                (false, Some(e)) => Err(e),
+                (false, None) => Err(anyhow::anyhow!(
+                    "no usable account; run `gw login {provider}`"
+                )),
+                _ => Ok(count),
+            },
         ));
     }
     std::fs::create_dir_all(&cfg.state_dir)?;
     std::fs::write(cfg.state_dir.join(FILE), serde_json::to_vec_pretty(&saved)?)?;
     Ok(report)
+}
+
+fn load_union(saved: &Accounts, provider: &str) -> usize {
+    saved
+        .get(provider)
+        .into_iter()
+        .flat_map(|accounts| accounts.values().flatten())
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 /// The account with its access token refreshed if it is due.
@@ -76,12 +120,8 @@ async fn discover(
     store: &creds::Store,
     client: &reqwest::Client,
     provider: &str,
+    entry: Entry,
 ) -> anyhow::Result<Vec<String>> {
-    let entry = store
-        .accounts(provider)
-        .into_iter()
-        .find(|e| !e.paused && !e.needs_reauth)
-        .ok_or_else(|| anyhow::anyhow!("no usable account; run `gw login {provider}`"))?;
     let entry = fresh(store, client, provider, entry).await?;
     let token = access_token(&entry)?;
     let base = cfg.endpoints.get(provider).map(|b| b.trim_end_matches('/'));
@@ -194,8 +234,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gw-discover-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load(&dir).is_empty());
-        std::fs::write(dir.join(FILE), r#"{"anthropic":["m"]}"#).unwrap();
-        assert_eq!(load(&dir)["anthropic"], ["m"]);
+        std::fs::write(dir.join(FILE), r#"{"anthropic":{"a":["m"],"b":["m","n"]}}"#).unwrap();
+        assert_eq!(load(&dir)["anthropic"], ["m", "n"]);
+        assert_eq!(load_accounts(&dir)["anthropic"]["a"], ["m"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -86,6 +86,9 @@ enum Cmd {
         /// Ask the providers for their live model lists first
         #[arg(long)]
         refresh: bool,
+        /// Show which account can use which model (discovered providers only)
+        #[arg(long, conflicts_with = "json")]
+        accounts: bool,
         /// Print JSON
         #[arg(long)]
         json: bool,
@@ -199,9 +202,16 @@ async fn run() -> anyhow::Result<()> {
             emails,
             json,
         } => status(&cfg, &since, refresh, emails, json).await,
-        Cmd::Models { refresh, json } => {
+        Cmd::Models {
+            refresh,
+            accounts,
+            json,
+        } => {
             if refresh {
                 refresh_models(&cfg).await?;
+            }
+            if accounts {
+                return account_models(&cfg);
             }
             models(&cfg, json).await
         }
@@ -351,6 +361,40 @@ async fn models(cfg: &gw::config::Config, json: bool) -> anyhow::Result<()> {
     for id in model_ids(cfg).await? {
         println!("{id}");
     }
+    Ok(())
+}
+
+/// Per-account model availability from the last discovery, one row per model.
+fn account_models(cfg: &gw::config::Config) -> anyhow::Result<()> {
+    let saved = gw::discover::load_accounts(&cfg.state_dir);
+    if saved.is_empty() {
+        anyhow::bail!("nothing discovered yet; run `gw models --refresh`");
+    }
+    let mut cells: Vec<Vec<String>> = Vec::new();
+    for (provider, accounts) in &saved {
+        let all: std::collections::BTreeSet<&String> = accounts.values().flatten().collect();
+        for model in all {
+            let who: Vec<&str> = accounts
+                .iter()
+                .filter(|(_, ids)| ids.contains(model))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let who = if who.len() == accounts.len() {
+                "all".to_owned()
+            } else {
+                who.join(", ")
+            };
+            cells.push(vec![provider.clone(), model.clone(), who]);
+        }
+    }
+    let ui = gw::ui::Ui::from_env();
+    println!(
+        "{}",
+        ui.render_table(
+            &["provider", "model", "accounts"],
+            &views(&cells).iter().map(Vec::as_slice).collect::<Vec<_>>()
+        )
+    );
     Ok(())
 }
 
