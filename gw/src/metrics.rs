@@ -439,9 +439,12 @@ impl Drop for InflightGuard<'_> {
 }
 
 /// Headers and formatted rows for the `stats` table in [`crate::ui`].
-pub fn stats_table(rows: &[store::UsageSummary]) -> (Vec<&'static str>, Vec<Vec<String>>) {
+pub fn stats_table(
+    rows: &[store::UsageSummary],
+    prices: &crate::pricing::Prices,
+) -> (Vec<&'static str>, Vec<Vec<String>>) {
     let headers = vec![
-        "provider", "model", "account", "reqs", "errs", "in", "out", "cached", "hit",
+        "provider", "model", "account", "reqs", "errs", "in", "out", "cached", "hit", "~cost",
     ];
     let body = rows
         .iter()
@@ -456,6 +459,7 @@ pub fn stats_table(rows: &[store::UsageSummary]) -> (Vec<&'static str>, Vec<Vec<
                 human(r.output),
                 human(r.cached_read),
                 format!("{:.0}%", r.cache_read_share * 100.0),
+                crate::pricing::dollars(prices.cost(r)),
             ]
         })
         .collect();
@@ -808,8 +812,8 @@ mod tests {
 
     #[test]
     fn stats_table_headers_and_rows() {
-        let (headers, rows) = stats_table(&[summary()]);
-        assert_eq!(headers.len(), 9);
+        let (headers, rows) = stats_table(&[summary()], &crate::pricing::Prices::default());
+        assert_eq!(headers.len(), 10);
         assert_eq!(headers[8], "hit");
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -819,12 +823,13 @@ mod tests {
         assert_eq!(row[5], "34k");
         assert_eq!(row[7], "1.2k");
         assert_eq!(row[8], "25%");
+        assert_eq!(row[9], "-");
     }
 
     #[test]
     fn stats_table_is_empty_without_rows() {
-        let (headers, rows) = stats_table(&[]);
-        assert_eq!(headers.len(), 9);
+        let (headers, rows) = stats_table(&[], &crate::pricing::Prices::default());
+        assert_eq!(headers.len(), 10);
         assert!(rows.is_empty());
     }
 }

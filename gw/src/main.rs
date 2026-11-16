@@ -472,7 +472,8 @@ async fn stats(cfg: &gw::config::Config, since: &str, json: bool) -> anyhow::Res
         println!("no usage in the last {since}");
         return quota(cfg).await;
     }
-    let (headers, cells) = gw::metrics::stats_table(&rows);
+    let (headers, cells) =
+        gw::metrics::stats_table(&rows, &gw::pricing::Prices::load(&cfg.state_dir).await);
     let borrowed: Vec<Vec<&str>> = cells
         .iter()
         .map(|row| row.iter().map(String::as_str).collect())

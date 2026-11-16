@@ -9,6 +9,7 @@ pub mod login;
 pub mod metrics;
 pub mod models;
 pub mod pool;
+pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod quota;
