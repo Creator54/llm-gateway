@@ -488,6 +488,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

@@ -149,6 +149,12 @@ enum AccountCmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Die quietly when stdout closes early (`gw status | head`) instead of panicking in println!.
+    // SAFETY: restoring the default disposition of a signal is async-signal-safe and runs
+    // before any thread starts.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Two workers are enough for a proxy and keep per-thread memory low. Override with GW_THREADS.
     let threads = std::env::var("GW_THREADS")
         .ok()
@@ -547,7 +553,7 @@ async fn status(
             )
         );
     }
-    combos(cfg, state_dir, &ui);
+    combos(cfg, state_dir, &ui).await;
     if !windows.is_empty() {
         let now = gw::login::now_secs();
         let cells: Vec<Vec<String>> = windows
@@ -590,7 +596,7 @@ async fn status(
 }
 
 /// Combos as a table, one row per target in the order they are tried.
-fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
+async fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
     if cfg.combos.is_empty() {
         return;
     }
@@ -598,6 +604,16 @@ fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
     let mut cells: Vec<Vec<String>> = Vec::new();
     for (name, combo) in &cfg.combos {
         let mut targets: Vec<_> = combo.targets.iter().collect();
+        if combo.strategy == gw::combo::Strategy::QuotaAware {
+            let windows = gw::quota::load(cfg, false)
+                .await
+                .map(|r| r.0)
+                .unwrap_or_default();
+            let room = |t: &gw::combo::Target| {
+                gw::quota::headroom(&windows, &t.provider, &t.model).unwrap_or(-1.0)
+            };
+            targets.sort_by(|a, b| room(b).total_cmp(&room(a)));
+        }
         if combo.strategy == gw::combo::Strategy::Cheapest {
             targets.sort_by(|a, b| prices.rank(&a.model).total_cmp(&prices.rank(&b.model)));
         }

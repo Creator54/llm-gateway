@@ -89,6 +89,30 @@ pub async fn load(cfg: &Config, force: bool) -> anyhow::Result<(Vec<Window>, Vec
     Ok((cache.windows, failures))
 }
 
+/// Percent of quota the provider's best account still has for `model`, or `None` when no
+/// figures are known. Antigravity quota is per model family; elsewhere the most used window
+/// limits the account.
+pub fn headroom(windows: &[Window], provider: &str, model: &str) -> Option<f64> {
+    let family = (provider == "antigravity").then(|| {
+        if model.contains("claude") {
+            "claude"
+        } else {
+            "gemini"
+        }
+    });
+    let mut best: std::collections::HashMap<&str, f64> = Default::default();
+    for w in windows.iter().filter(|w| w.provider == provider) {
+        if family.is_some_and(|f| w.name != f) {
+            continue;
+        }
+        let worst = best.entry(&w.account).or_insert(0.0);
+        *worst = worst.max(w.used_percent);
+    }
+    best.values()
+        .map(|used| 100.0 - used)
+        .max_by(f64::total_cmp)
+}
+
 const PROVIDERS: [&str; 5] = ["anthropic", "openai", "antigravity", "command-code", "kiro"];
 
 /// Quota windows for every account that has a quota endpoint. An account whose probe
@@ -428,5 +452,42 @@ mod tests {
         assert_eq!(duration(42), "42s");
         assert_eq!(duration(7_500), "2h 5m");
         assert_eq!(duration(300_000), "3d 11h");
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::*;
+
+    fn w(provider: &str, account: &str, name: &str, used: f64) -> Window {
+        Window {
+            provider: provider.into(),
+            account: account.into(),
+            name: name.into(),
+            used_percent: used,
+            resets_at: None,
+        }
+    }
+
+    #[test]
+    fn best_account_wins_and_worst_window_limits_it() {
+        let windows = [
+            w("anthropic", "a", "5h", 10.0),
+            w("anthropic", "a", "week", 80.0),
+            w("anthropic", "b", "5h", 30.0),
+            w("anthropic", "b", "week", 40.0),
+        ];
+        assert_eq!(headroom(&windows, "anthropic", "m"), Some(60.0));
+        assert_eq!(headroom(&windows, "openai", "m"), None);
+    }
+
+    #[test]
+    fn antigravity_uses_the_model_family() {
+        let windows = [
+            w("antigravity", "a", "claude", 100.0),
+            w("antigravity", "a", "gemini", 0.0),
+        ];
+        assert_eq!(headroom(&windows, "antigravity", "claude-opus"), Some(0.0));
+        assert_eq!(headroom(&windows, "antigravity", "gemini-3"), Some(100.0));
     }
 }

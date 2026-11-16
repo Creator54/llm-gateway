@@ -68,6 +68,22 @@ pub async fn serve(listener: tokio::net::TcpListener, cfg: Config) -> anyhow::Re
     // Refresh the price feed before the gateway reads it for `cheapest` combos.
     pricing::Prices::load(&cfg.state_dir).await;
     let state = Arc::new(Gateway::new(&cfg)?);
+    if cfg
+        .combos
+        .values()
+        .any(|c| c.strategy == combo::Strategy::QuotaAware)
+    {
+        let (quota, cfg) = (Arc::clone(&state.quota), cfg.clone());
+        tokio::spawn(async move {
+            loop {
+                match crate::quota::load(&cfg, false).await {
+                    Ok((windows, _)) => *quota.lock().unwrap() = windows,
+                    Err(e) => tracing::warn!(error = %e, "quota refresh failed"),
+                }
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
+    }
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_endpoint))
@@ -154,6 +170,8 @@ struct Gateway {
     combos: BTreeMap<String, combo::Combo>,
     models: BTreeMap<String, Vec<String>>,
     prices: pricing::Prices,
+    /// Latest quota windows, refreshed in the background; read by `quota_aware` combos.
+    quota: Arc<Mutex<Vec<crate::quota::Window>>>,
     /// Provider a bare model id routes to; `None` leaves it to the fallback.
     default_provider: Option<String>,
     /// Prefix hash and cache read of the last reply, for the cache-break detector.
@@ -228,6 +246,7 @@ impl Gateway {
             pool: Mutex::new(pool::Pool::new()),
             models: cfg.models.clone(),
             prices: pricing::Prices::cached(&cfg.state_dir),
+            quota: Arc::new(Mutex::new(Vec::new())),
             combos: cfg
                 .combos
                 .iter()
@@ -738,6 +757,13 @@ impl Gateway {
                         .rank(&a.model)
                         .total_cmp(&self.prices.rank(&b.model))
                 });
+            }
+            if combo.strategy == combo::Strategy::QuotaAware {
+                let windows = self.quota.lock().unwrap();
+                let room = |t: &combo::Target| {
+                    crate::quota::headroom(&windows, &t.provider, &t.model).unwrap_or(-1.0)
+                };
+                targets.sort_by(|a, b| room(b).total_cmp(&room(a)));
             }
             if targets.is_empty() {
                 return None;

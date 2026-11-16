@@ -14,6 +14,9 @@ pub enum Strategy {
     RoundRobin,
     /// Failover over the targets sorted by list price, cheapest first, unpriced models last.
     Cheapest,
+    /// Failover over the targets sorted by remaining subscription quota, most first; targets
+    /// without quota figures last.
+    QuotaAware,
 }
 
 /// One provider model a combo can use.
@@ -46,6 +49,7 @@ impl Strategy {
             Self::Failover => "failover",
             Self::RoundRobin => "round_robin",
             Self::Cheapest => "cheapest",
+            Self::QuotaAware => "quota_aware",
         }
     }
 }
@@ -86,7 +90,9 @@ impl Combo {
             .session_target(session, &self.name)
             .filter(|(index, _)| *index < count);
         match (kept, self.strategy) {
-            (Some((index, _)), Strategy::Failover | Strategy::Cheapest) => index,
+            (Some((index, _)), Strategy::Failover | Strategy::Cheapest | Strategy::QuotaAware) => {
+                index
+            }
             (Some((index, reuses)), Strategy::RoundRobin) => {
                 if reuses >= self.sticky_limit.max(1) {
                     (index + 1) % count
@@ -94,7 +100,7 @@ impl Combo {
                     index
                 }
             }
-            (None, Strategy::Failover | Strategy::Cheapest) => 0,
+            (None, Strategy::Failover | Strategy::Cheapest | Strategy::QuotaAware) => 0,
             (None, Strategy::RoundRobin) => weighted_start(&self.targets, pool.next_rotation()),
         }
     }
