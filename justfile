@@ -51,9 +51,14 @@ copy-token kind container:
     unset token
     echo 'Token copied. Clear your clipboard after use.'
 
-# Fetch both gateway branches and build images.
+# Build the gw release binary.
 build:
-    nix build .#gw --no-link
+    cd gw && nix shell nixpkgs#cargo nixpkgs#rustc -c cargo build --release
+
+# Build, then link gw into ~/.local/bin.
+install: build
+    install -d ~/.local/bin
+    ln -sf "{{justfile_directory()}}/gw/target/release/gw" ~/.local/bin/gw
 
 # Test with a fake provider, never existing credentials.
 test:
