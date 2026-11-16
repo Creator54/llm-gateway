@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use super::{providers, Flow, Options};
 use crate::{creds, ui};
 
-/// Providers the login flows know; aliases fold through `providers::canonical`.
+/// Providers the login flows know.
 pub const PROVIDERS: &[&str] = &[
     "anthropic",
     "openai",
@@ -36,7 +36,7 @@ pub struct Import {
 
 /// Run a login flow and store the account it yields.
 pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
-    let provider = crate::providers::canonical(&args.provider.to_ascii_lowercase()).to_owned();
+    let provider = args.provider;
     if !PROVIDERS.contains(&provider.as_str()) {
         anyhow::bail!(
             "unknown provider {provider}; expected one of: {}",

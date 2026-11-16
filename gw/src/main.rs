@@ -13,7 +13,8 @@ Examples:
   gw connect pi                 point pi at the gateway
   gw login anthropic            log in and store the account
   gw account list               show stored accounts
-  gw status                     show accounts and routes";
+  gw status                     show agents, accounts and usage
+  gw models                     list models the running gateway serves";
 
 #[derive(Parser)]
 #[command(
@@ -55,8 +56,14 @@ enum Cmd {
         /// One of: pi, opencode, claude, codex
         agent: String,
     },
-    /// Show which agents are connected
+    /// Show connected agents, stored accounts and recent usage
     Status,
+    /// List the models the running gateway serves
+    Models {
+        /// Print the raw JSON list
+        #[arg(long)]
+        json: bool,
+    },
     /// Show usage from the local database
     Stats {
         /// Window to summarise, e.g. 24h, 7d, 30m
@@ -68,7 +75,7 @@ enum Cmd {
     },
     /// Log in to a provider and store the account
     Login {
-        /// One of: anthropic, openai, antigravity, kiro, command-code, opencode (aliases: claude, chatgpt, codex, google-antigravity, opencode-zen)
+        /// One of: anthropic, openai, antigravity, kiro, command-code, opencode
         provider: String,
         /// Force the device-code flow (openai only)
         #[arg(long)]
@@ -112,7 +119,9 @@ enum AccountCmd {
     },
     /// Remove one stored account
     Remove {
+        /// Provider name, as shown by `gw account list`
         provider: String,
+        /// Account id, as shown by `gw account list`
         id: String,
         /// Machine-readable output and no confirmation prompt
         #[arg(long)]
@@ -169,9 +178,11 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Status => {
             report(gw::connect::status(&gw::connect::home()?, &cfg.state_dir)?);
+            report(accounts(&cfg.state_dir)?);
             report(gw::connect::usage(&cfg.state_dir)?);
             Ok(())
         }
+        Cmd::Models { json } => models(&cfg, json).await,
         Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
         Cmd::Login {
             provider,
@@ -208,6 +219,62 @@ async fn run() -> anyhow::Result<()> {
             }
         },
     }
+}
+
+/// One line per provider: how many accounts, and how many need a new login.
+fn accounts(state_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let all = gw::creds::Store::load(state_dir)?.all();
+    if all.is_empty() {
+        return Ok(vec!["no accounts; run `gw login <provider>`".into()]);
+    }
+    let mut by: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    for e in &all {
+        let n = by.entry(&e.provider).or_default();
+        n.0 += 1;
+        n.1 += usize::from(e.needs_reauth);
+    }
+    Ok(by
+        .into_iter()
+        .map(|(p, (n, bad))| match bad {
+            0 => format!("{p}: {n} account(s)"),
+            _ => format!("{p}: {n} account(s), {bad} need login"),
+        })
+        .collect())
+}
+
+/// `gw models`: ask the running gateway what it serves.
+async fn models(cfg: &gw::config::Config, json: bool) -> anyhow::Result<()> {
+    let mut req =
+        reqwest::Client::new().get(format!("{}/models", gw::connect::default_url(cfg.listen)));
+    if let Some(key) = read_key(cfg.api_key_file.as_deref())? {
+        req = req.bearer_auth(key);
+    }
+    let bytes = req
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "gateway not reachable at {}: {e}; is `gw serve` running?",
+                cfg.listen
+            )
+        })?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    if json {
+        println!("{}", String::from_utf8_lossy(&bytes));
+        return Ok(());
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    for id in body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str())
+    {
+        println!("{id}");
+    }
+    Ok(())
 }
 
 fn report(lines: Vec<String>) {

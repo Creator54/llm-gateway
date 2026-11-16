@@ -51,13 +51,7 @@ fn login_help_lists_providers() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = stdout(&out);
-    for provider in [
-        "anthropic",
-        "openai",
-        "google-antigravity",
-        "kiro",
-        "command-code",
-    ] {
+    for provider in ["anthropic", "openai", "antigravity", "kiro", "command-code"] {
         assert!(
             text.contains(provider),
             "help is missing {provider}: {text}"
