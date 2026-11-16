@@ -202,7 +202,7 @@ async fn run() -> anyhow::Result<()> {
             models(&cfg, json).await
         }
         Cmd::Setup { yes, dry_run } => setup(cfg, yes, dry_run).await,
-        Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
+        Cmd::Stats { since, json } => stats(&cfg, &since, json).await,
         Cmd::Login {
             provider,
             label,
@@ -424,7 +424,8 @@ fn report(lines: Vec<String>) {
 }
 
 /// `gw stats`: summarise the local usage database.
-fn stats(state_dir: &std::path::Path, since: &str, json: bool) -> anyhow::Result<()> {
+async fn stats(cfg: &gw::config::Config, since: &str, json: bool) -> anyhow::Result<()> {
+    let state_dir = &cfg.state_dir;
     let seconds = parse_window(since)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -469,7 +470,7 @@ fn stats(state_dir: &std::path::Path, since: &str, json: bool) -> anyhow::Result
 
     if rows.is_empty() {
         println!("no usage in the last {since}");
-        return Ok(());
+        return quota(cfg).await;
     }
     let (headers, cells) = gw::metrics::stats_table(&rows);
     let borrowed: Vec<Vec<&str>> = cells
@@ -478,6 +479,36 @@ fn stats(state_dir: &std::path::Path, since: &str, json: bool) -> anyhow::Result
         .collect();
     let view: Vec<&[&str]> = borrowed.iter().map(Vec::as_slice).collect();
     println!("{}", gw::ui::Ui::from_env().render_table(&headers, &view));
+    quota(cfg).await
+}
+
+/// Print each account's remaining subscription quota, as the providers report it.
+async fn quota(cfg: &gw::config::Config) -> anyhow::Result<()> {
+    let (windows, errors) = gw::quota::fetch(cfg).await?;
+    if !windows.is_empty() {
+        let cells: Vec<Vec<String>> = windows
+            .iter()
+            .map(|w| {
+                vec![
+                    w.provider.clone(),
+                    w.account.clone(),
+                    w.name.clone(),
+                    format!("{:.0}%", w.used_percent),
+                    w.resets_in.map_or_else(String::new, gw::quota::duration),
+                ]
+            })
+            .collect();
+        let borrowed: Vec<Vec<&str>> = cells
+            .iter()
+            .map(|row| row.iter().map(String::as_str).collect())
+            .collect();
+        let view: Vec<&[&str]> = borrowed.iter().map(Vec::as_slice).collect();
+        let headers = ["provider", "account", "window", "used", "resets in"];
+        println!("\n{}", gw::ui::Ui::from_env().render_table(&headers, &view));
+    }
+    for error in errors {
+        gw::ui::warn(&format!("quota: {error}"));
+    }
     Ok(())
 }
 

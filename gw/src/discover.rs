@@ -47,17 +47,13 @@ pub async fn refresh(cfg: &Config) -> anyhow::Result<Vec<(String, anyhow::Result
     Ok(report)
 }
 
-async fn discover(
-    cfg: &Config,
+/// The account with its access token refreshed if it is due.
+pub(crate) async fn fresh(
     store: &creds::Store,
     client: &reqwest::Client,
     provider: &str,
-) -> anyhow::Result<Vec<String>> {
-    let entry = store
-        .accounts(provider)
-        .into_iter()
-        .find(|e| !e.paused && !e.needs_reauth)
-        .ok_or_else(|| anyhow::anyhow!("no usable account; run `gw login {provider}`"))?;
+    entry: Entry,
+) -> anyhow::Result<Entry> {
     let refresher = crate::login::refresh::TokenRefresher {
         provider: provider.to_owned(),
         http: client.clone(),
@@ -72,7 +68,21 @@ async fn discover(
             creds::DEFAULT_SKEW_SECS,
         )
         .await?;
-    let entry = store.get(provider, &entry.id).unwrap_or(entry);
+    Ok(store.get(provider, &entry.id).unwrap_or(entry))
+}
+
+async fn discover(
+    cfg: &Config,
+    store: &creds::Store,
+    client: &reqwest::Client,
+    provider: &str,
+) -> anyhow::Result<Vec<String>> {
+    let entry = store
+        .accounts(provider)
+        .into_iter()
+        .find(|e| !e.paused && !e.needs_reauth)
+        .ok_or_else(|| anyhow::anyhow!("no usable account; run `gw login {provider}`"))?;
+    let entry = fresh(store, client, provider, entry).await?;
     let token = access_token(&entry)?;
     let base = cfg.endpoints.get(provider).map(|b| b.trim_end_matches('/'));
     let body = match provider {
@@ -97,7 +107,7 @@ async fn discover(
     Ok(ids)
 }
 
-fn access_token(entry: &Entry) -> anyhow::Result<String> {
+pub(crate) fn access_token(entry: &Entry) -> anyhow::Result<String> {
     match crate::provider::Account::from(entry).credential {
         crate::provider::Credential::OAuth { access, .. } => Ok(access),
         crate::provider::Credential::ApiKey(key) => Ok(key),
@@ -105,7 +115,7 @@ fn access_token(entry: &Entry) -> anyhow::Result<String> {
     }
 }
 
-fn account_extra(entry: &Entry, key: &str) -> anyhow::Result<String> {
+pub(crate) fn account_extra(entry: &Entry, key: &str) -> anyhow::Result<String> {
     crate::provider::Account::from(entry)
         .extra
         .get(key)
