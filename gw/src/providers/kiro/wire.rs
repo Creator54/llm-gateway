@@ -27,7 +27,7 @@ impl WireClient {
 }
 
 /// `api_region` → region from the profile ARN → `sso_region` → `us-east-1`.
-pub(super) fn region(extra: &BTreeMap<String, String>) -> String {
+pub(crate) fn region(extra: &BTreeMap<String, String>) -> String {
     normalize_region(extra.get("api_region").map(String::as_str))
         .or_else(|| {
             extra

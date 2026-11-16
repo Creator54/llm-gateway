@@ -7,6 +7,8 @@ mod response;
 mod tools;
 mod wire;
 
+pub(crate) use wire::region;
+
 #[cfg(test)]
 mod tests;
 

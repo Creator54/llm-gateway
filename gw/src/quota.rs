@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::creds::{self, Entry};
 use crate::discover::{access_token, account_extra, fresh};
-use crate::providers::{anthropic, antigravity};
+use crate::providers::{anthropic, antigravity, command_code, kiro};
 use serde_json::{json, Value};
 
 /// One usage window of one account.
@@ -26,7 +26,7 @@ pub async fn fetch(cfg: &Config) -> anyhow::Result<(Vec<Window>, Vec<String>)> {
     let store = creds::Store::load(&cfg.state_dir)?;
     let client = reqwest::Client::new();
     let (mut windows, mut errors) = (Vec::new(), Vec::new());
-    for provider in ["anthropic", "openai", "antigravity"] {
+    for provider in ["anthropic", "openai", "antigravity", "command-code", "kiro"] {
         for entry in store.accounts(provider) {
             let name = entry.label.clone().unwrap_or_else(|| entry.id.clone());
             match probe(&store, &client, provider, entry).await {
@@ -58,6 +58,7 @@ async fn probe(
     let entry = fresh(store, client, provider, entry).await?;
     let token = access_token(&entry)?;
     let now = crate::login::now_secs();
+    let extra = crate::provider::Account::from(&entry).extra;
     let request = match provider {
         "anthropic" => client
             .get("https://api.anthropic.com/api/oauth/usage")
@@ -65,6 +66,37 @@ async fn probe(
         "openai" => client
             .get("https://chatgpt.com/backend-api/wham/usage")
             .header("chatgpt-account-id", account_extra(&entry, "account_id")?),
+        "command-code" => client
+            .get(format!(
+                "{}/alpha/billing/credits",
+                command_code::DEFAULT_BASE_URL
+            ))
+            .header("user-agent", "cli")
+            .header(
+                "x-command-code-version",
+                extra
+                    .get("command_code_version")
+                    .map_or(command_code::DEFAULT_VERSION, String::as_str),
+            )
+            .header("x-cli-environment", "production"),
+        "kiro" => {
+            let arn = account_extra(&entry, "profile_arn")?;
+            let host = format!("https://management.{}.kiro.dev/", kiro::region(&extra));
+            client
+                .post(host)
+                .query(&[
+                    ("origin", "AI_EDITOR"),
+                    ("isEmailRequired", "true"),
+                    ("profileArn", arn.as_str()),
+                ])
+                .header("content-type", "application/x-amz-json-1.0")
+                .header("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
+                .header("x-amzn-codewhisperer-optout", "true")
+                .body(
+                    json!({ "origin": "AI_EDITOR", "isEmailRequired": true, "profileArn": arn })
+                        .to_string(),
+                )
+        }
         _ => client
             .post(format!(
                 "{}/v1internal:fetchAvailableModels",
@@ -81,6 +113,8 @@ async fn probe(
     Ok(match provider {
         "anthropic" => anthropic_windows(&body, now),
         "openai" => openai_windows(&body),
+        "command-code" => command_code_windows(&body),
+        "kiro" => kiro_windows(&body),
         _ => antigravity_windows(&body, now),
     })
 }
@@ -150,6 +184,58 @@ fn antigravity_windows(body: &Value, now: u64) -> Found {
         .into_iter()
         .map(|(family, used, resets_in)| (family.to_owned(), used, resets_in))
         .collect()
+}
+
+/// Command Code reports `windowLimits.{fiveHour,weekly}` as `{used, cap, resetAt}`.
+fn command_code_windows(body: &Value) -> Found {
+    let body = if body["data"].is_object() {
+        &body["data"]
+    } else {
+        body
+    };
+    [("fiveHour", "5h"), ("weekly", "week")]
+        .iter()
+        .filter_map(|(key, name)| {
+            let window = &body["windowLimits"][key];
+            let (used, cap) = (window["used"].as_f64()?, window["cap"].as_f64()?);
+            let resets_in = window["resetAt"]
+                .as_str()
+                .or_else(|| window["resetTime"].as_str())
+                .and_then(parse_rfc3339)
+                .map(|at| at.saturating_sub(crate::login::now_secs()));
+            (cap > 0.0).then(|| ((*name).to_owned(), used / cap * 100.0, resets_in))
+        })
+        .collect()
+}
+
+/// Kiro reports one credit pool per resource type; the agentic pool wins, as in opencodex.
+fn kiro_windows(body: &Value) -> Found {
+    let rows = body["usageBreakdownList"].as_array().into_iter().flatten();
+    let pick = |wanted: &str| {
+        rows.clone().find(|r| {
+            r["resourceType"]
+                .as_str()
+                .is_some_and(|t| t.eq_ignore_ascii_case(wanted))
+        })
+    };
+    let Some(row) = pick("AGENTIC_REQUEST").or_else(|| pick("CREDIT")) else {
+        return Vec::new();
+    };
+    let number = |precise: &str, whole: &str| row[precise].as_f64().or_else(|| row[whole].as_f64());
+    let (Some(used), Some(limit)) = (
+        number("currentUsageWithPrecision", "currentUsage"),
+        number("usageLimitWithPrecision", "usageLimit"),
+    ) else {
+        return Vec::new();
+    };
+    // `nextDateReset` is epoch seconds (sometimes with a fraction).
+    let resets_in = body["nextDateReset"]
+        .as_f64()
+        .map(|at| (at as u64).saturating_sub(crate::login::now_secs()));
+    if limit <= 0.0 {
+        return Vec::new();
+    }
+    vec![("month".to_owned(), used / limit * 100.0, resets_in)]
 }
 
 fn window_name(seconds: u64) -> String {
@@ -246,6 +332,19 @@ mod tests {
         assert_eq!(got[0].0, "gemini");
         assert!((got[0].1 - 50.0).abs() < 1e-9);
         assert_eq!(got[1], ("claude".to_owned(), 100.0, None));
+    }
+
+    #[test]
+    fn command_code_and_kiro_windows() {
+        let cc = json!({ "data": { "windowLimits": {
+            "fiveHour": { "used": 1, "cap": 4 }, "weekly": { "used": 0, "cap": 0 } } } });
+        assert_eq!(command_code_windows(&cc), [("5h".to_owned(), 25.0, None)]);
+        let kiro = json!({ "nextDateReset": 4102444800.0, "usageBreakdownList": [
+            { "resourceType": "CREDIT", "currentUsage": 9, "usageLimit": 10 },
+            { "resourceType": "AGENTIC_REQUEST", "currentUsageWithPrecision": 5.0, "usageLimitWithPrecision": 20.0 }] });
+        let got = kiro_windows(&kiro);
+        assert_eq!((got[0].0.as_str(), got[0].1), ("month", 25.0));
+        assert!(kiro_windows(&json!({})).is_empty());
     }
 
     #[test]

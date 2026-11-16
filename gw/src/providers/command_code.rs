@@ -19,8 +19,8 @@ use crate::{
     },
 };
 
-const DEFAULT_BASE_URL: &str = "https://api.commandcode.ai";
-const DEFAULT_VERSION: &str = "0.52.1";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.commandcode.ai";
+pub(crate) const DEFAULT_VERSION: &str = "0.52.1";
 const DEFAULT_MAX_TOKENS: u64 = 64_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(200);
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
