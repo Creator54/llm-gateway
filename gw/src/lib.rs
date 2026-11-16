@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod combo;
+pub mod combo_edit;
 pub mod config;
 pub mod connect;
 pub mod creds;

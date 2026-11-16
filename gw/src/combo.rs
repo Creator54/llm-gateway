@@ -44,6 +44,17 @@ pub struct Combo {
 }
 
 impl Strategy {
+    pub const ALL: [Self; 4] = [
+        Self::Failover,
+        Self::RoundRobin,
+        Self::Cheapest,
+        Self::QuotaAware,
+    ];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name() == name)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Failover => "failover",

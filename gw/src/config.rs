@@ -93,12 +93,8 @@ pub struct Transforms {
 impl Config {
     /// Load from `path`, `$GW_CONFIG`, or `~/.config/gw/config.toml`. A missing default file means defaults.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
-        let explicit = path
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("GW_CONFIG").map(PathBuf::from));
-        let file = explicit
-            .clone()
-            .unwrap_or_else(|| home().join(".config/gw/config.toml"));
+        let explicit = Self::explicit_path(path);
+        let file = Self::path(path);
         match std::fs::read_to_string(&file) {
             Ok(text) => Ok(toml::from_str(&text)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => {
@@ -106,6 +102,16 @@ impl Config {
             }
             Err(e) => Err(anyhow::anyhow!("{}: {e}", file.display())),
         }
+    }
+
+    fn explicit_path(path: Option<&Path>) -> Option<PathBuf> {
+        path.map(PathBuf::from)
+            .or_else(|| std::env::var_os("GW_CONFIG").map(PathBuf::from))
+    }
+
+    /// The config file in use: `path`, `$GW_CONFIG`, or the default location.
+    pub fn path(path: Option<&Path>) -> PathBuf {
+        Self::explicit_path(path).unwrap_or_else(|| home().join(".config/gw/config.toml"))
     }
 
     /// Cache edits in force for this profile.

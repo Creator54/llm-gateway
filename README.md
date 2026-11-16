@@ -83,3 +83,18 @@ bench/mem.sh        # RAM under streaming load
 
 Provider wire contracts are in `docs/provider-specs/`. The design and phase plan
 are in `docs/plan-rust-gateway.md`.
+
+## Combos
+
+A combo is a named list of `provider/model` targets that clients use as `combo/<name>`.
+Strategies: `failover` (listed order), `round_robin` (`*N` weights new sessions),
+`cheapest` (by list price) and `quota_aware` (most subscription quota left first).
+
+```
+gw combo set fast quota_aware antigravity/gemini-3.8-flash kiro/claude-haiku-4.5 openai/gpt-6-luna
+gw combo list
+gw combo rm fast
+```
+
+`set` creates the combo or replaces its targets, keeps the rest of `config.toml` as written, and
+refuses edits the gateway could not load. Restart `gw serve` to apply a change.

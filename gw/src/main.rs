@@ -35,6 +35,23 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ComboCmd {
+    /// Show every combo and the order its targets are tried
+    List,
+    /// Create a combo, or replace an existing one's strategy and targets
+    Set {
+        name: String,
+        #[arg(value_parser = PossibleValuesParser::new(gw::combo::Strategy::ALL.map(|s| s.name())))]
+        strategy: String,
+        /// Targets in the order to try, as provider/model (add *N to weight round_robin)
+        #[arg(required = true)]
+        targets: Vec<String>,
+    },
+    /// Delete a combo
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Run the gateway
     Serve,
@@ -81,6 +98,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show, create, change or delete combos (named fallback chains of provider models)
+    #[command(subcommand)]
+    Combo(ComboCmd),
     /// List the models the running gateway serves
     Models {
         /// Ask the providers for their live model lists first
@@ -208,6 +228,7 @@ async fn run() -> anyhow::Result<()> {
             emails,
             json,
         } => status(&cfg, &since, refresh, emails, json).await,
+        Cmd::Combo(cmd) => combo_cmd(&cfg, cli.config.as_deref(), cmd).await,
         Cmd::Models {
             refresh,
             accounts,
@@ -592,6 +613,57 @@ async fn status(
             f.provider, f.account, f.message
         ));
     }
+    Ok(())
+}
+
+/// `gw combo list|set|rm`. Edits apply when the gateway next starts.
+async fn combo_cmd(
+    cfg: &gw::config::Config,
+    config: Option<&Path>,
+    cmd: ComboCmd,
+) -> anyhow::Result<()> {
+    let path = gw::config::Config::path(config);
+    match cmd {
+        ComboCmd::List => {
+            if cfg.combos.is_empty() {
+                println!("no combos; create one with `gw combo set <name> <strategy> provider/model ...`");
+            } else {
+                combos(cfg, &cfg.state_dir, &gw::ui::Ui::from_env()).await;
+            }
+            return Ok(());
+        }
+        ComboCmd::Set {
+            name,
+            strategy,
+            targets,
+        } => {
+            let strategy = gw::combo::Strategy::parse(&strategy).expect("checked by clap");
+            let targets = targets
+                .iter()
+                .map(|t| gw::combo_edit::parse_target(t))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let known = model_ids(cfg).await.unwrap_or_default();
+            for t in &targets {
+                if !known.is_empty()
+                    && !known
+                        .iter()
+                        .any(|m| m == &format!("{}/{}", t.provider, t.model) || m == &t.model)
+                {
+                    eprintln!(
+                        "warning: `{}/{}` is not in `gw models`",
+                        t.provider, t.model
+                    );
+                }
+            }
+            gw::combo_edit::set(&path, &name, strategy, &targets)?;
+            println!("saved combo/{name}");
+        }
+        ComboCmd::Rm { name } => {
+            gw::combo_edit::remove(&path, &name)?;
+            println!("removed combo/{name}");
+        }
+    }
+    println!("restart `gw serve` to apply");
     Ok(())
 }
 
