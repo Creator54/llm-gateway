@@ -61,8 +61,10 @@ is tried.
 ## Metrics
 
 `GET /metrics` on the same port, behind the gateway key, Prometheus format.
-`gw stats [--since 24h] [--json]` reads the local database and works while the
-server is down.
+`gw status [--since 7d] [--refresh] [--json]` shows connected agents, accounts,
+usage with its equivalent list-price cost, and subscription quota. Usage comes from the
+local database, so it works while the server is down. Quota is cached for five minutes
+and refetched once a window resets; `--refresh` forces a fetch.
 
 ## Token efficiency
 

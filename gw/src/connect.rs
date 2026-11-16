@@ -216,60 +216,6 @@ pub fn status(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
     Ok(lines)
 }
 
-/// Short usage summary from the local journal; empty hands back a plain note.
-pub fn usage(state_dir: &Path) -> anyhow::Result<Vec<String>> {
-    const DAYS: u64 = 7;
-    const ROWS: usize = 12;
-    let store = crate::store::Store::open(state_dir)?;
-    let since = crate::store::now_secs() - (DAYS * 86_400) as i64;
-    let mut summary = store.usage_summary(since)?;
-    crate::store::label_accounts(&mut summary, state_dir)?;
-    if summary.is_empty() {
-        return Ok(vec![format!("no usage in the last {DAYS} days")]);
-    }
-    summary.sort_by_key(|row| std::cmp::Reverse(row.requests));
-    let requests = summary.iter().map(|s| s.requests).sum::<u64>().to_string();
-    let errors = summary.iter().map(|s| s.errors).sum::<u64>().to_string();
-    let window = format!("{DAYS} days");
-    let ui = crate::ui::Ui::from_env();
-    let mut out = ui.render_kv(&[
-        ("requests", &requests),
-        ("errors", &errors),
-        ("window", &window),
-    ]);
-    let rows: Vec<Vec<String>> = summary
-        .iter()
-        .take(ROWS)
-        .map(|s| {
-            vec![
-                s.provider.clone(),
-                s.model.clone(),
-                s.account.clone(),
-                s.requests.to_string(),
-                s.errors.to_string(),
-                format!("{:.0}%", s.cache_read_share * 100.0),
-                s.input.to_string(),
-                s.output.to_string(),
-            ]
-        })
-        .collect();
-    let cells: Vec<Vec<&str>> = rows
-        .iter()
-        .map(|row| row.iter().map(String::as_str).collect())
-        .collect();
-    let cells: Vec<&[&str]> = cells.iter().map(Vec::as_slice).collect();
-    out.push_str(&ui.render_table(
-        &[
-            "provider", "model", "account", "req", "err", "cached", "in", "out",
-        ],
-        &cells,
-    ));
-    if summary.len() > ROWS {
-        out.push_str(&format!("and {} more\n", summary.len() - ROWS));
-    }
-    Ok(vec![out.trim_end().to_owned()])
-}
-
 /// Client-side cache rewrites stay installed; gw does not touch them.
 fn client_cache_tools(home: &Path) -> Option<String> {
     let settings = fs::read_to_string(home.join(".pi/agent/settings.json")).unwrap_or_default();

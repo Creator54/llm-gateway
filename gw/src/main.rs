@@ -66,22 +66,23 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show connected agents, stored accounts and recent usage
-    Status,
+    /// Show connected agents, accounts, quota and recent usage
+    Status {
+        /// Window of usage to summarise, e.g. 24h, 7d, 30m
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Fetch quota from the providers instead of using the cache
+        #[arg(long)]
+        refresh: bool,
+        /// Print usage and quota as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List the models the running gateway serves
     Models {
         /// Ask the providers for their live model lists first
         #[arg(long)]
         refresh: bool,
-        /// Print JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show usage from the local database
-    Stats {
-        /// Window to summarise, e.g. 24h, 7d, 30m
-        #[arg(long, default_value = "24h")]
-        since: String,
         /// Print JSON
         #[arg(long)]
         json: bool,
@@ -189,12 +190,11 @@ async fn run() -> anyhow::Result<()> {
             )?);
             Ok(())
         }
-        Cmd::Status => {
-            report(gw::connect::status(&gw::connect::home()?, &cfg.state_dir)?);
-            report(accounts(&cfg.state_dir)?);
-            report(gw::connect::usage(&cfg.state_dir)?);
-            Ok(())
-        }
+        Cmd::Status {
+            since,
+            refresh,
+            json,
+        } => status(&cfg, &since, refresh, json).await,
         Cmd::Models { refresh, json } => {
             if refresh {
                 refresh_models(&cfg).await?;
@@ -202,7 +202,6 @@ async fn run() -> anyhow::Result<()> {
             models(&cfg, json).await
         }
         Cmd::Setup { yes, dry_run } => setup(cfg, yes, dry_run).await,
-        Cmd::Stats { since, json } => stats(&cfg, &since, json).await,
         Cmd::Login {
             provider,
             label,
@@ -423,21 +422,23 @@ fn report(lines: Vec<String>) {
     }
 }
 
-/// `gw stats`: summarise the local usage database.
-async fn stats(cfg: &gw::config::Config, since: &str, json: bool) -> anyhow::Result<()> {
+/// `gw status`: connected agents, accounts, local usage and subscription quota.
+async fn status(
+    cfg: &gw::config::Config,
+    since: &str,
+    refresh: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     let state_dir = &cfg.state_dir;
     let seconds = parse_window(since)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let store = gw::store::Store::open(state_dir)?;
-    let mut rows = store.usage_summary(now - seconds)?;
+    let mut rows = store.usage_summary(gw::store::now_secs() - seconds)?;
     gw::store::label_accounts(&mut rows, state_dir)?;
+    let (windows, failures) = gw::quota::load(cfg, refresh).await?;
 
     if json {
-        // Hand-rolled so the shape stays stable and needs no derive.
-        let objects: Vec<serde_json::Value> = rows
+        // Hand-rolled so the shape stays stable.
+        let usage: Vec<serde_json::Value> = rows
             .iter()
             .map(|row| {
                 serde_json::json!({
@@ -454,53 +455,86 @@ async fn stats(cfg: &gw::config::Config, since: &str, json: bool) -> anyhow::Res
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&objects)?);
+        let quota: Vec<serde_json::Value> = windows
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "provider": w.provider,
+                    "account": w.account,
+                    "window": w.name,
+                    "used_percent": w.used_percent,
+                    "resets_at": w.resets_at,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "usage": usage, "quota": quota });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
+    report(gw::connect::status(&gw::connect::home()?, state_dir)?);
+    report(accounts(state_dir)?);
+    let ui = gw::ui::Ui::from_env();
     if rows.is_empty() {
-        println!("no usage in the last {since}");
-        return quota(cfg).await;
+        println!("\nno usage in the last {since}");
+    } else {
+        rows.sort_by_key(|row| std::cmp::Reverse(row.requests));
+        let prices = gw::pricing::Prices::load(state_dir).await;
+        let (headers, cells) = gw::metrics::stats_table(&rows, &prices);
+        println!(
+            "\n{}",
+            ui.render_table(
+                &headers,
+                &views(&cells).iter().map(Vec::as_slice).collect::<Vec<_>>()
+            )
+        );
     }
-    let (headers, cells) =
-        gw::metrics::stats_table(&rows, &gw::pricing::Prices::load(&cfg.state_dir).await);
-    let borrowed: Vec<Vec<&str>> = cells
-        .iter()
-        .map(|row| row.iter().map(String::as_str).collect())
-        .collect();
-    let view: Vec<&[&str]> = borrowed.iter().map(Vec::as_slice).collect();
-    println!("{}", gw::ui::Ui::from_env().render_table(&headers, &view));
-    quota(cfg).await
-}
-
-/// Print each account's remaining subscription quota, as the providers report it.
-async fn quota(cfg: &gw::config::Config) -> anyhow::Result<()> {
-    let (windows, errors) = gw::quota::fetch(cfg).await?;
     if !windows.is_empty() {
+        let now = gw::login::now_secs();
         let cells: Vec<Vec<String>> = windows
             .iter()
             .map(|w| {
+                let stale = failures
+                    .iter()
+                    .any(|f| f.provider == w.provider && f.account == w.account);
                 vec![
                     w.provider.clone(),
                     w.account.clone(),
                     w.name.clone(),
-                    format!("{:.0}%", w.used_percent),
-                    w.resets_in.map_or_else(String::new, gw::quota::duration),
+                    format!(
+                        "{:.0}%{}",
+                        w.used_percent,
+                        if stale { " (stale)" } else { "" }
+                    ),
+                    w.resets_at.map_or_else(String::new, |at| {
+                        gw::quota::duration(at.saturating_sub(now))
+                    }),
                 ]
             })
             .collect();
-        let borrowed: Vec<Vec<&str>> = cells
-            .iter()
-            .map(|row| row.iter().map(String::as_str).collect())
-            .collect();
-        let view: Vec<&[&str]> = borrowed.iter().map(Vec::as_slice).collect();
         let headers = ["provider", "account", "window", "used", "resets in"];
-        println!("\n{}", gw::ui::Ui::from_env().render_table(&headers, &view));
+        println!(
+            "\n{}",
+            ui.render_table(
+                &headers,
+                &views(&cells).iter().map(Vec::as_slice).collect::<Vec<_>>()
+            )
+        );
     }
-    for error in errors {
-        gw::ui::warn(&format!("quota: {error}"));
+    for f in failures {
+        gw::ui::warn(&format!(
+            "quota: {} {}: {}",
+            f.provider, f.account, f.message
+        ));
     }
     Ok(())
+}
+
+fn views(cells: &[Vec<String>]) -> Vec<Vec<&str>> {
+    cells
+        .iter()
+        .map(|row| row.iter().map(String::as_str).collect())
+        .collect()
 }
 
 /// `24h`, `7d`, `90m`, `45s`, or a bare count of seconds.

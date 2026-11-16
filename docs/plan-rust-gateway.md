@@ -122,7 +122,7 @@ OAuth adapter for all agents).
 | `gw connect <agent>` / `disconnect` | journaled base URL + key in pi/codex/claude/opencode configs; pi: drop compat flags, `cacheWarming=off`, remove pi-cache-optimizer once parity is shown |
 | `gw uninstall [--purge]` | replay journal, stop unit; `--purge` removes credentials/state |
 | `gw doctor` | ports, credentials, expiry, upstream reachability, client config drift |
-| `gw stats` | tokens, cache-read share, spend per provider/account/session |
+| `gw status` | agents, accounts, quota, tokens, cache-read share and cost per provider/account |
 
 ## Phases
 

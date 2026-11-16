@@ -1,4 +1,4 @@
-//! Subscription quota per account, read live from the provider.
+//! Subscription quota per account, read from the provider and cached in `quota.json`.
 //!
 //! Anthropic and ChatGPT report usage windows (5-hour, weekly, …); Antigravity reports a
 //! remaining fraction per model family. Providers without such an endpoint are not listed.
@@ -7,26 +7,98 @@ use crate::config::Config;
 use crate::creds::{self, Entry};
 use crate::discover::{access_token, account_extra, fresh};
 use crate::providers::{anthropic, antigravity, command_code, kiro};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// One usage window of one account.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
     pub provider: String,
     pub account: String,
     pub name: String,
     pub used_percent: f64,
-    /// Seconds until the window resets, when the provider says.
-    pub resets_in: Option<u64>,
+    /// Unix time at which the window resets, when the provider says.
+    pub resets_at: Option<u64>,
 }
+
+/// Cached figures older than this are fetched again.
+const MAX_AGE_SECS: u64 = 300;
+const FILE: &str = "quota.json";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Cache {
+    fetched_at: u64,
+    windows: Vec<Window>,
+}
+
+/// A failed probe: which account, and why.
+pub struct Failure {
+    pub provider: String,
+    pub account: String,
+    pub message: String,
+}
+
+/// Quota for every account: the cache while it is fresh, otherwise a new fetch.
+///
+/// The cache is stale after five minutes, once any window's reset time has passed, or when
+/// `force` is set. An account whose probe fails keeps its cached windows, and the failure is
+/// returned so the caller can say the figures are old.
+pub async fn load(cfg: &Config, force: bool) -> anyhow::Result<(Vec<Window>, Vec<Failure>)> {
+    let path = cfg.state_dir.join(FILE);
+    let cached: Cache = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let now = crate::login::now_secs();
+    let expired = cached
+        .windows
+        .iter()
+        .any(|w| w.resets_at.is_some_and(|at| at <= now));
+    let known = |store: &creds::Store| {
+        PROVIDERS.iter().all(|p| {
+            store.accounts(p).iter().all(|e| {
+                let name = e.label.as_deref().unwrap_or(&e.id);
+                cached
+                    .windows
+                    .iter()
+                    .any(|w| w.provider == *p && w.account == name)
+            })
+        })
+    };
+    let store = creds::Store::load(&cfg.state_dir)?;
+    if !force && !expired && now.saturating_sub(cached.fetched_at) < MAX_AGE_SECS && known(&store) {
+        return Ok((cached.windows, Vec::new()));
+    }
+    let (mut windows, failures) = fetch(cfg).await?;
+    for old in &cached.windows {
+        let failed = failures
+            .iter()
+            .any(|f| f.provider == old.provider && f.account == old.account);
+        if failed {
+            windows.push(old.clone());
+        }
+    }
+    let cache = Cache {
+        fetched_at: now,
+        windows,
+    };
+    // Best effort: an unwritable state dir only costs a refetch next time.
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let _ = std::fs::write(&path, bytes);
+    }
+    Ok((cache.windows, failures))
+}
+
+const PROVIDERS: [&str; 5] = ["anthropic", "openai", "antigravity", "command-code", "kiro"];
 
 /// Quota windows for every account that has a quota endpoint. An account whose probe
 /// fails is reported in the second list instead of aborting the others.
-pub async fn fetch(cfg: &Config) -> anyhow::Result<(Vec<Window>, Vec<String>)> {
+async fn fetch(cfg: &Config) -> anyhow::Result<(Vec<Window>, Vec<Failure>)> {
     let store = creds::Store::load(&cfg.state_dir)?;
     let client = reqwest::Client::new();
-    let (mut windows, mut errors) = (Vec::new(), Vec::new());
-    for provider in ["anthropic", "openai", "antigravity", "command-code", "kiro"] {
+    let now = crate::login::now_secs();
+    let (mut windows, mut failures) = (Vec::new(), Vec::new());
+    for provider in PROVIDERS {
         for entry in store.accounts(provider) {
             let name = entry.label.clone().unwrap_or_else(|| entry.id.clone());
             match probe(&store, &client, provider, entry).await {
@@ -36,14 +108,18 @@ pub async fn fetch(cfg: &Config) -> anyhow::Result<(Vec<Window>, Vec<String>)> {
                         account: name.clone(),
                         name: window,
                         used_percent: used,
-                        resets_in,
+                        resets_at: resets_in.map(|secs| now + secs),
                     }))
                 }
-                Err(e) => errors.push(format!("{provider} {name}: {e:#}")),
+                Err(e) => failures.push(Failure {
+                    provider: provider.to_owned(),
+                    account: name.clone(),
+                    message: format!("{e:#}"),
+                }),
             }
         }
     }
-    Ok((windows, errors))
+    Ok((windows, failures))
 }
 
 type Found = Vec<(String, f64, Option<u64>)>;
