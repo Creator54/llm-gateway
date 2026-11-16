@@ -89,6 +89,9 @@ enum Cmd {
     Login {
         /// One of: anthropic, openai, antigravity, kiro, command-code, opencode
         provider: String,
+        /// Account label, same as --label
+        #[arg(conflicts_with = "label")]
+        name: Option<String>,
         /// Force the device-code flow (openai only)
         #[arg(long)]
         device: bool,
@@ -205,6 +208,7 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
         Cmd::Login {
             provider,
+            name,
             device,
             no_browser,
             label,
@@ -214,7 +218,7 @@ async fn run() -> anyhow::Result<()> {
                 provider,
                 device,
                 no_browser,
-                label,
+                label: label.or(name),
                 json,
             };
             gw::login::cli::login(args, cfg.state_dir).await
