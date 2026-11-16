@@ -260,7 +260,7 @@ async fn fetch_models(cfg: &gw::config::Config) -> anyhow::Result<Vec<u8>> {
     if let Some(key) = read_key(cfg.api_key_file.as_deref())? {
         req = req.bearer_auth(key);
     }
-    let bytes = req
+    let response = req
         .send()
         .await
         .map_err(|e| {
@@ -269,10 +269,20 @@ async fn fetch_models(cfg: &gw::config::Config) -> anyhow::Result<Vec<u8>> {
                 cfg.listen
             )
         })?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    Ok(bytes.to_vec())
+        .error_for_status()?;
+    let serving = response
+        .headers()
+        .get("x-gw-state-dir")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if let Some(dir) = serving.filter(|dir| std::path::Path::new(dir) != cfg.state_dir) {
+        anyhow::bail!(
+            "the gateway on {} uses state dir {dir}, not {}; pass the same --config",
+            cfg.listen,
+            cfg.state_dir.display()
+        );
+    }
+    Ok(response.bytes().await?.to_vec())
 }
 
 async fn model_ids(cfg: &gw::config::Config) -> anyhow::Result<Vec<String>> {

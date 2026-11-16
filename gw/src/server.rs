@@ -462,6 +462,10 @@ async fn list_models(State(st): State<Arc<Gateway>>, req: Request) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    // Lets the CLI notice it is talking to a gateway with a different state dir.
+    if let Ok(dir) = HeaderValue::from_str(&st.state_dir.to_string_lossy()) {
+        response.headers_mut().insert("x-gw-state-dir", dir);
+    }
     response
 }
 
