@@ -12,6 +12,8 @@ pub enum Strategy {
     Failover,
     /// Weighted order whose starting point rotates for every new session.
     RoundRobin,
+    /// Failover over the targets sorted by list price, cheapest first, unpriced models last.
+    Cheapest,
 }
 
 /// One provider model a combo can use.
@@ -74,7 +76,7 @@ impl Combo {
             .session_target(session, &self.name)
             .filter(|(index, _)| *index < count);
         match (kept, self.strategy) {
-            (Some((index, _)), Strategy::Failover) => index,
+            (Some((index, _)), Strategy::Failover | Strategy::Cheapest) => index,
             (Some((index, reuses)), Strategy::RoundRobin) => {
                 if reuses >= self.sticky_limit.max(1) {
                     (index + 1) % count
@@ -82,7 +84,7 @@ impl Combo {
                     index
                 }
             }
-            (None, Strategy::Failover) => 0,
+            (None, Strategy::Failover | Strategy::Cheapest) => 0,
             (None, Strategy::RoundRobin) => weighted_start(&self.targets, pool.next_rotation()),
         }
     }

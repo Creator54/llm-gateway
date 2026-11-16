@@ -25,7 +25,7 @@ use crate::{
     config::Config,
     creds,
     journal::Journal,
-    metrics, models, pool, provider, providers, route,
+    metrics, models, pool, pricing, provider, providers, route,
     store::Store,
     tidy, tokens,
     translate::{self, SseParser},
@@ -65,6 +65,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 /// Serve on an already bound listener until SIGINT or SIGTERM.
 pub async fn serve(listener: tokio::net::TcpListener, cfg: Config) -> anyhow::Result<()> {
     guard(&cfg)?;
+    // Refresh the price feed before the gateway reads it for `cheapest` combos.
+    pricing::Prices::load(&cfg.state_dir).await;
     let state = Arc::new(Gateway::new(&cfg)?);
     let app = Router::new()
         .route("/health", get(health))
@@ -151,6 +153,7 @@ struct Gateway {
     /// Combos from the config, so a route can expand to its targets.
     combos: BTreeMap<String, combo::Combo>,
     models: BTreeMap<String, Vec<String>>,
+    prices: pricing::Prices,
     /// Provider a bare model id routes to; `None` leaves it to the fallback.
     default_provider: Option<String>,
     /// Prefix hash and cache read of the last reply, for the cache-break detector.
@@ -224,6 +227,7 @@ impl Gateway {
             adapters,
             pool: Mutex::new(pool::Pool::new()),
             models: cfg.models.clone(),
+            prices: pricing::Prices::cached(&cfg.state_dir),
             combos: cfg
                 .combos
                 .iter()
@@ -722,12 +726,19 @@ impl Gateway {
     fn route(&self, info: &RequestInfo) -> Option<Route> {
         if info.provider == "combo" {
             let combo = self.combos.get(&info.model)?.clone();
-            let targets: Vec<combo::Target> = combo
+            let mut targets: Vec<combo::Target> = combo
                 .targets
                 .iter()
                 .filter(|target| self.adapters.contains_key(&target.provider))
                 .cloned()
                 .collect();
+            if combo.strategy == combo::Strategy::Cheapest {
+                targets.sort_by(|a, b| {
+                    self.prices
+                        .rank(&a.model)
+                        .total_cmp(&self.prices.rank(&b.model))
+                });
+            }
             if targets.is_empty() {
                 return None;
             }

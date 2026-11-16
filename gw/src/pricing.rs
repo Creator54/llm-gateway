@@ -53,6 +53,20 @@ impl Prices {
         }
     }
 
+    /// The cached feed without refreshing it; empty when there is none.
+    pub fn cached(state_dir: &Path) -> Self {
+        std::fs::read(state_dir.join(FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Input plus output dollars per million tokens, for ordering models; unpriced sort last.
+    pub fn rank(&self, model: &str) -> f64 {
+        self.find(model)
+            .map_or(f64::INFINITY, |price| price.input + price.output)
+    }
+
     /// Equivalent list-price dollars for a usage row, or `None` for an unpriced model.
     pub fn cost(&self, row: &UsageSummary) -> Option<f64> {
         let price = self.find(&row.model)?;
@@ -141,6 +155,13 @@ mod tests {
         let cost = prices().cost(&row("gpt-x--fast")).unwrap();
         assert!((cost - 12.0).abs() < 1e-9);
         assert!(prices().cost(&row("unknown")).is_none());
+    }
+
+    #[test]
+    fn rank_orders_cheap_before_dear_and_unknown_last() {
+        let p = prices();
+        assert!(p.rank("claude-haiku-4.5") < p.rank("gpt-x"));
+        assert!(p.rank("gpt-x") < p.rank("unknown"));
     }
 
     #[test]
