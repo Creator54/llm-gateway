@@ -77,7 +77,7 @@ impl OpenAi {
         let Some(access) = access_token(account) else {
             return Err(Failure::Auth);
         };
-        let Some(account_id) = account.extra.get("chatgpt_account_id") else {
+        let Some(account_id) = account.extra.get("account_id") else {
             return Err(Failure::Auth);
         };
 
@@ -977,7 +977,7 @@ mod tests {
                 refresh: None,
                 expires_at: None,
             },
-            extra: BTreeMap::from([("chatgpt_account_id".to_owned(), "acct-123".to_owned())]),
+            extra: BTreeMap::from([("account_id".to_owned(), "acct-123".to_owned())]),
         }
     }
 

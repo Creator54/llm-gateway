@@ -56,7 +56,7 @@ impl std::fmt::Debug for Credential {
 pub struct Account {
     pub id: String,
     pub credential: Credential,
-    /// Non-secret provider fields kept with the login, e.g. `chatgpt_account_id`,
+    /// Non-secret provider fields kept with the login, e.g. `account_id`,
     /// antigravity `project`, kiro `profile_arn` and `region`.
     pub extra: std::collections::BTreeMap<String, String>,
 }
