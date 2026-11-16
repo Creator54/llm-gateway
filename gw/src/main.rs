@@ -303,13 +303,30 @@ async fn model_ids(cfg: &gw::config::Config) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// `gw models --refresh`: fetch live lists from the providers and save them for the gateway.
+/// `gw models --refresh`: fetch live lists from the providers, save them, and bring every
+/// connected agent's model list up to date.
 async fn refresh_models(cfg: &gw::config::Config) -> anyhow::Result<()> {
     for (provider, result) in gw::discover::refresh(cfg).await? {
         match result {
             Ok(count) => gw::ui::ok(&format!("{provider}: {count} models")),
             Err(e) => gw::ui::warn(&format!("{provider}: {e:#}")),
         }
+    }
+    let agents = gw::connect::connected(&cfg.state_dir)?;
+    if agents.is_empty() {
+        return Ok(());
+    }
+    // The running gateway has to re-read the saved lists before it can serve them.
+    let opts = gw::connect::Connect {
+        url: gw::connect::default_url(cfg.listen),
+        key: read_key(cfg.api_key_file.as_deref())?,
+        dry_run: false,
+        models: model_ids(cfg).await?,
+        state_dir: cfg.state_dir.clone(),
+    };
+    let home = gw::connect::home()?;
+    for agent in agents {
+        report(gw::connect::connect(&agent, &opts, &home)?);
     }
     Ok(())
 }

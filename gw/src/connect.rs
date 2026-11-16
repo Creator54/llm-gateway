@@ -43,6 +43,11 @@ pub struct Connect {
     pub models: Vec<String>,
 }
 
+/// Agents `gw connect` has configured, per the manifest.
+pub fn connected(state_dir: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(Manifest::load(state_dir)?.agents.into_keys().collect())
+}
+
 /// Agents whose config directory exists under `home`.
 pub fn detect(home: &Path) -> Vec<&'static str> {
     let dirs = [
