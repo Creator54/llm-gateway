@@ -498,7 +498,7 @@ async fn status(
             )
         );
     }
-    combos(cfg, state_dir);
+    combos(cfg, state_dir, &ui);
     if !windows.is_empty() {
         let now = gw::login::now_secs();
         let cells: Vec<Vec<String>> = windows
@@ -540,29 +540,45 @@ async fn status(
     Ok(())
 }
 
-/// One line per combo: its strategy and targets in the order they are tried.
-fn combos(cfg: &gw::config::Config, state_dir: &Path) {
+/// Combos as a table, one row per target in the order they are tried.
+fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
     if cfg.combos.is_empty() {
         return;
     }
     let prices = gw::pricing::Prices::cached(state_dir);
-    println!();
+    let mut cells: Vec<Vec<String>> = Vec::new();
     for (name, combo) in &cfg.combos {
         let mut targets: Vec<_> = combo.targets.iter().collect();
         if combo.strategy == gw::combo::Strategy::Cheapest {
             targets.sort_by(|a, b| prices.rank(&a.model).total_cmp(&prices.rank(&b.model)));
         }
-        let list: Vec<String> = targets
-            .iter()
-            .map(|t| format!("{}/{}", t.provider, t.model))
-            .collect();
-        println!(
-            "combo/{} ({}): {}",
-            name,
-            combo.strategy.name(),
-            list.join(" -> ")
-        );
+        for (i, t) in targets.iter().enumerate() {
+            let first = i == 0;
+            cells.push(vec![
+                if first {
+                    format!("combo/{name}")
+                } else {
+                    String::new()
+                },
+                if first {
+                    combo.strategy.name().to_owned()
+                } else {
+                    String::new()
+                },
+                (i + 1).to_string(),
+                t.provider.clone(),
+                t.model.clone(),
+            ]);
+        }
     }
+    let headers = ["combo", "strategy", "#", "provider", "model"];
+    println!(
+        "\n{}",
+        ui.render_table(
+            &headers,
+            &views(&cells).iter().map(Vec::as_slice).collect::<Vec<_>>()
+        )
+    );
 }
 
 fn views(cells: &[Vec<String>]) -> Vec<Vec<&str>> {
