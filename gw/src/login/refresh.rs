@@ -42,7 +42,7 @@ impl TokenRefresher {
         }
         let http = &self.http;
         match self.provider.as_str() {
-            "anthropic" | "claude" => {
+            "anthropic" => {
                 let url = self
                     .endpoints
                     .token_url
@@ -50,7 +50,7 @@ impl TokenRefresher {
                     .unwrap_or_else(|| providers::anthropic::TOKEN_URL.to_string());
                 providers::anthropic::refresh(http, &url, refresh).await
             }
-            "openai" | "chatgpt" | "codex" => {
+            "openai" => {
                 let url = self
                     .endpoints
                     .token_url
@@ -58,7 +58,7 @@ impl TokenRefresher {
                     .unwrap_or_else(|| providers::openai::TOKEN_URL.to_string());
                 providers::openai::refresh(http, &url, refresh).await
             }
-            "google-antigravity" | "antigravity" => {
+            "antigravity" => {
                 let url = self
                     .endpoints
                     .token_url

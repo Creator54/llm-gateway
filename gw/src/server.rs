@@ -234,7 +234,7 @@ impl Gateway {
             default_provider: cfg
                 .default_provider
                 .as_deref()
-                .map(alias)
+                .map(providers::canonical)
                 .map(str::to_owned),
         })
     }
@@ -631,6 +631,12 @@ impl Gateway {
             let Some(adapter) = self.adapters.get(&target.provider) else {
                 continue;
             };
+            if let Err(e) = self.refresh(&creds, &target.provider, &id).await {
+                tracing::warn!(provider = %target.provider, account = %id, error = %e, "token refresh failed; log in again");
+                last = Some(provider::Failure::Auth);
+                tried.push((target.provider.clone(), id));
+                continue;
+            }
             let Some(account) = Self::declared(&creds, &target.provider, &id) else {
                 continue;
             };
@@ -725,6 +731,20 @@ impl Gateway {
             pool.add(&entry.provider, &entry.id);
             pool.set_paused(&entry.provider, &entry.id, entry.paused);
         }
+    }
+
+    /// Refresh an OAuth account that is expired or about to expire, before it is used.
+    async fn refresh(&self, creds: &creds::Store, provider: &str, id: &str) -> anyhow::Result<()> {
+        let refresher = crate::login::refresh::TokenRefresher {
+            provider: provider.to_owned(),
+            http: self.client.clone(),
+            endpoints: Default::default(),
+        };
+        let now = crate::login::now_secs();
+        creds
+            .refresh_if_due(&refresher, provider, id, now, creds::DEFAULT_SKEW_SECS)
+            .await
+            .map(|_| ())
     }
 
     /// The credential snapshot's copy of one account.
@@ -1160,14 +1180,6 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 
 /// Provider names clients still send from the opencodex era, mapped to the adapter that
 /// serves them now.
-fn alias(provider: &str) -> &str {
-    match provider {
-        "opencode-cli" | "opencode-zen" | "opencode-free" => "opencode",
-        "google-antigravity" => "antigravity",
-        other => other,
-    }
-}
-
 /// Client suffix asking for the fast tier; a single `-fast` is a real model id.
 const FAST: &str = "--fast";
 
@@ -1211,7 +1223,7 @@ impl RequestInfo {
                 account,
                 model,
             }) => (
-                alias(&provider).to_owned(),
+                providers::canonical(&provider).to_owned(),
                 model,
                 account.unwrap_or_else(|| "auto".to_owned()),
             ),
@@ -1220,7 +1232,7 @@ impl RequestInfo {
                 ("auto".to_owned(), asked, profile.unwrap_or_default())
             }
             // A bare model id belongs to the configured default provider, when it has an adapter.
-            None => match default_provider.map(alias) {
+            None => match default_provider.map(providers::canonical) {
                 Some(provider) if !asked.is_empty() && providers::is_provider(provider) => {
                     (provider.to_owned(), asked, "auto".to_owned())
                 }

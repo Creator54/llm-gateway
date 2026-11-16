@@ -196,12 +196,12 @@ impl Pending {
 pub async fn run(provider: &str, http: &reqwest::Client, opts: &Options) -> Result<Credential> {
     let oauth = |result: Result<Tokens>| result.map(Credential::OAuth);
     match provider {
-        "anthropic" | "claude" => oauth(anthropic::login(http, opts).await),
-        "openai" | "chatgpt" | "codex" => oauth(openai::login(http, opts).await),
-        "google-antigravity" | "antigravity" => oauth(antigravity::login(http, opts).await),
+        "anthropic" => oauth(anthropic::login(http, opts).await),
+        "openai" => oauth(openai::login(http, opts).await),
+        "antigravity" => oauth(antigravity::login(http, opts).await),
         "kiro" => kiro::login(http, opts).await,
-        "command-code" | "commandcode" => oauth(command_code::login(http, opts).await),
-        "opencode-zen" | "opencode" => key::login("opencode-zen", opts).await,
+        "command-code" => oauth(command_code::login(http, opts).await),
+        "opencode" => key::login(opts).await,
         other => Err(anyhow!("unknown login provider: {other}")),
     }
 }

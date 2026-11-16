@@ -117,7 +117,7 @@ impl Antigravity {
 
 impl Provider for Antigravity {
     fn id(&self) -> &str {
-        "google-antigravity"
+        "antigravity"
     }
 
     fn send<'a>(

@@ -29,9 +29,8 @@ pub fn prompt_key(dashboard: Option<&str>) -> Result<String> {
 }
 
 /// Login by pasting the provider's API key.
-pub async fn login(provider: &str, _opts: &Options) -> Result<Credential> {
-    let dashboard = (provider == "opencode-zen").then_some(OPENCODE_ZEN_DASHBOARD);
-    let key = tokio::task::spawn_blocking(move || prompt_key(dashboard)).await??;
+pub async fn login(_opts: &Options) -> Result<Credential> {
+    let key = tokio::task::spawn_blocking(|| prompt_key(Some(OPENCODE_ZEN_DASHBOARD))).await??;
     Ok(Credential::ApiKey(key))
 }
 

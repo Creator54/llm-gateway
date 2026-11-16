@@ -10,19 +10,15 @@ use std::path::{Path, PathBuf};
 use super::{providers, Flow, Options};
 use crate::{creds, ui};
 
-/// Providers the login flows know, with their aliases.
+/// Providers the login flows know; aliases fold through `providers::canonical`.
 pub const PROVIDERS: &[&str] = &[
     "anthropic",
-    "claude",
     "openai",
-    "google-antigravity",
+    "antigravity",
     "kiro",
     "command-code",
-    "opencode-zen",
+    "opencode",
 ];
-
-/// Providers with a device-code grant; `--device` is an error elsewhere.
-const DEVICE: &[&str] = &["openai", "chatgpt", "codex"];
 
 pub struct Login {
     pub provider: String,
@@ -40,14 +36,14 @@ pub struct Import {
 
 /// Run a login flow and store the account it yields.
 pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
-    let provider = args.provider.to_ascii_lowercase();
+    let provider = crate::providers::canonical(&args.provider.to_ascii_lowercase()).to_owned();
     if !PROVIDERS.contains(&provider.as_str()) {
         anyhow::bail!(
             "unknown provider {provider}; expected one of: {}",
             PROVIDERS.join(", ")
         );
     }
-    if args.device && !DEVICE.contains(&provider.as_str()) {
+    if args.device && provider != "openai" {
         anyhow::bail!("{provider} has no device-code flow; drop --device");
     }
     let label = Some(args.label.unwrap_or_else(|| provider.clone()));

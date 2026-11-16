@@ -2,11 +2,13 @@
 //!
 //! Adapted from joocode (MIT); see `LICENSE-joocode`.
 
+mod claude;
 mod reply;
 mod request;
 mod sse;
 mod stream;
 
+pub use claude::{chat_request_to_messages, messages_reply_to_chat, MessagesToChat};
 pub use reply::{chat_to_messages, chat_to_responses, responses_reply_to_chat};
 pub use request::{
     chat_to_responses as chat_request_to_responses, messages_to_chat, responses_to_chat,

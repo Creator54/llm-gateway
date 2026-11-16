@@ -1,8 +1,8 @@
 //! anthropic upstream adapter: the native Messages lane (Claude Pro/Max OAuth or an API key).
 //!
-//! Only a caller that already speaks Messages is served; the body is cut to the protocol's
-//! field allowlist and re-shaped for the credential. Other inbound protocols have no
-//! translation yet and are refused.
+//! A Messages caller is served natively; a Chat Completions caller is translated to Messages
+//! and back. The body is cut to the protocol's field allowlist and re-shaped for the
+//! credential. Responses callers have no translation yet and are refused.
 
 use crate::provider::{Account, Credential, Failure, Inbound, Provider, Reply, Request};
 use crate::translate::Error as TranslateError;
@@ -72,6 +72,15 @@ struct Plan {
     stream: bool,
     /// Wire tool name to the caller's name, for the OAuth rename.
     renames: HashMap<String, String>,
+    /// Set when the caller speaks Chat and the reply must be translated back.
+    chat: Option<ChatReply>,
+}
+
+/// How to answer a Chat caller.
+#[derive(Debug)]
+struct ChatReply {
+    model: String,
+    include_usage: bool,
 }
 
 impl Provider for Anthropic {
@@ -97,7 +106,11 @@ impl Provider for Anthropic {
                     return Err(Failure::Retryable);
                 }
             };
-            reply(resp, plan.stream, plan.renames).await
+            let reply = reply(resp, plan.stream, plan.renames).await?;
+            match plan.chat {
+                Some(chat) => to_chat(reply, plan.stream, chat).await,
+                None => Ok(reply),
+            }
         })
     }
 }
@@ -171,10 +184,10 @@ fn protocol(inbound: Inbound) -> crate::translate::Inbound {
 
 /// Decide the whole request: URL, headers in order, wire body.
 fn plan(base_url: &str, req: &Request, account: &Account) -> Result<Plan, Failure> {
-    if req.inbound != Inbound::Messages {
+    if req.inbound == Inbound::Responses {
         return Err(fatal(
             req.inbound,
-            "this provider only accepts the Messages protocol",
+            "this provider accepts only the Messages and Chat protocols",
         ));
     }
     let url = messages_url(base_url).map_err(|e| fatal(req.inbound, &e))?;
@@ -186,8 +199,32 @@ fn plan(base_url: &str, req: &Request, account: &Account) -> Result<Plan, Failur
             "a Claude OAuth credential is only sent to api.anthropic.com",
         ));
     }
-    let caller: Map<String, Value> = serde_json::from_slice(&req.body)
+    let mut caller: Map<String, Value> = serde_json::from_slice(&req.body)
         .map_err(|_| fatal(req.inbound, "request body is not a JSON object"))?;
+    let chat = if req.inbound == Inbound::Chat {
+        let source = Value::Object(caller);
+        let include_usage = source
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let model = source
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&req.model)
+            .to_owned();
+        caller = match crate::translate::chat_request_to_messages(&source, &req.model)
+            .map_err(|e| translated(req.inbound, &e))?
+        {
+            Value::Object(body) => body,
+            _ => return Err(fatal(req.inbound, "request body is not a JSON object")),
+        };
+        Some(ChatReply {
+            model,
+            include_usage,
+        })
+    } else {
+        None
+    };
     let stream = caller
         .get("stream")
         .and_then(Value::as_bool)
@@ -215,7 +252,98 @@ fn plan(base_url: &str, req: &Request, account: &Account) -> Result<Plan, Failur
         body,
         stream,
         renames,
+        chat,
     })
+}
+
+fn translated(inbound: Inbound, error: &TranslateError) -> Failure {
+    Failure::Fatal {
+        status: StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_REQUEST),
+        body: Bytes::from(error.to_body(protocol(inbound)).to_string()),
+    }
+}
+
+/// A successful Messages reply re-encoded for a Chat caller.
+async fn to_chat(reply: Reply, stream: bool, chat: ChatReply) -> Result<Reply, Failure> {
+    let mut headers = HeaderMap::new();
+    let sse = reply
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let body: Body = if stream && sse {
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        chat_stream(reply.body, chat)
+    } else {
+        let mut bytes = Vec::new();
+        let mut source = reply.body;
+        while let Some(chunk) = source.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|_| Failure::Retryable)?);
+        }
+        let message: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::Retryable)?;
+        let out = crate::translate::messages_reply_to_chat(&message, &chat.model)
+            .map_err(|_| Failure::Retryable)?;
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let out = Bytes::from(out.to_string());
+        Box::pin(futures_util::stream::once(async move { Ok(out) }))
+    };
+    Ok(Reply {
+        status: reply.status,
+        headers,
+        body,
+    })
+}
+
+/// Messages SSE re-encoded as Chat completion chunks.
+fn chat_stream(source: Body, chat: ChatReply) -> Body {
+    let state = (
+        source,
+        crate::translate::SseParser::new(),
+        crate::translate::MessagesToChat::new(chat.model, chat.include_usage),
+        false,
+    );
+    futures_util::stream::unfold(
+        state,
+        |(mut source, mut parser, mut encoder, ended)| async move {
+            if ended {
+                return None;
+            }
+            loop {
+                match source.next().await {
+                    Some(Ok(chunk)) => {
+                        let Ok(payloads) = parser.push(&chunk) else {
+                            let out = encoder.finish();
+                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
+                        };
+                        let out: Vec<u8> = payloads
+                            .iter()
+                            .flat_map(|payload| encoder.push_event(payload))
+                            .collect();
+                        if !out.is_empty() {
+                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, false)));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        return Some((Err(error), (source, parser, encoder, true)));
+                    }
+                    None => {
+                        let out = encoder.finish();
+                        if out.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
 }
 
 fn base_headers(stream: bool) -> Vec<(String, String)> {
@@ -1250,9 +1378,34 @@ mod tests {
     }
 
     #[test]
-    fn other_inbound_protocols_are_refused_before_io() {
+    fn chat_inbound_is_translated_to_messages() {
         let req = request(
             Inbound::Chat,
+            json!({
+                "model": "anthropic/claude-haiku-4-5",
+                "stream": true,
+                "stream_options": { "include_usage": true },
+                "messages": [
+                    { "role": "system", "content": "be brief" },
+                    { "role": "user", "content": "hi" }
+                ]
+            }),
+        );
+        let plan = plan("https://api.anthropic.com", &req, &key_account()).unwrap();
+        let wire: Value = serde_json::from_slice(&plan.body).unwrap();
+        assert!(plan.stream);
+        assert_eq!(wire["messages"][0]["role"], "user");
+        assert!(wire["max_tokens"].as_u64().unwrap() > 0);
+        assert!(wire.get("stream_options").is_none());
+        let chat = plan.chat.unwrap();
+        assert_eq!(chat.model, "anthropic/claude-haiku-4-5");
+        assert!(chat.include_usage);
+    }
+
+    #[test]
+    fn responses_inbound_is_refused_before_io() {
+        let req = request(
+            Inbound::Responses,
             json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
         );
         let failure = plan("https://api.anthropic.com", &req, &key_account()).unwrap_err();

@@ -17,6 +17,18 @@ pub const NAMES: [&str; 6] = [
     "opencode",
 ];
 
+/// The adapter name for `name`, folding the spellings opencodex and the CLIs use.
+pub fn canonical(name: &str) -> &str {
+    match name {
+        "claude" => "anthropic",
+        "chatgpt" | "codex" => "openai",
+        "google-antigravity" => "antigravity",
+        "commandcode" => "command-code",
+        "opencode-cli" | "opencode-zen" | "opencode-free" => "opencode",
+        other => other,
+    }
+}
+
 /// Whether `name` has a native adapter.
 pub fn is_provider(name: &str) -> bool {
     NAMES.contains(&name)

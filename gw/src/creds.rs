@@ -582,6 +582,19 @@ pub fn import_opencodex(dir: &Path) -> anyhow::Result<Vec<Entry>> {
     if let Some(codex) = read_json(&dir.join("codex-accounts.json"))? {
         entries.extend(entries_from_codex(&codex));
     }
+    for entry in &mut entries {
+        entry.provider = crate::providers::canonical(&entry.provider).to_owned();
+    }
+    // opencodex can list one ChatGPT login in both files; two copies of one refresh
+    // token would each rotate it and log the other out.
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|entry| match &entry.credential {
+        Secret::OAuth(c) => c
+            .refresh
+            .as_ref()
+            .is_none_or(|token| seen.insert((entry.provider.clone(), token.clone()))),
+        Secret::ApiKey { .. } => true,
+    });
     Ok(entries)
 }
 
@@ -1244,6 +1257,8 @@ mod tests {
                     { "id": "a2", "needsReauth": true, "credential": { "access": "fake-access-2", "refresh": "fake-refresh-2", "expires": 1_700_000_001_000u64 } }
                 ]
             },
+            "google-antigravity": { "accounts": [ { "id": "g1", "credential": { "access": "fake-g", "refresh": "fake-rg", "expires": 1_700_000_005_000u64 } } ] },
+            "chatgpt": { "accounts": [ { "id": "c1", "credential": { "access": "fake-at-2", "refresh": "fake-rt-2", "expires": 1_700_000_003_000u64 } } ] },
             "kiro": {
                 "access": "fake-access-3",
                 "refresh": "fake-refresh-3",
@@ -1283,8 +1298,10 @@ mod tests {
             vec![
                 ("anthropic", "a1"),
                 ("anthropic", "a2"),
+                ("antigravity", "g1"),
                 ("kiro", "kiro"),
-                ("openai", "codex-legacy"),
+                // codex-legacy repeats c1's refresh token, so only the first copy stays.
+                ("openai", "c1"),
                 ("openai", "codex-work"),
             ]
         );

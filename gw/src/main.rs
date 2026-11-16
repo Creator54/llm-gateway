@@ -68,7 +68,7 @@ enum Cmd {
     },
     /// Log in to a provider and store the account
     Login {
-        /// One of: anthropic, claude, openai, google-antigravity, kiro, command-code, opencode-zen
+        /// One of: anthropic, openai, antigravity, kiro, command-code, opencode (aliases: claude, chatgpt, codex, google-antigravity, opencode-zen)
         provider: String,
         /// Force the device-code flow (openai only)
         #[arg(long)]
