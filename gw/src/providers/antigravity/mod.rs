@@ -5,6 +5,7 @@
 
 mod request;
 mod response;
+mod schema;
 mod util;
 
 #[cfg(test)]
@@ -538,6 +539,7 @@ fn quota_exhausted(body: &str) -> bool {
 async fn failure(status: StatusCode, response: reqwest::Response) -> Failure {
     let retry = retry_after(response.headers());
     let body = read_bounded(response, ERROR_BODY_CAP).await;
+    tracing::debug!(%status, body = %String::from_utf8_lossy(&body), "antigravity upstream error");
     match status.as_u16() {
         429 if quota_exhausted(&String::from_utf8_lossy(&body)) => {
             Failure::Quota { reset_after: retry }

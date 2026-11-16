@@ -354,11 +354,10 @@ fn tools(chat: &Value, names: &ToolNames) -> Option<Value> {
             {
                 declaration.insert("description".into(), json!(description));
             }
-            let parameters = tool
-                .pointer("/function/parameters")
-                .filter(|value| value.is_object())
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            let parameters = tool.pointer("/function/parameters").map_or_else(
+                || json!({ "type": "object", "properties": {} }),
+                super::schema::sanitize,
+            );
             declaration.insert("parameters".into(), parameters);
             Some(Value::Object(declaration))
         })
