@@ -309,6 +309,10 @@ impl Agent {
                     kind: Kind::Json,
                     changes: vec![
                         (
+                            "provider.gw.name".into(),
+                            Scalar::Str("Gateway (gw)".into()),
+                        ),
+                        (
                             "provider.gw.npm".into(),
                             Scalar::Str("@ai-sdk/openai-compatible".into()),
                         ),
