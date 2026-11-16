@@ -110,6 +110,16 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// The login email, when the provider reported one.
+    pub fn email(&self) -> Option<&str> {
+        match &self.credential {
+            Secret::OAuth(oauth) => oauth.extra.get("email").and_then(serde_json::Value::as_str),
+            _ => None,
+        }
+    }
+}
+
+impl Entry {
     /// True when this token is expired or expires within `skew_secs`; unknown expiry counts as fresh.
     pub fn needs_refresh(&self, now_unix: u64, skew_secs: u64) -> bool {
         needs_refresh(self, now_unix, skew_secs)

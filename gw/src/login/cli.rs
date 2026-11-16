@@ -172,6 +172,7 @@ pub fn list(json: bool, dir: PathBuf) -> Result<()> {
                     "provider": e.provider,
                     "id": e.id,
                     "label": e.label,
+                    "email": e.email(),
                     "paused": e.paused,
                     "needs_reauth": e.needs_reauth,
                 })
@@ -198,6 +199,7 @@ pub fn list(json: bool, dir: PathBuf) -> Result<()> {
                 e.provider.clone(),
                 e.id.clone(),
                 e.label.clone().unwrap_or_else(|| "-".to_string()),
+                e.email().unwrap_or("-").to_owned(),
                 match flags.join(",") {
                     empty if empty.is_empty() => "-".to_string(),
                     joined => joined,
@@ -212,7 +214,7 @@ pub fn list(json: bool, dir: PathBuf) -> Result<()> {
     let lines: Vec<&[&str]> = cell_refs.iter().map(|c| c.as_slice()).collect();
     print!(
         "{}",
-        ui::Ui::from_env().render_table(&["provider", "id", "label", "flags"], &lines)
+        ui::Ui::from_env().render_table(&["provider", "id", "label", "email", "flags"], &lines)
     );
     Ok(())
 }

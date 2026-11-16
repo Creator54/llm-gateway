@@ -74,6 +74,9 @@ enum Cmd {
         /// Fetch quota from the providers instead of using the cache
         #[arg(long)]
         refresh: bool,
+        /// Show each account's login email
+        #[arg(long)]
+        emails: bool,
         /// Print usage and quota as JSON
         #[arg(long)]
         json: bool,
@@ -193,8 +196,9 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Status {
             since,
             refresh,
+            emails,
             json,
-        } => status(&cfg, &since, refresh, json).await,
+        } => status(&cfg, &since, refresh, emails, json).await,
         Cmd::Models { refresh, json } => {
             if refresh {
                 refresh_models(&cfg).await?;
@@ -240,7 +244,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// One line per provider: how many accounts, and how many need a new login.
-fn accounts(state_dir: &Path) -> anyhow::Result<Vec<String>> {
+fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<Vec<String>> {
     let all = gw::creds::Store::load(state_dir)?.all();
     if all.is_empty() {
         return Ok(vec!["no accounts; run `gw login <provider>`".into()]);
@@ -249,9 +253,13 @@ fn accounts(state_dir: &Path) -> anyhow::Result<Vec<String>> {
     for e in &all {
         let name = e.label.as_deref().unwrap_or(&e.id);
         let flag = if e.needs_reauth { " (needs login)" } else { "" };
+        let email = match e.email() {
+            Some(email) if emails => format!(" <{email}>"),
+            _ => String::new(),
+        };
         by.entry(&e.provider)
             .or_default()
-            .push(format!("{name}{flag}"));
+            .push(format!("{name}{email}{flag}"));
     }
     Ok(by
         .into_iter()
@@ -354,7 +362,7 @@ async fn setup(cfg: gw::config::Config, yes: bool, dry_run: bool) -> anyhow::Res
         Ok(models) => models,
         Err(e) => anyhow::bail!("{e:#}\nstart it first: gw serve"),
     };
-    let accounts = accounts(&cfg.state_dir)?;
+    let accounts = accounts(&cfg.state_dir, false)?;
     gw::ui::heading("Gateway");
     gw::ui::ok(&format!("{url}: running, {} models", models.len()));
     for line in &accounts {
@@ -427,6 +435,7 @@ async fn status(
     cfg: &gw::config::Config,
     since: &str,
     refresh: bool,
+    emails: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let state_dir = &cfg.state_dir;
@@ -473,7 +482,7 @@ async fn status(
     }
 
     report(gw::connect::status(&gw::connect::home()?, state_dir)?);
-    report(accounts(state_dir)?);
+    report(accounts(state_dir, emails)?);
     let ui = gw::ui::Ui::from_env();
     if rows.is_empty() {
         println!("\nno usage in the last {since}");
