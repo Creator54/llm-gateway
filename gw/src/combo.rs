@@ -40,6 +40,16 @@ pub struct Combo {
     pub sticky_limit: u16,
 }
 
+impl Strategy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Failover => "failover",
+            Self::RoundRobin => "round_robin",
+            Self::Cheapest => "cheapest",
+        }
+    }
+}
+
 impl Combo {
     /// Attempts for one request, in the order they may be tried.
     // Failover is only safe before the first reply byte: stop iterating once a target replies,
