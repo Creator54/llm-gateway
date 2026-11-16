@@ -144,7 +144,8 @@ fn classify(status: StatusCode, retry_after: Option<Duration>, body: &Bytes) -> 
     }
     match status.as_u16() {
         401 | 403 => Failure::Auth,
-        429 if quota_exhausted(body) => Failure::Quota {
+        // command-code reports an empty balance as a 400 "insufficient credits".
+        400 | 429 if quota_exhausted(body) => Failure::Quota {
             reset_after: retry_after,
         },
         429 => Failure::RateLimited { retry_after },
@@ -1516,6 +1517,24 @@ mod tests {
         let body = Bytes::from_static(br#"{"error":"forbidden"}"#);
         let failure = classify(StatusCode::FORBIDDEN, None, &body);
         assert!(matches!(failure, Failure::Auth));
+    }
+
+    #[test]
+    fn empty_balance_400_is_quota_not_fatal() {
+        let body =
+            Bytes::from_static(b"{\"error\":{\"message\":\"You have insufficient credits\"}}");
+        assert!(matches!(
+            classify(StatusCode::BAD_REQUEST, None, &body),
+            Failure::Quota { .. }
+        ));
+        assert!(matches!(
+            classify(
+                StatusCode::BAD_REQUEST,
+                None,
+                &Bytes::from_static(b"bad json")
+            ),
+            Failure::Fatal { .. }
+        ));
     }
 
     #[test]
