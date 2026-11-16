@@ -69,6 +69,9 @@ enum Cmd {
     Status,
     /// List the models the running gateway serves
     Models {
+        /// Ask the providers for their live model lists first
+        #[arg(long)]
+        refresh: bool,
         /// Print the raw JSON list
         #[arg(long)]
         json: bool,
@@ -192,7 +195,12 @@ async fn run() -> anyhow::Result<()> {
             report(gw::connect::usage(&cfg.state_dir)?);
             Ok(())
         }
-        Cmd::Models { json } => models(&cfg, json).await,
+        Cmd::Models { refresh, json } => {
+            if refresh {
+                refresh_models(&cfg).await?;
+            }
+            models(&cfg, json).await
+        }
         Cmd::Setup { yes, dry_run } => setup(cfg, yes, dry_run).await,
         Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
         Cmd::Login {
@@ -293,6 +301,17 @@ async fn model_ids(cfg: &gw::config::Config) -> anyhow::Result<Vec<String>> {
         .flatten()
         .filter_map(|m| m["id"].as_str().map(str::to_owned))
         .collect())
+}
+
+/// `gw models --refresh`: fetch live lists from the providers and save them for the gateway.
+async fn refresh_models(cfg: &gw::config::Config) -> anyhow::Result<()> {
+    for (provider, result) in gw::discover::refresh(cfg).await? {
+        match result {
+            Ok(count) => gw::ui::ok(&format!("{provider}: {count} models")),
+            Err(e) => gw::ui::warn(&format!("{provider}: {e:#}")),
+        }
+    }
+    Ok(())
 }
 
 /// `gw models`: ask the running gateway what it serves.

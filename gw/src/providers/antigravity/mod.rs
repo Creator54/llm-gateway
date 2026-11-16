@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
-const USER_AGENT: &str =
+pub(crate) const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+pub(crate) const USER_AGENT: &str =
     "antigravity/ide/2.5.5 (os_type=windows; arch=amd64; aidev_client; auth_method=oauth)";
 const ERROR_BODY_CAP: usize = 8 * 1024;
 const REPLY_BODY_CAP: usize = 100 * 1024 * 1024;

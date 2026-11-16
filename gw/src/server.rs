@@ -509,10 +509,20 @@ impl Gateway {
 
     /// Models this gateway can route, or empty when the config names none.
     fn model_list(&self) -> Vec<models::Entry> {
-        let listed = self.models.iter().flat_map(|(provider, ids)| {
-            ids.iter()
-                .map(move |model| (provider.as_str(), model.as_str()))
-        });
+        // Live lists from `gw models --refresh` come first; `[models]` fills in providers
+        // that have no listing endpoint.
+        let discovered = crate::discover::load(&self.state_dir);
+        let configured = self
+            .models
+            .iter()
+            .filter(|(provider, _)| !discovered.contains_key(*provider));
+        let listed = discovered
+            .iter()
+            .chain(configured)
+            .flat_map(|(provider, ids)| {
+                ids.iter()
+                    .map(move |model| (provider.as_str(), model.as_str()))
+            });
         let targets = self
             .combos
             .values()

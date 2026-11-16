@@ -14,13 +14,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_BASE: &str = "https://api.anthropic.com";
+pub(crate) const DEFAULT_BASE: &str = "https://api.anthropic.com";
 /// Anthropic's own API host; the only destination a plan credential is trusted for.
 const FIRST_PARTY_HOST: &str = "api.anthropic.com";
-const API_VERSION: &str = "2023-06-01";
+pub(crate) const API_VERSION: &str = "2023-06-01";
 const SDK_VERSION: &str = "0.74.0";
 const NODE_VERSION: &str = "22.11.0";
-const OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+pub(crate) const OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 const CLAUDE_CODE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const TOOL_PREFIX: &str = "custom_";
 /// Anthropic's own tools keep their names under the OAuth prefix.

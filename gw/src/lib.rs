@@ -3,6 +3,7 @@ pub mod combo;
 pub mod config;
 pub mod connect;
 pub mod creds;
+pub mod discover;
 pub mod journal;
 pub mod login;
 pub mod metrics;
