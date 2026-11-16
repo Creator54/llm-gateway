@@ -256,13 +256,18 @@ async fn run() -> anyhow::Result<()> {
 /// One line per provider: how many accounts, and how many need a new login.
 fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<Vec<String>> {
     let all = gw::creds::Store::load(state_dir)?.all();
-    if all.is_empty() {
-        return Ok(vec!["no accounts; run `gw login <provider>`".into()]);
-    }
     let mut by: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    // opencode serves its free models without a login.
+    if !all.iter().any(|e| e.provider == "opencode") {
+        by.insert("opencode", vec!["free tier (no login)".into()]);
+    }
     for e in &all {
         let name = e.label.as_deref().unwrap_or(&e.id);
-        let flag = if e.needs_reauth { " (needs login)" } else { "" };
+        let flag = match (e.needs_reauth, e.paused) {
+            (true, _) => " (needs login)",
+            (_, true) => " (paused)",
+            _ => "",
+        };
         let email = match e.email() {
             Some(email) if emails => format!(" <{email}>"),
             _ => String::new(),
