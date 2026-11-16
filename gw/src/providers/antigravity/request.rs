@@ -112,11 +112,29 @@ fn system_text(messages: &[Value]) -> String {
         Some(rest) => rest.split_once('\n').map(|(_, tail)| tail).unwrap_or(""),
         None => joined.as_str(),
     };
-    stripped
+    let kept = stripped
         .split("\n\n")
         .filter(|paragraph| *paragraph != REJECTED_CLAUDE_SDK_PARAGRAPH)
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    rename_identity(&kept)
+}
+
+/// CCA also answers 429 when the system text claims a rival agent's identity
+/// ("You are opencode", any case, anywhere). Naming the agent keeps the meaning.
+fn rename_identity(text: &str) -> String {
+    const CLAIM: &str = "you are opencode";
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut rest = 0;
+    for (at, _) in lower.match_indices(CLAIM) {
+        out.push_str(&text[rest..at]);
+        out.push_str("You are an agent named ");
+        out.push_str(&text[at + "you are ".len()..at + CLAIM.len()]);
+        rest = at + CLAIM.len();
+    }
+    out.push_str(&text[rest..]);
+    out
 }
 
 fn contents(messages: &[Value], names: &ToolNames) -> Vec<Value> {
@@ -488,7 +506,16 @@ fn is_pro(model: &str) -> bool {
 
 #[cfg(test)]
 mod wire_tests {
-    use super::wire_model;
+    use super::{rename_identity, wire_model};
+
+    #[test]
+    fn renames_rival_identity_claims() {
+        assert_eq!(
+            rename_identity("Hi.\n\nYou are OpenCode, a CLI. you are opencode."),
+            "Hi.\n\nYou are an agent named OpenCode, a CLI. You are an agent named opencode."
+        );
+        assert_eq!(rename_identity("Use opencode."), "Use opencode.");
+    }
 
     #[test]
     fn picker_ids_map_to_tiered_wire_ids() {
