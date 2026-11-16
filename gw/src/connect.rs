@@ -299,7 +299,7 @@ impl Agent {
                             "providers.gateway.baseUrl".into(),
                             Scalar::Str(opts.url.clone()),
                         ),
-                        ("providers.gateway.apiKey".into(), Scalar::Str(key(opts)?)),
+                        ("providers.gateway.apiKey".into(), Scalar::Str(key(opts))),
                     ],
                 },
                 WriteSet {
@@ -328,7 +328,7 @@ impl Agent {
                             "provider.gw.options.baseURL".into(),
                             Scalar::Str(opts.url.clone()),
                         ),
-                        ("provider.gw.options.apiKey".into(), Scalar::Str(key(opts)?)),
+                        ("provider.gw.options.apiKey".into(), Scalar::Str(key(opts))),
                     ],
                 }])
             }
@@ -340,7 +340,7 @@ impl Agent {
                         "env.ANTHROPIC_BASE_URL".into(),
                         Scalar::Str(anthropic_base(&opts.url)),
                     ),
-                    ("env.ANTHROPIC_AUTH_TOKEN".into(), Scalar::Str(key(opts)?)),
+                    ("env.ANTHROPIC_AUTH_TOKEN".into(), Scalar::Str(key(opts))),
                 ],
             }]),
             Agent::Codex => Ok(vec![WriteSet {
@@ -368,10 +368,10 @@ impl Agent {
     }
 }
 
-fn key(opts: &Connect) -> anyhow::Result<String> {
-    opts.key
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no gateway key: pass --key-file"))
+/// A gateway with no `api_key_file` is loopback-only and checks no key, but
+/// agents still insist on a non-empty one.
+fn key(opts: &Connect) -> String {
+    opts.key.clone().unwrap_or_else(|| "gw".into())
 }
 
 fn kind_of(file: &Path) -> Kind {
@@ -1508,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_requires_a_key_except_for_codex() {
+    fn connect_without_a_key_uses_a_placeholder() {
         let sandbox = Sandbox::new();
         let opts = Connect {
             url: URL.into(),
@@ -1516,8 +1516,9 @@ mod tests {
             dry_run: false,
             state_dir: sandbox.state(),
         };
-        let error = connect("pi", &opts, &sandbox.home()).unwrap_err();
-        assert!(error.to_string().contains("--key-file"), "{error}");
+        connect("pi", &opts, &sandbox.home()).unwrap();
+        let models = std::fs::read_to_string(sandbox.home().join(".pi/agent/models.json")).unwrap();
+        assert!(models.contains("\"apiKey\": \"gw\""), "{models}");
     }
 
     #[test]
