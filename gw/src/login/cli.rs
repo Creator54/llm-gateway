@@ -220,9 +220,13 @@ pub fn list(json: bool, dir: PathBuf) -> Result<()> {
 /// Remove one account, asking for confirmation unless `json` is set.
 pub fn remove(provider: &str, id: &str, json: bool, dir: &Path) -> Result<()> {
     let store = creds::Store::load(dir)?;
-    if store.get(provider, id).is_none() {
-        anyhow::bail!("no account {provider} / {id}");
-    }
+    // The label is what `gw login` was given, so accept it as well as the opaque id.
+    let id = &store
+        .accounts(provider)
+        .into_iter()
+        .find(|e| e.id == id || e.label.as_deref() == Some(id))
+        .map(|e| e.id)
+        .ok_or_else(|| anyhow::anyhow!("no {provider} account {id:?}; see `gw account list`"))?;
     if !json && !ui::confirm(&format!("remove {provider} / {id}?"), false) {
         ui::info("nothing removed");
         return Ok(());

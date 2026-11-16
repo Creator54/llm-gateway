@@ -176,28 +176,36 @@ pub fn status(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
     }
     let mut lines = Vec::new();
     for (agent, files) in &manifest.agents {
-        lines.push(format!("{agent}: connected"));
+        let mut drifted = Vec::new();
+        let mut total = 0;
         for (file, records) in files {
             let file = PathBuf::from(file);
             let kind = kind_of(&file);
             for record in records {
+                total += 1;
                 let current = if file.exists() {
                     read_doc(&file, kind)?.get(&record.key)?
                 } else {
                     None
                 };
-                let state = if current.as_ref() == Some(&record.set) {
-                    "in sync"
-                } else {
-                    "drifted"
-                };
-                lines.push(format!(
-                    "  {}: {} = {} [{state}]",
-                    rel(&file, home),
-                    record.key,
-                    show(&record.key, current.as_ref())
-                ));
+                if current.as_ref() != Some(&record.set) {
+                    drifted.push(format!(
+                        "  {}: {} = {} [drifted]",
+                        rel(&file, home),
+                        record.key,
+                        show(&record.key, current.as_ref())
+                    ));
+                }
             }
+        }
+        if drifted.is_empty() {
+            lines.push(format!("{agent}: connected, {total} settings in sync"));
+        } else {
+            lines.push(format!(
+                "{agent}: connected, {} of {total} settings drifted",
+                drifted.len()
+            ));
+            lines.extend(drifted);
         }
         if agent == "pi" {
             if let Some(line) = client_cache_tools(home) {

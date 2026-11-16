@@ -51,7 +51,14 @@ const ANONYMOUS_ACCOUNT: &str = "anonymous";
 /// Run the gateway on `cfg.listen` until SIGINT or SIGTERM.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     guard(&cfg)?;
-    let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
+    let listener = tokio::net::TcpListener::bind(cfg.listen)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot listen on {}: {e}; is gw already running?",
+                cfg.listen
+            )
+        })?;
     serve(listener, cfg).await
 }
 

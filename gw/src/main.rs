@@ -246,18 +246,17 @@ fn accounts(state_dir: &Path) -> anyhow::Result<Vec<String>> {
     if all.is_empty() {
         return Ok(vec!["no accounts; run `gw login <provider>`".into()]);
     }
-    let mut by: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut by: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for e in &all {
-        let n = by.entry(&e.provider).or_default();
-        n.0 += 1;
-        n.1 += usize::from(e.needs_reauth);
+        let name = e.label.as_deref().unwrap_or(&e.id);
+        let flag = if e.needs_reauth { " (needs login)" } else { "" };
+        by.entry(&e.provider)
+            .or_default()
+            .push(format!("{name}{flag}"));
     }
     Ok(by
         .into_iter()
-        .map(|(p, (n, bad))| match bad {
-            0 => format!("{p}: {n} account(s)"),
-            _ => format!("{p}: {n} account(s), {bad} need login"),
-        })
+        .map(|(p, names)| format!("{p}: {}", names.join(", ")))
         .collect())
 }
 
@@ -273,8 +272,13 @@ async fn fetch_models(cfg: &gw::config::Config) -> anyhow::Result<Vec<u8>> {
         .await
         .map_err(|e| {
             anyhow::anyhow!(
-                "gateway not reachable at {}: {e}; is `gw serve` running?",
-                cfg.listen
+                "gateway not reachable at {}: {}; is `gw serve` running?",
+                cfg.listen,
+                if e.is_connect() {
+                    "connection refused".to_owned()
+                } else {
+                    e.to_string()
+                }
             )
         })?
         .error_for_status()?;
