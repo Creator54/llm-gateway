@@ -31,6 +31,7 @@ pub fn default_url(listen: std::net::SocketAddr) -> String {
 }
 
 /// What `gw connect` writes.
+#[derive(Clone)]
 pub struct Connect {
     /// Base URL clients should use, e.g. `http://127.0.0.1:10204/v1`.
     pub url: String,
@@ -38,6 +39,22 @@ pub struct Connect {
     pub key: Option<String>,
     pub dry_run: bool,
     pub state_dir: PathBuf,
+    /// Model ids to list in agents that need an explicit list (pi, opencode).
+    pub models: Vec<String>,
+}
+
+/// Agents whose config directory exists under `home`.
+pub fn detect(home: &Path) -> Vec<&'static str> {
+    let dirs = [
+        ("pi", ".pi/agent"),
+        ("opencode", ".config/opencode"),
+        ("claude", ".claude"),
+        ("codex", ".codex"),
+    ];
+    dirs.into_iter()
+        .filter(|(_, dir)| home.join(dir).is_dir())
+        .map(|(agent, _)| agent)
+        .collect()
 }
 
 /// Connect one agent and report every change.
@@ -300,7 +317,18 @@ impl Agent {
                             Scalar::Str(opts.url.clone()),
                         ),
                         ("providers.gateway.apiKey".into(), Scalar::Str(key(opts))),
-                    ],
+                        (
+                            "providers.gateway.api".into(),
+                            Scalar::Str("openai-completions".into()),
+                        ),
+                    ]
+                    .into_iter()
+                    .chain(model_list(
+                        "providers.gateway.models",
+                        &opts.models,
+                        |id| serde_json::json!({ "id": id }),
+                    ))
+                    .collect(),
                 },
                 WriteSet {
                     file: home.join(".pi/agent/settings.json"),
@@ -329,7 +357,14 @@ impl Agent {
                             Scalar::Str(opts.url.clone()),
                         ),
                         ("provider.gw.options.apiKey".into(), Scalar::Str(key(opts))),
-                    ],
+                    ]
+                    .into_iter()
+                    .chain(model_list(
+                        "provider.gw.models",
+                        &opts.models,
+                        |id| serde_json::json!({ "name": id }),
+                    ))
+                    .collect(),
                 }])
             }
             Agent::Claude => Ok(vec![WriteSet {
@@ -366,6 +401,25 @@ impl Agent {
             }]),
         }
     }
+}
+
+/// The `models` change for an agent; none when the gateway lists no models.
+fn model_list(
+    path: &str,
+    ids: &[String],
+    entry: fn(&str) -> serde_json::Value,
+) -> Option<(String, Scalar)> {
+    if ids.is_empty() {
+        return None;
+    }
+    let value = if path.starts_with("providers.") {
+        // pi takes an array of entries.
+        serde_json::Value::Array(ids.iter().map(|id| entry(id)).collect())
+    } else {
+        // opencode takes an object keyed by model id.
+        serde_json::Value::Object(ids.iter().map(|id| (id.clone(), entry(id))).collect())
+    };
+    Some((path.into(), Scalar::Json(value)))
 }
 
 /// A gateway with no `api_key_file` is loopback-only and checks no key, but
@@ -492,6 +546,8 @@ enum Scalar {
     Bool(bool),
     Int(i64),
     Str(String),
+    /// An array or object, e.g. a model list.
+    Json(serde_json::Value),
 }
 
 impl Scalar {
@@ -500,6 +556,7 @@ impl Scalar {
             Scalar::Bool(v) => (*v).into(),
             Scalar::Int(v) => (*v).into(),
             Scalar::Str(v) => v.as_str().into(),
+            Scalar::Json(v) => v.clone(),
         }
     }
 
@@ -508,6 +565,7 @@ impl Scalar {
             Scalar::Bool(v) => (*v).into(),
             Scalar::Int(v) => (*v).into(),
             Scalar::Str(v) => v.as_str().into(),
+            Scalar::Json(v) => v.to_string().into(),
         }
     }
 }
@@ -525,6 +583,11 @@ fn show(path: &str, value: Option<&Scalar>) -> String {
         Some(Scalar::Bool(v)) => v.to_string(),
         Some(Scalar::Int(v)) => v.to_string(),
         Some(Scalar::Str(v)) => v.clone(),
+        Some(Scalar::Json(v)) => format!(
+            "{} entries",
+            v.as_array()
+                .map_or_else(|| v.as_object().map_or(0, |o| o.len()), Vec::len)
+        ),
     }
 }
 
@@ -534,7 +597,7 @@ fn scalar_from_json(value: &serde_json::Value) -> anyhow::Result<Option<Scalar>>
         serde_json::Value::Number(v) => v.as_i64().map(Scalar::Int),
         serde_json::Value::String(v) => Some(Scalar::Str(v.clone())),
         serde_json::Value::Null => None,
-        _ => anyhow::bail!("refusing to touch a non-scalar value"),
+        other => Some(Scalar::Json(other.clone())),
     })
 }
 
@@ -1025,6 +1088,7 @@ mod tests {
                 key: Some(key.into()),
                 dry_run: false,
                 state_dir: self.state(),
+                models: Vec::new(),
             }
         }
     }
@@ -1240,17 +1304,6 @@ mod tests {
         );
         assert_eq!(anthropic_base("http://h/v1/v1"), "http://h/v1");
         assert_eq!(anthropic_base("http://h/v1beta"), "http://h/v1beta");
-    }
-
-    #[test]
-    fn non_scalar_values_are_refused() {
-        let sandbox = Sandbox::new();
-        sandbox.write(
-            ".pi/agent/models.json",
-            r#"{"providers":{"gateway":{"baseUrl":{"nested":"x"}}}}"#,
-        );
-        let error = connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap_err();
-        assert!(error.to_string().contains("non-scalar"), "{error}");
     }
 
     #[test]
@@ -1483,6 +1536,7 @@ mod tests {
             key: None,
             dry_run: false,
             state_dir: sandbox.state(),
+            models: Vec::new(),
         };
         let lines = connect("codex", &opts, &sandbox.home()).unwrap();
         assert!(lines.iter().any(|l| l.contains("export GW_API_KEY")));
@@ -1515,6 +1569,7 @@ mod tests {
             key: None,
             dry_run: false,
             state_dir: sandbox.state(),
+            models: Vec::new(),
         };
         connect("pi", &opts, &sandbox.home()).unwrap();
         let models = std::fs::read_to_string(sandbox.home().join(".pi/agent/models.json")).unwrap();
@@ -1526,5 +1581,35 @@ mod tests {
         let sandbox = Sandbox::new();
         let error = connect("nope", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap_err();
         assert!(error.to_string().contains("unknown agent"), "{error}");
+    }
+
+    #[test]
+    fn detect_finds_agent_directories() {
+        let sandbox = Sandbox::new();
+        fs::create_dir_all(sandbox.home().join(".pi/agent")).unwrap();
+        fs::create_dir_all(sandbox.home().join(".codex")).unwrap();
+        assert_eq!(detect(&sandbox.home()), ["pi", "codex"]);
+    }
+
+    #[test]
+    fn pi_and_opencode_get_model_lists_and_disconnect_restores() {
+        let sandbox = Sandbox::new();
+        let mut opts = sandbox.opts(URL, KEY);
+        opts.models = vec!["a/b".into(), "c/d".into()];
+        connect("pi", &opts, &sandbox.home()).unwrap();
+        connect("opencode", &opts, &sandbox.home()).unwrap();
+        let pi: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(sandbox.home().join(".pi/agent/models.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pi["providers"]["gateway"]["models"][1]["id"], "c/d");
+        let oc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(sandbox.home().join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(oc["provider"]["gw"]["models"]["a/b"]["name"], "a/b");
+        disconnect("pi", &sandbox.home(), &sandbox.state()).unwrap();
+        let pi = fs::read_to_string(sandbox.home().join(".pi/agent/models.json")).unwrap();
+        assert!(!pi.contains("c/d"), "{pi}");
     }
 }

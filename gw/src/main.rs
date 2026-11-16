@@ -56,6 +56,15 @@ enum Cmd {
         /// One of: pi, opencode, claude, codex
         agent: String,
     },
+    /// Find installed coding tools and point the ones you choose at this gateway
+    Setup {
+        /// Connect every detected tool without asking
+        #[arg(long, short)]
+        yes: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show connected agents, stored accounts and recent usage
     Status,
     /// List the models the running gateway serves
@@ -163,6 +172,7 @@ async fn run() -> anyhow::Result<()> {
                 url: url.unwrap_or_else(|| gw::connect::default_url(cfg.listen)),
                 key: read_key(key_file.as_deref())?,
                 dry_run,
+                models: model_ids(&cfg).await.unwrap_or_default(),
                 state_dir: cfg.state_dir,
             };
             report(gw::connect::connect(&agent, &opts, &gw::connect::home()?)?);
@@ -183,6 +193,7 @@ async fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Models { json } => models(&cfg, json).await,
+        Cmd::Setup { yes, dry_run } => setup(cfg, yes, dry_run).await,
         Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
         Cmd::Login {
             provider,
@@ -242,8 +253,8 @@ fn accounts(state_dir: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// `gw models`: ask the running gateway what it serves.
-async fn models(cfg: &gw::config::Config, json: bool) -> anyhow::Result<()> {
+/// Ask the running gateway for its model list (raw JSON body).
+async fn fetch_models(cfg: &gw::config::Config) -> anyhow::Result<Vec<u8>> {
     let mut req =
         reqwest::Client::new().get(format!("{}/models", gw::connect::default_url(cfg.listen)));
     if let Some(key) = read_key(cfg.api_key_file.as_deref())? {
@@ -261,18 +272,97 @@ async fn models(cfg: &gw::config::Config, json: bool) -> anyhow::Result<()> {
         .error_for_status()?
         .bytes()
         .await?;
-    if json {
-        println!("{}", String::from_utf8_lossy(&bytes));
-        return Ok(());
-    }
-    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
-    for id in body["data"]
+    Ok(bytes.to_vec())
+}
+
+async fn model_ids(cfg: &gw::config::Config) -> anyhow::Result<Vec<String>> {
+    let body: serde_json::Value = serde_json::from_slice(&fetch_models(cfg).await?)?;
+    Ok(body["data"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|m| m["id"].as_str())
-    {
+        .filter_map(|m| m["id"].as_str().map(str::to_owned))
+        .collect())
+}
+
+/// `gw models`: ask the running gateway what it serves.
+async fn models(cfg: &gw::config::Config, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", String::from_utf8_lossy(&fetch_models(cfg).await?));
+        return Ok(());
+    }
+    for id in model_ids(cfg).await? {
         println!("{id}");
+    }
+    Ok(())
+}
+
+/// `gw setup`: detect coding tools, let the user pick, connect them with the model list.
+async fn setup(cfg: gw::config::Config, yes: bool, dry_run: bool) -> anyhow::Result<()> {
+    let home = gw::connect::home()?;
+    let url = gw::connect::default_url(cfg.listen);
+    let models = match model_ids(&cfg).await {
+        Ok(models) => models,
+        Err(e) => anyhow::bail!("{e:#}\nstart it first: gw serve"),
+    };
+    let accounts = accounts(&cfg.state_dir)?;
+    gw::ui::heading("Gateway");
+    gw::ui::ok(&format!("{url}: running, {} models", models.len()));
+    for line in &accounts {
+        gw::ui::info(line);
+    }
+    let found = gw::connect::detect(&home);
+    if found.is_empty() {
+        gw::ui::warn("no coding tools found (looked for pi, opencode, claude, codex)");
+        return Ok(());
+    }
+    gw::ui::heading("Coding tools");
+    for (i, agent) in found.iter().enumerate() {
+        gw::ui::info(&format!("{}. {agent}", i + 1));
+    }
+    let chosen: Vec<&str> = if yes {
+        found.clone()
+    } else {
+        let answer = gw::ui::prompt("Connect which? (numbers like 1,3; Enter for all; n for none)");
+        match answer.as_str() {
+            "" => found.clone(),
+            "n" | "none" => Vec::new(),
+            list => list
+                .split(',')
+                .filter_map(|n| n.trim().parse::<usize>().ok())
+                .filter_map(|n| n.checked_sub(1).and_then(|i| found.get(i)).copied())
+                .collect(),
+        }
+    };
+    if chosen.is_empty() {
+        gw::ui::info("nothing selected");
+        return Ok(());
+    }
+    let key_file = cfg.api_key_file.clone();
+    let opts = gw::connect::Connect {
+        url,
+        key: read_key(key_file.as_deref())?,
+        dry_run,
+        models,
+        state_dir: cfg.state_dir,
+    };
+    if !yes && !dry_run {
+        for agent in &chosen {
+            report(gw::connect::connect(
+                agent,
+                &gw::connect::Connect {
+                    dry_run: true,
+                    ..opts.clone()
+                },
+                &home,
+            )?);
+        }
+        if !gw::ui::confirm("Apply?", true) {
+            return Ok(());
+        }
+    }
+    for agent in chosen {
+        report(gw::connect::connect(agent, &opts, &home)?);
     }
     Ok(())
 }
