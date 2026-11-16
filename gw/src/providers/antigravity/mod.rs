@@ -50,7 +50,7 @@ impl Antigravity {
         };
         let Some(project) = account
             .extra
-            .get("project")
+            .get("project_id")
             .filter(|project| !project.is_empty())
         else {
             return Err(Fatal::new(

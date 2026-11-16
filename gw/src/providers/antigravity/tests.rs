@@ -90,7 +90,7 @@ async fn upstream_with(
 
 fn account() -> Account {
     let mut extra = std::collections::BTreeMap::new();
-    extra.insert("project".to_owned(), "proj-1".to_owned());
+    extra.insert("project_id".to_owned(), "proj-1".to_owned());
     Account {
         id: "a1".into(),
         credential: Credential::OAuth {
