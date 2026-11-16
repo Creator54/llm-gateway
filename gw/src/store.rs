@@ -682,3 +682,21 @@ mod tests {
         assert!((anthropic.cache_read_share - 30.0 / 60.0).abs() < 1e-9);
     }
 }
+
+/// Replace each row's account id with the label the user gave that account.
+pub fn label_accounts(
+    rows: &mut [UsageSummary],
+    state_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let names: std::collections::HashMap<String, String> = crate::creds::Store::load(state_dir)?
+        .all()
+        .into_iter()
+        .filter_map(|e| e.label.map(|label| (e.id, label)))
+        .collect();
+    for row in rows {
+        if let Some(label) = names.get(&row.account) {
+            row.account.clone_from(label);
+        }
+    }
+    Ok(())
+}

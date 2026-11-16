@@ -223,6 +223,7 @@ pub fn usage(state_dir: &Path) -> anyhow::Result<Vec<String>> {
     let store = crate::store::Store::open(state_dir)?;
     let since = crate::store::now_secs() - (DAYS * 86_400) as i64;
     let mut summary = store.usage_summary(since)?;
+    crate::store::label_accounts(&mut summary, state_dir)?;
     if summary.is_empty() {
         return Ok(vec![format!("no usage in the last {DAYS} days")]);
     }

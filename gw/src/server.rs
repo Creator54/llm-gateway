@@ -696,7 +696,7 @@ impl Gateway {
                     self.remember(&session, &route, &target, &id, index);
                     // Clearing on success keeps the gauge honest after a recovery.
                     self.metrics.set_cooling(&target.provider, &id, false);
-                    return Some(self.adapter_reply(reply, plan.clone(), started, &id));
+                    return Some(self.adapter_reply(reply, plan.clone(), started, &id, &target));
                 }
                 // The same account must not be tried twice in one request.
                 AttemptResult::Cooled(failure) => {
@@ -1019,11 +1019,15 @@ impl Gateway {
         plan: Plan,
         started: Instant,
         account: &str,
+        target: &combo::Target,
     ) -> Response {
         let status = StatusCode::from_u16(reply.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
         // Label the counters with the account that actually served this request.
         info.account = account.to_owned();
+        // A combo request counts under the provider model that really answered it.
+        info.provider.clone_from(&target.provider);
+        info.model.clone_from(&target.model);
         let sse = is_event_stream(&reply.headers);
         let mut headers = HeaderMap::new();
         for (name, value) in &reply.headers {

@@ -433,17 +433,7 @@ async fn stats(cfg: &gw::config::Config, since: &str, json: bool) -> anyhow::Res
         .unwrap_or(0);
     let store = gw::store::Store::open(state_dir)?;
     let mut rows = store.usage_summary(now - seconds)?;
-    // Usage is keyed by account id; show the name the user gave it.
-    let names: std::collections::HashMap<String, String> = gw::creds::Store::load(state_dir)?
-        .all()
-        .into_iter()
-        .filter_map(|e| e.label.map(|label| (e.id, label)))
-        .collect();
-    for row in &mut rows {
-        if let Some(label) = names.get(&row.account) {
-            row.account.clone_from(label);
-        }
-    }
+    gw::store::label_accounts(&mut rows, state_dir)?;
 
     if json {
         // Hand-rolled so the shape stays stable and needs no derive.
