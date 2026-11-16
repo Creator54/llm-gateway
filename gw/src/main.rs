@@ -1,3 +1,4 @@
+use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -10,11 +11,11 @@ const HELP_TEMPLATE: &str = "\
 const EXAMPLES: &str = "\
 Examples:
   gw serve                      run the gateway
-  gw connect pi                 point pi at the gateway
-  gw login anthropic            log in and store the account
-  gw account list               show stored accounts
+  gw login anthropic work       log in and name the account \"work\"
+  gw setup                      connect the coding tools found on this machine
+  gw models --refresh           update model lists from the providers
   gw status                     show agents, accounts and usage
-  gw models                     list models the running gateway serves";
+  gw account list               show stored accounts";
 
 #[derive(Parser)]
 #[command(
@@ -39,7 +40,7 @@ enum Cmd {
     Serve,
     /// Point an agent's config at this gateway
     Connect {
-        /// One of: pi, opencode, claude, codex
+        #[arg(value_parser = PossibleValuesParser::new(gw::connect::AGENTS))]
         agent: String,
         /// Base URL to write (default: http://<listen>/v1)
         #[arg(long)]
@@ -53,7 +54,7 @@ enum Cmd {
     },
     /// Restore the values `gw connect` replaced
     Disconnect {
-        /// One of: pi, opencode, claude, codex
+        #[arg(value_parser = PossibleValuesParser::new(gw::connect::AGENTS))]
         agent: String,
     },
     /// Find installed coding tools and point the ones you choose at this gateway
@@ -72,7 +73,7 @@ enum Cmd {
         /// Ask the providers for their live model lists first
         #[arg(long)]
         refresh: bool,
-        /// Print the raw JSON list
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
@@ -81,27 +82,23 @@ enum Cmd {
         /// Window to summarise, e.g. 24h, 7d, 30m
         #[arg(long, default_value = "24h")]
         since: String,
-        /// Print rows as JSON
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
     /// Log in to a provider and store the account
     Login {
-        /// One of: anthropic, openai, antigravity, kiro, command-code, opencode
+        #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
         provider: String,
-        /// Account label, same as --label
-        #[arg(conflicts_with = "label")]
-        name: Option<String>,
+        /// Account label (default: the provider name)
+        label: Option<String>,
         /// Force the device-code flow (openai only)
         #[arg(long)]
         device: bool,
         /// Print the URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
-        /// Account label (default: the provider name)
-        #[arg(long)]
-        label: Option<String>,
-        /// Machine-readable output
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
@@ -122,23 +119,23 @@ enum AccountCmd {
         /// Show what would be stored without writing
         #[arg(long)]
         dry_run: bool,
-        /// Machine-readable output
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
     /// List stored accounts
     List {
-        /// Machine-readable output
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
     /// Remove one stored account
     Remove {
-        /// Provider name, as shown by `gw account list`
+        #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
         provider: String,
         /// Account id, as shown by `gw account list`
         id: String,
-        /// Machine-readable output and no confirmation prompt
+        /// Print JSON and skip the confirmation prompt
         #[arg(long)]
         json: bool,
     },
@@ -208,17 +205,16 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Stats { since, json } => stats(&cfg.state_dir, &since, json),
         Cmd::Login {
             provider,
-            name,
+            label,
             device,
             no_browser,
-            label,
             json,
         } => {
             let args = gw::login::cli::Login {
                 provider,
                 device,
                 no_browser,
-                label: label.or(name),
+                label,
                 json,
             };
             gw::login::cli::login(args, cfg.state_dir).await
