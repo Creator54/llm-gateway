@@ -456,7 +456,7 @@ async fn collect(response: reqwest::Response, session: &Session) -> Result<Value
             );
             if drain(response, &mut retry).await.is_ok() {
                 retry.finish();
-                if retry.produced_output() {
+                if retry.delivered() {
                     return Ok(retry.completion());
                 }
             }
@@ -505,7 +505,7 @@ fn stream_reply(response: reqwest::Response, session: Session) -> Reply {
                 );
                 if pump(retry, &mut second, &mut sink, &tx).await.is_ok() {
                     let mut retry_chunks = second.finish();
-                    if second.produced_output() {
+                    if second.delivered() {
                         for chunk in retry_chunks {
                             if tx.send(Ok(sink.push(&chunk))).await.is_err() {
                                 return;

@@ -808,3 +808,86 @@ async fn turns_without_token_usage_report_an_estimate() {
     assert!(usage["prompt_tokens"].as_u64().unwrap() > 0, "{usage}");
     assert_eq!(usage["completion_tokens"], 6, "20 chars / 3.5");
 }
+
+fn event(kind: &str, payload: &Value) -> Vec<u8> {
+    encode_message(
+        &[(":message-type", "event"), (":event-type", kind)],
+        payload.to_string().as_bytes(),
+    )
+}
+
+fn talk(text: &str) -> Vec<u8> {
+    let mut body = event(
+        "assistantResponseEvent",
+        &serde_json::json!({ "content": text }),
+    );
+    body.extend(event(
+        "metadataEvent",
+        &serde_json::json!({ "stopReason": "END_TURN" }),
+    ));
+    body
+}
+
+/// Chat reply text, streamed and collected, after a first attempt that only talked, then `retry`.
+async fn content_after_retry(retry: Vec<u8>) -> [String; 2] {
+    let mut texts = [String::new(), String::new()];
+    for (text, stream) in texts.iter_mut().zip([true, false]) {
+        let events = || vec![("content-type", "application/vnd.amazon.eventstream")];
+        let (base, _) = scripted(vec![
+            (200, events(), talk("gwtest")),
+            (200, events(), retry.clone()),
+        ])
+        .await;
+        let reply = provider(&base)
+            .send(
+                &request(Inbound::Chat, chat_body(stream), stream),
+                &account(&[], "aoa-token"),
+            )
+            .await
+            .expect("reply");
+        let mut bytes = Vec::new();
+        let mut body = reply.body;
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.expect("chunk"));
+        }
+        let bytes = String::from_utf8(bytes).expect("utf8");
+        if !stream {
+            let body: Value = serde_json::from_str(&bytes).expect("json");
+            *text = body["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("content")
+                .to_owned();
+            continue;
+        }
+        for data in bytes.lines().filter_map(|line| line.strip_prefix("data: ")) {
+            if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+                text.push_str(
+                    chunk["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+    texts
+}
+
+#[tokio::test]
+async fn a_retry_answer_supersedes_the_retry_preamble() {
+    let mut retry = event(
+        "assistantResponseEvent",
+        &serde_json::json!({ "content": "The output is:\n\n" }),
+    );
+    retry.extend(event(
+        "toolUseEvent",
+        &serde_json::json!({ "name": "codex_kiro_final_answer", "toolUseId": "c1",
+            "input": "{\"answer\":\"gwtest\"}", "stop": true }),
+    ));
+    assert_eq!(content_after_retry(retry).await, ["gwtest", "gwtest"]);
+}
+
+#[tokio::test]
+async fn a_retry_that_only_talks_keeps_the_first_answer() {
+    let retry = talk("I don't have an existing task to continue.");
+    assert_eq!(content_after_retry(retry).await, ["gwtest", "gwtest"]);
+}

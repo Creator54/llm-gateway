@@ -191,6 +191,8 @@ pub(super) struct Translator {
     names: ToolNames,
     /// Text stays staged until the turn is known to have delivered its answer.
     defer: bool,
+    /// Whether a turn that only talked may be retried once to demand the answer.
+    may_retry: bool,
     staged: Vec<Value>,
     text: String,
     calls: Vec<Value>,
@@ -222,8 +224,9 @@ impl Translator {
         Self {
             model: model.to_owned(),
             names,
-            // Only the demanding attempt stages text; the bounded retry's text is the answer.
-            defer: mode == CompletionMode::Required,
+            // A completion answer supersedes the text staged before it, on either attempt.
+            defer: mode != CompletionMode::Disabled,
+            may_retry: mode == CompletionMode::Required,
             staged: Vec::new(),
             text: String::new(),
             calls: Vec::new(),
@@ -347,9 +350,10 @@ impl Translator {
         self.needs_fallback.then(|| self.text.clone())
     }
 
-    /// Whether the turn produced anything the client can see.
-    pub(super) fn produced_output(&self) -> bool {
-        self.answered || self.saw_real_tool || !self.text.trim().is_empty()
+    /// Whether the turn delivered its answer or did real work. A retry that only talks again
+    /// usually asks what the task is, so the first attempt's text is the better answer.
+    pub(super) fn delivered(&self) -> bool {
+        self.answered || self.saw_real_tool
     }
 
     /// Release staged progress text as the final answer when no retry is possible.
@@ -368,7 +372,7 @@ impl Translator {
         if self.finished {
             return Vec::new();
         }
-        if self.defer && !self.answered && !self.saw_real_tool && !self.text.trim().is_empty() {
+        if self.may_retry && !self.answered && !self.saw_real_tool && !self.text.trim().is_empty() {
             let retry_stop = matches!(
                 self.stop_reason.as_deref(),
                 None | Some("END_TURN") | Some("STOP_SEQUENCE")
