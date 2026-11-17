@@ -297,40 +297,73 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// One line per provider: how many accounts, and how many need a new login.
-fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<Vec<String>> {
+/// One line per provider, accounts grouped by state, then one hint per action needed.
+fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let all = gw::creds::Store::load(state_dir)?.all();
-    let mut by: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    let now = gw::login::now_secs();
+    // provider -> state -> names; "" is the usable group and sorts first.
+    let mut by: std::collections::BTreeMap<&str, std::collections::BTreeMap<String, Vec<String>>> =
+        Default::default();
     // opencode serves its free models without a login.
     if !all.iter().any(|e| e.provider == "opencode") {
-        by.insert("opencode", vec!["free tier (no login)".into()]);
+        by.entry("opencode")
+            .or_default()
+            .insert(String::new(), vec!["free tier (no login)".into()]);
     }
+    let mut login = false;
+    let mut recheck: Option<u64> = None;
     for e in &all {
-        let name = e.label.as_deref().unwrap_or(&e.id);
-        let now = gw::login::now_secs();
-        let flag = match (e.needs_reauth, e.paused, e.disabled_until) {
-            (true, ..) => " (needs login)".to_owned(),
-            (_, true, _) => " (paused)".to_owned(),
-            (.., Some(until)) if until > now => format!(
-                " (disabled by provider, rechecks in {}h or `gw account recheck {} {name}`)",
-                (until - now).div_ceil(3600),
-                e.provider
-            ),
-            (.., Some(_)) => " (disabled by provider, rechecks on next request)".to_owned(),
+        let state = match (e.needs_reauth, e.paused, e.disabled_until) {
+            (true, ..) => {
+                login = true;
+                "needs login".to_owned()
+            }
+            (_, true, _) => "paused".to_owned(),
+            (.., Some(until)) => {
+                let left = until.saturating_sub(now);
+                recheck = Some(recheck.map_or(left, |r| r.max(left)));
+                "disabled by provider".to_owned()
+            }
             _ => String::new(),
         };
+        let name = e.label.as_deref().unwrap_or(&e.id);
         let email = match e.email() {
             Some(email) if emails => format!(" <{email}>"),
             _ => String::new(),
         };
         by.entry(&e.provider)
             .or_default()
-            .push(format!("{name}{email}{flag}"));
+            .entry(state)
+            .or_default()
+            .push(format!("{name}{email}"));
     }
-    Ok(by
+    let lines = by
         .into_iter()
-        .map(|(p, names)| format!("{p}: {}", names.join(", ")))
-        .collect())
+        .map(|(provider, states)| {
+            let groups: Vec<String> = states
+                .into_iter()
+                .map(|(state, names)| match state.as_str() {
+                    "" => names.join(", "),
+                    _ => format!("{state}: {}", names.join(", ")),
+                })
+                .collect();
+            format!("{provider}: {}", groups.join("; "))
+        })
+        .collect();
+    let mut hints = Vec::new();
+    if login {
+        hints.push("log in again: gw login <provider> <account>".to_owned());
+    }
+    if let Some(left) = recheck {
+        let when = match left {
+            0 => "on the next request".to_owned(),
+            left => format!("within {}", gw::quota::duration(left)),
+        };
+        hints.push(format!(
+            "disabled accounts recheck {when}, or now: gw account recheck <provider> <account>"
+        ));
+    }
+    Ok((lines, hints))
 }
 
 /// Ask the running gateway for its model list (raw JSON body).
@@ -462,7 +495,7 @@ async fn setup(cfg: gw::config::Config, yes: bool, dry_run: bool) -> anyhow::Res
         Ok(models) => models,
         Err(e) => anyhow::bail!("{e:#}\nstart it first: gw serve"),
     };
-    let accounts = accounts(&cfg.state_dir, false)?;
+    let (accounts, _) = accounts(&cfg.state_dir, false)?;
     gw::ui::heading("Gateway");
     gw::ui::ok(&format!("{url}: running, {} models", models.len()));
     for line in &accounts {
@@ -581,16 +614,28 @@ async fn status(
         return Ok(());
     }
 
-    report(gw::connect::status(&gw::connect::home()?, state_dir)?);
-    report(accounts(state_dir, emails)?);
     let ui = gw::ui::Ui::from_env();
+    ui.heading("agents");
+    report(gw::connect::status(&gw::connect::home()?, state_dir)?);
+    let (lines, hints) = accounts(state_dir, emails)?;
+    ui.heading("\naccounts");
+    report(lines);
+    for hint in hints {
+        ui.hint(&hint);
+    }
     if rows.is_empty() {
         println!("\nno usage in the last {since}");
     } else {
-        rows.sort_by_key(|row| std::cmp::Reverse(row.requests));
+        // Group by provider, busiest first within each.
+        rows.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then(b.requests.cmp(&a.requests))
+        });
         let prices = gw::pricing::Prices::load(state_dir).await;
-        let (headers, cells) = gw::metrics::stats_table(&rows, &prices);
-        println!(
+        let (headers, mut cells) = gw::metrics::stats_table(&rows, &prices);
+        blank_repeats(&mut cells, 1);
+        print!(
             "\n{}",
             ui.render_table(
                 &headers,
@@ -599,9 +644,25 @@ async fn status(
         );
     }
     combos(cfg, state_dir, &ui).await;
+    // Accounts that need a login are already flagged above; their figures are stale.
+    let relogin: Vec<(String, String)> = gw::creds::Store::load(state_dir)?
+        .all()
+        .into_iter()
+        .filter(|e| e.needs_reauth)
+        .map(|e| (e.provider.clone(), e.label.unwrap_or(e.id)))
+        .collect();
+    let skip =
+        |provider: &str, account: &str| relogin.iter().any(|(p, a)| p == provider && a == account);
+    let mut windows: Vec<_> = windows
+        .into_iter()
+        .filter(|w| !skip(&w.provider, &w.account))
+        .collect();
+    windows.sort_by(|a, b| {
+        (&a.provider, &a.account, &a.name).cmp(&(&b.provider, &b.account, &b.name))
+    });
     if !windows.is_empty() {
         let now = gw::login::now_secs();
-        let cells: Vec<Vec<String>> = windows
+        let mut cells: Vec<Vec<String>> = windows
             .iter()
             .map(|w| {
                 let stale = failures
@@ -622,8 +683,9 @@ async fn status(
                 ]
             })
             .collect();
+        blank_repeats(&mut cells, 2);
         let headers = ["provider", "account", "window", "used", "resets in"];
-        println!(
+        print!(
             "\n{}",
             ui.render_table(
                 &headers,
@@ -631,7 +693,7 @@ async fn status(
             )
         );
     }
-    for f in failures {
+    for f in failures.iter().filter(|f| !skip(&f.provider, &f.account)) {
         gw::ui::warn(&format!(
             "quota: {} {}: {}",
             f.provider, f.account, f.message
@@ -733,13 +795,25 @@ async fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
         }
     }
     let headers = ["combo", "strategy", "#", "provider", "model"];
-    println!(
+    print!(
         "\n{}",
         ui.render_table(
             &headers,
             &views(&cells).iter().map(Vec::as_slice).collect::<Vec<_>>()
         )
     );
+}
+
+/// Blank a leading cell that repeats the row above, for the first `depth` columns.
+fn blank_repeats(cells: &mut [Vec<String>], depth: usize) {
+    for row in (1..cells.len()).rev() {
+        let same = (0..depth)
+            .take_while(|&col| cells[row][col] == cells[row - 1][col])
+            .count();
+        for cell in &mut cells[row][..same] {
+            cell.clear();
+        }
+    }
 }
 
 fn views(cells: &[Vec<String>]) -> Vec<Vec<&str>> {
@@ -782,4 +856,34 @@ fn read_key(path: Option<&Path>) -> anyhow::Result<Option<String>> {
         anyhow::bail!("{}: empty key", path.display());
     }
     Ok(Some(key))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn blank_repeats_keeps_only_the_first_of_each_group() {
+        let mut cells: Vec<Vec<String>> = [
+            ["a", "x", "1"],
+            ["a", "x", "2"],
+            ["a", "y", "3"],
+            ["b", "y", "4"],
+        ]
+        .iter()
+        .map(|r| r.iter().map(|c| (*c).to_owned()).collect())
+        .collect();
+        super::blank_repeats(&mut cells, 2);
+        let got: Vec<Vec<&str>> = cells
+            .iter()
+            .map(|r| r.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ["a", "x", "1"],
+                ["", "", "2"],
+                ["", "y", "3"],
+                ["b", "y", "4"]
+            ]
+        );
+    }
 }
