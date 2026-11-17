@@ -737,6 +737,23 @@ impl Gateway {
                     last = Some(failure);
                     tried.push((target.provider.clone(), id));
                 }
+                // A combo skips a target whose model is gone and rechecks it after a while.
+                AttemptResult::Stop(provider::Failure::Fatal { status, body })
+                    if route.combo.is_some() && model_unavailable(status, &body) =>
+                {
+                    tracing::warn!(
+                        provider = %target.provider,
+                        model = %target.model,
+                        %status,
+                        "model unavailable; skipping the target"
+                    );
+                    self.lock_pool().set_unavailable(
+                        &target.provider,
+                        &target.model,
+                        Instant::now() + pool::UNAVAILABLE_COOLDOWN,
+                    );
+                    last = Some(provider::Failure::Fatal { status, body });
+                }
                 AttemptResult::Stop(failure @ provider::Failure::Fatal { .. }) => {
                     return Some(failure_reply(shape, failure));
                 }
@@ -1644,6 +1661,29 @@ struct Route {
     pin: Option<String>,
 }
 
+/// The provider does not serve the requested model: missing, retired or not entitled.
+/// Any other client error is the request's own fault and goes back unchanged.
+fn model_unavailable(status: StatusCode, body: &[u8]) -> bool {
+    if status == StatusCode::NOT_FOUND {
+        return true;
+    }
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_lowercase();
+    text.contains("model")
+        && [
+            "not found",
+            "not supported",
+            "does not exist",
+            "deprecated",
+            "no longer available",
+            "unavailable",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
 /// How one send on one account ended.
 enum AttemptResult {
     Served(provider::Reply),
@@ -1780,6 +1820,22 @@ mod tests {
 
     use axum::extract::Path;
     use serde_json::{json, Value};
+
+    #[test]
+    fn only_missing_models_count_as_unavailable() {
+        let bad = StatusCode::BAD_REQUEST;
+        assert!(model_unavailable(StatusCode::NOT_FOUND, b"{}"));
+        assert!(model_unavailable(
+            bad,
+            br#"{"error":{"message":"The model `x` does not exist"}}"#
+        ));
+        assert!(model_unavailable(bad, b"model x is deprecated"));
+        assert!(!model_unavailable(bad, b"messages: field required"));
+        assert!(!model_unavailable(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            b"model not found"
+        ));
+    }
 
     static KEY_N: AtomicUsize = AtomicUsize::new(0);
 

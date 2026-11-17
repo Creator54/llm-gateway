@@ -161,6 +161,13 @@ impl<'a> Attempt<'a> {
     /// A target with no usable account is skipped; `retry_after` reports why.
     fn try_target(&mut self, index: usize) -> Option<(&'a Target, String)> {
         let target = &self.combo.targets[index];
+        if self
+            .pool
+            .unavailable_until(&target.provider, &target.model, self.now)
+            .is_some()
+        {
+            return None;
+        }
         let account = self
             .pool
             .pick(&target.provider, self.session, None, self.now)?;
@@ -211,7 +218,16 @@ impl<'a> Attempt<'a> {
         self.combo
             .targets
             .iter()
-            .filter_map(|target| self.pool.earliest_free(&target.provider, None, self.now))
+            .filter_map(|target| {
+                let free = self.pool.earliest_free(&target.provider, None, self.now);
+                match self
+                    .pool
+                    .unavailable_until(&target.provider, &target.model, self.now)
+                {
+                    Some(until) => Some(free.map_or(until, |free| free.max(until))),
+                    None => free,
+                }
+            })
             .min()
     }
 }
@@ -272,6 +288,20 @@ mod tests {
             .map(|(t, _)| t.provider.as_str())
             .collect();
         assert_eq!(models, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn unavailable_models_sit_out_until_their_recheck() {
+        let mut pool = pool(&[("a", "a1"), ("b", "b1")]);
+        let combo = combo(Strategy::Failover, &["a", "b"]);
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        pool.set_unavailable("a", "m", until);
+        let mut attempts = combo.attempt(&mut pool, "s1", now);
+        assert_eq!(attempts.next().unwrap().0.provider, "b");
+        drop(attempts);
+        let mut attempts = combo.attempt(&mut pool, "s2", until);
+        assert_eq!(attempts.next().unwrap().0.provider, "a");
     }
 
     #[test]

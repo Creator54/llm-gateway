@@ -14,6 +14,8 @@ const QUOTA_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const AUTH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// How long a provider-disabled account sits out before one request rechecks it.
 pub const DISABLED_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+/// How long a target whose model the provider does not serve sits out before a recheck.
+pub const UNAVAILABLE_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 /// Sessions untouched for this long are dropped.
 const SESSION_IDLE: Duration = Duration::from_secs(60 * 60);
 /// Idle sweeps run at most once per interval, keeping the insert path cheap.
@@ -98,6 +100,8 @@ pub struct Pool {
     rotation: u64,
     /// When the session map was last swept for idle entries.
     swept: Option<Instant>,
+    /// (provider, model) pairs the provider reported missing, until their recheck.
+    unavailable: HashMap<(String, String), Instant>,
 }
 
 /// An account as the account commands report it.
@@ -127,6 +131,20 @@ impl Pool {
             cooldown: None,
             assigned: 0,
         });
+    }
+
+    /// Sit a model out on one provider until `until`; the first request after it rechecks.
+    pub fn set_unavailable(&mut self, provider: &str, model: &str, until: Instant) {
+        self.unavailable
+            .insert((provider.to_owned(), model.to_owned()), until);
+    }
+
+    /// When a model sitting out on a provider may be tried again; `None` when it may now.
+    pub fn unavailable_until(&self, provider: &str, model: &str, now: Instant) -> Option<Instant> {
+        self.unavailable
+            .get(&(provider.to_owned(), model.to_owned()))
+            .copied()
+            .filter(|until| *until > now)
     }
 
     /// Pause or resume an account; unknown accounts are ignored.

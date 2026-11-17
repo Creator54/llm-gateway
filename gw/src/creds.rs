@@ -422,6 +422,8 @@ impl Store {
                 self.save()?;
                 Ok(Some(updated))
             }
+            // The endpoint never answered: keep the account and try again next request.
+            Err(err) if unreachable(&err) => Err(err),
             Err(err) => {
                 let mut failed = entry;
                 failed.needs_reauth = true;
@@ -493,6 +495,15 @@ fn warn_loose_dir(dir: &Path) {
 }
 
 /// First 200 chars of a refresh error; the refresher must keep tokens out of its message.
+/// A transport failure (DNS, connect, timeout) rather than a refused refresh.
+fn unreachable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+            e.status().is_none() && (e.is_connect() || e.is_timeout() || e.is_request())
+        })
+    })
+}
+
 fn brief(err: &anyhow::Error) -> String {
     err.to_string().chars().take(200).collect()
 }
@@ -1099,6 +1110,22 @@ mod tests {
         }
     }
 
+    struct DownRefresher;
+
+    impl Refresher for DownRefresher {
+        fn refresh<'a>(&'a self, _cred: &'a OAuthCred) -> BoxFuture<'a, anyhow::Result<OAuthCred>> {
+            Box::pin(async move {
+                // Nothing listens on port 1.
+                let err = reqwest::Client::new()
+                    .post("http://127.0.0.1:1/token")
+                    .send()
+                    .await
+                    .unwrap_err();
+                Err(anyhow::Error::new(err).context("token refresh"))
+            })
+        }
+    }
+
     struct FailingRefresher {
         calls: AtomicUsize,
     }
@@ -1206,6 +1233,19 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unreachable_token_endpoint_does_not_mark_the_entry() {
+        let dir = TempDir::new("refresh-down");
+        let store = Store::load(&dir.0).unwrap();
+        store.upsert(oauth_entry("anthropic", "a1", 1_000));
+        let refresher = DownRefresher;
+        assert!(store
+            .refresh_if_due(&refresher, "anthropic", "a1", 900, DEFAULT_SKEW_SECS)
+            .await
+            .is_err());
+        assert!(!store.get("anthropic", "a1").unwrap().needs_reauth);
     }
 
     #[tokio::test]
