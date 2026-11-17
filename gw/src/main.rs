@@ -255,7 +255,14 @@ async fn run() -> anyhow::Result<()> {
             }
             models(&cfg, json).await
         }
-        Cmd::Setup { yes, dry_run } => setup(cfg, yes, dry_run).await,
+        Cmd::Setup { yes, dry_run } => {
+            let config = cli
+                .config
+                .or_else(|| std::env::var_os("GW_CONFIG").map(PathBuf::from))
+                .map(std::path::absolute)
+                .transpose()?;
+            setup(cfg, config.as_deref(), yes, dry_run).await
+        }
         Cmd::Login {
             provider,
             label,
@@ -499,9 +506,17 @@ fn account_models(cfg: &gw::config::Config) -> anyhow::Result<()> {
 }
 
 /// `gw setup`: detect coding tools, let the user pick, connect them with the model list.
-async fn setup(cfg: gw::config::Config, yes: bool, dry_run: bool) -> anyhow::Result<()> {
+async fn setup(
+    cfg: gw::config::Config,
+    config: Option<&Path>,
+    yes: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let home = gw::connect::home()?;
     let url = gw::connect::default_url(cfg.listen);
+    if !dry_run && gw::service::available() {
+        install_service(&cfg, &home, config, yes).await?;
+    }
     let models = match model_ids(&cfg).await {
         Ok(models) => models,
         Err(e) => anyhow::bail!("{e:#}\nstart it first: gw serve"),
@@ -566,6 +581,44 @@ async fn setup(cfg: gw::config::Config, yes: bool, dry_run: bool) -> anyhow::Res
         report(gw::connect::connect(agent, &opts, &home)?);
     }
     Ok(())
+}
+
+/// Offer to run the gateway as a systemd user service, then make sure it is up.
+async fn install_service(
+    cfg: &gw::config::Config,
+    home: &Path,
+    config: Option<&Path>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use gw::service;
+    let text = service::unit(&service::exe()?, config);
+    let installed = std::fs::read_to_string(service::unit_path(home)).is_ok();
+    if !installed {
+        if model_ids(cfg).await.is_ok() {
+            gw::ui::hint(
+                "gw is already running by hand; stop it and rerun setup to install the service",
+            );
+            return Ok(());
+        }
+        if !yes && !gw::ui::confirm("Run gw as a user service (starts at login)?", true) {
+            return Ok(());
+        }
+    }
+    let changed = service::write(home, &text)?;
+    service::systemctl(&["daemon-reload"])?;
+    service::systemctl(&["enable", "--quiet", service::NAME])?;
+    service::systemctl(&[if changed { "restart" } else { "start" }, service::NAME])?;
+    for _ in 0..20 {
+        if model_ids(cfg).await.is_ok() {
+            gw::ui::ok(&format!("service {}: running", service::NAME));
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    anyhow::bail!(
+        "service {} did not come up; see: journalctl --user -u gw",
+        service::NAME
+    )
 }
 
 fn report(lines: Vec<String>) {

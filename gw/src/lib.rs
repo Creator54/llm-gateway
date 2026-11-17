@@ -17,6 +17,7 @@ pub mod quota;
 pub mod route;
 pub mod rules;
 pub mod server;
+pub mod service;
 pub mod store;
 pub mod tidy;
 pub mod tokens;
