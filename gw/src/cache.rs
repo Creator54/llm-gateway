@@ -1,4 +1,4 @@
-//! Cache-friendly request edits: markers, stable prefixes, warming.
+//! Cache-friendly request edits: markers and stable prefixes.
 //!
 //! Every edit here is deterministic and fail-open: a body that does not parse,
 //! or does not look like the expected protocol, comes back byte-identical.
@@ -30,7 +30,8 @@ pub struct Options {
     pub markers: bool,
     /// Repair breakpoint TTL order.
     pub ttl_order: bool,
-    /// Use the 1h TTL on breakpoints this module adds.
+    /// Use the 1h TTL on breakpoints this module adds, so a pause of up to an
+    /// hour still hits; writes cost 2x input instead of 1.25x.
     pub ttl_1h: bool,
     /// Strip per-turn churn from a pi `<session-overview>` block.
     pub strip_volatile: bool,
@@ -44,7 +45,7 @@ impl Default for Options {
         Self {
             markers: true,
             ttl_order: true,
-            ttl_1h: false,
+            ttl_1h: true,
             strip_volatile: true,
             openai_cache_key: true,
         }
@@ -605,21 +606,18 @@ mod tests {
             block(&out, Spot::Tool(1)).unwrap()["cache_control"]["type"],
             "ephemeral"
         );
-        assert!(block(&out, Spot::Tool(1)).unwrap()["cache_control"]
-            .get("ttl")
-            .is_none());
-    }
-
-    #[test]
-    fn ttl_1h_marks_added_breakpoints() {
-        let opts = Options {
-            ttl_1h: true,
-            ..Options::default()
-        };
-        let out = anthropic_messages(sample(), &opts);
+        // Added breakpoints default to the 1h TTL.
         for spot in breakpoints(&out) {
             assert_eq!(block(&out, spot).unwrap()["cache_control"]["ttl"], "1h");
         }
+        let short = Options {
+            ttl_1h: false,
+            ..Options::default()
+        };
+        let out = anthropic_messages(sample(), &short);
+        assert!(block(&out, Spot::Tool(1)).unwrap()["cache_control"]
+            .get("ttl")
+            .is_none());
     }
 
     #[test]

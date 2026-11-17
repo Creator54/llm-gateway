@@ -267,36 +267,25 @@ impl Agent {
     fn files(self, opts: &Connect, home: &Path) -> anyhow::Result<Vec<WriteSet>> {
         let pi_models = home.join(".pi/agent/models.json");
         match self {
-            Agent::Pi => Ok(vec![
-                WriteSet {
-                    file: pi_models,
-                    kind: Kind::Json,
-                    changes: vec![
-                        (
-                            "providers.gateway.baseUrl".into(),
-                            Scalar::Str(opts.url.clone()),
-                        ),
-                        ("providers.gateway.apiKey".into(), Scalar::Str(key(opts))),
-                        (
-                            "providers.gateway.api".into(),
-                            Scalar::Str("openai-completions".into()),
-                        ),
-                    ]
-                    .into_iter()
-                    .chain(model_list(
-                        "providers.gateway.models",
-                        &opts.models,
-                        |id| serde_json::json!({ "id": id }),
-                    ))
-                    .collect(),
-                },
-                WriteSet {
-                    file: home.join(".pi/agent/settings.json"),
-                    kind: Kind::Json,
-                    // Gateway-side warming replaces pi's own, which would double bill.
-                    changes: vec![("cacheWarming".into(), Scalar::Str("off".into()))],
-                },
-            ]),
+            Agent::Pi => Ok(vec![WriteSet {
+                file: pi_models,
+                kind: Kind::Json,
+                changes: vec![
+                    ("providers.gw.baseUrl".into(), Scalar::Str(opts.url.clone())),
+                    ("providers.gw.apiKey".into(), Scalar::Str(key(opts))),
+                    (
+                        "providers.gw.api".into(),
+                        Scalar::Str("openai-completions".into()),
+                    ),
+                ]
+                .into_iter()
+                .chain(model_list(
+                    "providers.gw.models",
+                    &opts.models,
+                    |id| serde_json::json!({ "id": id }),
+                ))
+                .collect(),
+            }]),
             Agent::Opencode => {
                 let dir = home.join(".config/opencode");
                 let file = ["opencode.json", "opencode.jsonc"]
@@ -1070,7 +1059,7 @@ mod tests {
         let sandbox = Sandbox::new();
         sandbox.write(
             ".pi/agent/models.json",
-            r#"{"providers":{"gateway":{"baseUrl":"https://old.example/v1","api":"openai-completions","apiKey":"sk-old","models":{"m":{"id":"m"}}}}}"#,
+            r#"{"providers":{"gateway":{"baseUrl":"https://other.example/v1","apiKey":"sk-other"},"gw":{"baseUrl":"https://old.example/v1","api":"openai-completions","apiKey":"sk-old","models":{"m":{"id":"m"}}}}}"#,
         );
         sandbox.write(
             ".pi/agent/settings.json",
@@ -1091,21 +1080,23 @@ mod tests {
         );
 
         let models = sandbox.read_json(".pi/agent/models.json");
-        let gateway = &models["providers"]["gateway"];
+        let gateway = &models["providers"]["gw"];
         assert_eq!(gateway["baseUrl"], URL);
         assert_eq!(gateway["apiKey"], KEY);
         assert_eq!(gateway["api"], "openai-completions");
         assert!(gateway["models"]["m"].is_object());
+        // Other providers and pi's own cache warming are not ours to change.
+        assert_eq!(models["providers"]["gateway"]["apiKey"], "sk-other");
         assert_eq!(
             sandbox.read_json(".pi/agent/settings.json")["cacheWarming"],
-            "off"
+            "on"
         );
         assert_eq!(sandbox.backups(".pi/agent/models.json"), 1);
 
         let again = connect("pi", &opts, &sandbox.home()).unwrap();
         assert!(again.iter().all(|l| l.ends_with("unchanged")), "{again:?}");
         assert_eq!(sandbox.backups(".pi/agent/models.json"), 1);
-        assert_eq!(sandbox.backups(".pi/agent/settings.json"), 1);
+        assert_eq!(sandbox.backups(".pi/agent/settings.json"), 0);
     }
 
     #[test]
@@ -1116,7 +1107,7 @@ mod tests {
 
         // A later user edit must survive the restore.
         let mut models = sandbox.read_json(".pi/agent/models.json");
-        models["providers"]["gateway"]["models"]["extra"] = serde_json::json!({"id": "extra"});
+        models["providers"]["gw"]["models"]["extra"] = serde_json::json!({"id": "extra"});
         sandbox.write(
             ".pi/agent/models.json",
             &serde_json::to_string(&models).unwrap(),
@@ -1127,15 +1118,11 @@ mod tests {
 
         let models = sandbox.read_json(".pi/agent/models.json");
         assert_eq!(
-            models["providers"]["gateway"]["baseUrl"],
+            models["providers"]["gw"]["baseUrl"],
             "https://old.example/v1"
         );
-        assert_eq!(models["providers"]["gateway"]["apiKey"], "sk-old");
-        assert!(models["providers"]["gateway"]["models"]["extra"].is_object());
-        assert_eq!(
-            sandbox.read_json(".pi/agent/settings.json")["cacheWarming"],
-            "on"
-        );
+        assert_eq!(models["providers"]["gw"]["apiKey"], "sk-old");
+        assert!(models["providers"]["gw"]["models"]["extra"].is_object());
 
         let status = status(&sandbox.home(), &sandbox.state()).unwrap();
         assert_eq!(status, vec!["no agents connected".to_string()]);
@@ -1154,10 +1141,10 @@ mod tests {
         disconnect("pi", &sandbox.home(), &sandbox.state()).unwrap();
         let models = sandbox.read_json(".pi/agent/models.json");
         assert_eq!(
-            models["providers"]["gateway"]["baseUrl"],
+            models["providers"]["gw"]["baseUrl"],
             "https://old.example/v1"
         );
-        assert_eq!(models["providers"]["gateway"]["apiKey"], "sk-old");
+        assert_eq!(models["providers"]["gw"]["apiKey"], "sk-old");
     }
 
     #[test]
@@ -1166,7 +1153,7 @@ mod tests {
         connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap();
 
         let mut models = sandbox.read_json(".pi/agent/models.json");
-        models["providers"]["gateway"]["apiKey"] = serde_json::json!("sk-user-rotated");
+        models["providers"]["gw"]["apiKey"] = serde_json::json!("sk-user-rotated");
         sandbox.write(
             ".pi/agent/models.json",
             &serde_json::to_string(&models).unwrap(),
@@ -1178,9 +1165,9 @@ mod tests {
             "{lines:?}"
         );
         let models = sandbox.read_json(".pi/agent/models.json");
-        assert_eq!(models["providers"]["gateway"]["apiKey"], "sk-user-rotated");
+        assert_eq!(models["providers"]["gw"]["apiKey"], "sk-user-rotated");
         assert_eq!(
-            models["providers"]["gateway"]["baseUrl"],
+            models["providers"]["gw"]["baseUrl"],
             "https://old.example/v1"
         );
         // The drifted record stays recorded so a later disconnect can still reach it.
@@ -1229,20 +1216,6 @@ mod tests {
             & 0o777;
         assert_eq!(manifest, 0o600);
         assert_eq!(sandbox.mode(".pi/agent/models.json"), 0o600);
-        assert_eq!(sandbox.mode(".pi/agent/settings.json"), 0o600);
-    }
-
-    #[test]
-    fn manifest_is_saved_per_file_so_earlier_writes_stay_recorded() {
-        let sandbox = pi_sandbox();
-        // A directory where settings.json belongs makes the second write fail.
-        fs::remove_file(sandbox.home().join(".pi/agent/settings.json")).unwrap();
-        fs::create_dir(sandbox.home().join(".pi/agent/settings.json")).unwrap();
-
-        connect("pi", &sandbox.opts(URL, KEY), &sandbox.home()).unwrap_err();
-
-        let text = fs::read_to_string(Manifest::path(&sandbox.state())).unwrap();
-        assert!(text.contains("models.json"), "{text}");
     }
 
     #[test]
@@ -1566,7 +1539,7 @@ mod tests {
             &fs::read_to_string(sandbox.home().join(".pi/agent/models.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(pi["providers"]["gateway"]["models"][1]["id"], "c/d");
+        assert_eq!(pi["providers"]["gw"]["models"][1]["id"], "c/d");
         let oc: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(sandbox.home().join(".config/opencode/opencode.json")).unwrap(),
         )

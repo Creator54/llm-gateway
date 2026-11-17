@@ -86,9 +86,10 @@ Not done: ML compression, summarizing or dropping history.
 
 Success metric: cost per completed task and cache-read share, not tokens per request.
 
-Replaces client-side: pi-cache-optimizer, pi `cacheWarming`, the local
+Replaces client-side: pi-cache-optimizer, the local
 `extensions/opencodex-anthropic.ts` prompt rewrite (moves into the anthropic
-OAuth adapter for all agents).
+OAuth adapter for all agents). Pauses are covered by the 1h cache TTL on
+Anthropic breakpoints rather than keep-alive requests.
 
 ## Accounts
 
@@ -119,7 +120,7 @@ OAuth adapter for all agents).
 | Command | Effect |
 |---|---|
 | `gw install` | binary, config, systemd unit; NixOS via `services.llm-gateway` |
-| `gw connect <agent>` / `disconnect` | journaled base URL + key in pi/codex/claude/opencode configs; pi: drop compat flags, `cacheWarming=off`, remove pi-cache-optimizer once parity is shown |
+| `gw connect <agent>` / `disconnect` | journaled base URL + key in pi/codex/claude/opencode configs; pi: provider `gw` beside existing ones, drop compat flags, remove pi-cache-optimizer once parity is shown |
 | `gw uninstall [--purge]` | replay journal, stop unit; `--purge` removes credentials/state |
 | `gw doctor` | ports, credentials, expiry, upstream reachability, client config drift |
 | `gw status` | agents, accounts, quota, tokens, cache-read share and cost per provider/account |
