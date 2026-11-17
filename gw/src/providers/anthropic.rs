@@ -21,6 +21,8 @@ pub(crate) const API_VERSION: &str = "2023-06-01";
 const SDK_VERSION: &str = "0.74.0";
 const NODE_VERSION: &str = "22.11.0";
 pub(crate) const OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+/// `speed: "fast"` is a 400 without this beta.
+const FAST_BETA: &str = "fast-mode-2026-02-01";
 const CLAUDE_CODE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const TOOL_PREFIX: &str = "custom_";
 /// Anthropic's own tools keep their names under the OAuth prefix.
@@ -94,18 +96,15 @@ impl Provider for Anthropic {
         account: &'a Account,
     ) -> futures_util::future::BoxFuture<'a, Result<Reply, Failure>> {
         Box::pin(async move {
-            let plan = plan(&self.base_url, req, account)?;
-            let mut outbound = self.client.post(&plan.url);
-            for (name, value) in &plan.headers {
-                outbound = outbound.header(name.as_str(), value.as_str());
+            let fast = req.fast == Some(true) && fast_model(&req.model);
+            let mut plan = plan(&self.base_url, req, account, fast)?;
+            let mut resp = self.post(&plan).await?;
+            if fast && fast_refused(&mut resp).await {
+                // Fast mode is a separately entitled lane; Claude Code resends at standard speed.
+                tracing::debug!(model = %req.model, "fast mode refused; resending at standard speed");
+                plan = self::plan(&self.base_url, req, account, false)?;
+                resp = self.post(&plan).await?;
             }
-            let resp = match outbound.body(plan.body).send().await {
-                Ok(resp) => resp,
-                Err(error) => {
-                    tracing::debug!(%error, "anthropic request failed");
-                    return Err(Failure::Retryable);
-                }
-            };
             let reply = reply(resp, plan.stream, plan.renames).await?;
             match plan.chat {
                 Some(chat) => to_chat(reply, plan.stream, chat).await,
@@ -113,6 +112,52 @@ impl Provider for Anthropic {
             }
         })
     }
+}
+
+impl Anthropic {
+    async fn post(&self, plan: &Plan) -> Result<reqwest::Response, Failure> {
+        let mut outbound = self.client.post(&plan.url);
+        for (name, value) in &plan.headers {
+            outbound = outbound.header(name.as_str(), value.as_str());
+        }
+        outbound
+            .body(plan.body.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "anthropic request failed");
+                Failure::Retryable
+            })
+    }
+}
+
+/// Opus is the only family with a fast lane.
+fn fast_model(model: &str) -> bool {
+    model.contains("opus")
+}
+
+/// A 400 or 429 that names fast mode or the `speed` parameter, or an empty fast pool.
+/// Reads the body only for those statuses, which then go to the standard-speed resend.
+async fn fast_refused(resp: &mut reqwest::Response) -> bool {
+    let status = resp.status().as_u16();
+    if status != 400 && status != 429 {
+        return false;
+    }
+    let pool_empty = resp.headers().iter().any(|(name, value)| {
+        let name = name.as_str();
+        name.starts_with("anthropic-fast-") && name.ends_with("-tokens-remaining") && value == "0"
+    });
+    if pool_empty {
+        return true;
+    }
+    let body = read_capped(resp, MAX_ERROR_BODY).await;
+    let message = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_lowercase))
+        .unwrap_or_default();
+    message.contains("fast mode")
+        || message.contains("`speed`")
+        || message.contains("speed parameter")
 }
 
 /// `{origin}/v1/messages` from any base URL spelling.
@@ -183,7 +228,7 @@ fn protocol(inbound: Inbound) -> crate::translate::Inbound {
 }
 
 /// Decide the whole request: URL, headers in order, wire body.
-fn plan(base_url: &str, req: &Request, account: &Account) -> Result<Plan, Failure> {
+fn plan(base_url: &str, req: &Request, account: &Account, fast: bool) -> Result<Plan, Failure> {
     if req.inbound == Inbound::Responses {
         return Err(fatal(
             req.inbound,
@@ -229,8 +274,11 @@ fn plan(base_url: &str, req: &Request, account: &Account) -> Result<Plan, Failur
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (body, renames) =
+    let (mut body, renames) =
         wire_body(&caller, &req.model, oauth, first_party).map_err(|e| fatal(req.inbound, &e))?;
+    if fast {
+        body.insert("speed".into(), Value::String("fast".into()));
+    }
     let mut headers = base_headers(stream);
     match &account.credential {
         Credential::OAuth { access, .. } => oauth_auth(&mut headers, access),
@@ -244,6 +292,9 @@ fn plan(base_url: &str, req: &Request, account: &Account) -> Result<Plan, Failur
         .get("anthropic-beta")
         .and_then(|value| value.to_str().ok());
     merge_betas(&mut headers, caller_beta, first_party);
+    if fast {
+        add_beta(&mut headers, FAST_BETA);
+    }
     let body = serde_json::to_vec(&Value::Object(body))
         .map_err(|e| fatal(req.inbound, &format!("cannot encode request: {e}")))?;
     Ok(Plan {
@@ -424,6 +475,20 @@ fn allowed_betas(first_party: bool) -> &'static [&'static str] {
         &["interleaved-thinking-2025-05-14"]
     } else {
         &[]
+    }
+}
+
+/// Append one token to the already-merged `anthropic-beta` header.
+fn add_beta(headers: &mut Vec<(String, String)>, beta: &str) {
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+    {
+        Some((_, value)) => {
+            value.push(',');
+            value.push_str(beta);
+        }
+        None => headers.push(("anthropic-beta".into(), beta.into())),
     }
 }
 
@@ -1230,7 +1295,7 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("interleaved-thinking-2025-05-14,other-beta"),
         );
-        let plan = plan("https://api.anthropic.com", &req, &oauth_account()).unwrap();
+        let plan = plan("https://api.anthropic.com", &req, &oauth_account(), false).unwrap();
 
         assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
         assert!(!plan.stream);
@@ -1302,7 +1367,7 @@ mod tests {
             Inbound::Messages,
             json!({ "model": "m", "max_tokens": 8, "messages": [], "stream": true }),
         );
-        let direct = plan("http://127.0.0.1:9", &req, &key_account()).unwrap();
+        let direct = plan("http://127.0.0.1:9", &req, &key_account(), false).unwrap();
         assert_eq!(direct.url, "http://127.0.0.1:9/v1/messages");
         let pairs = header_pairs(&direct.headers);
         assert_eq!(pairs[2], ("Accept", "text/event-stream"));
@@ -1319,7 +1384,7 @@ mod tests {
         bearer
             .extra
             .insert("api_key_transport".into(), "bearer".into());
-        let by_bearer = plan("http://127.0.0.1:9", &req, &bearer).unwrap();
+        let by_bearer = plan("http://127.0.0.1:9", &req, &bearer, false).unwrap();
         assert_eq!(
             header_pairs(&by_bearer.headers)[4],
             ("Authorization", "Bearer sk-ant-test")
@@ -1336,12 +1401,12 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("interleaved-thinking-2025-05-14"),
         );
-        let first = plan("https://api.anthropic.com", &req, &key_account()).unwrap();
+        let first = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap();
         assert_eq!(
             header_pairs(&first.headers).last().copied(),
             Some(("anthropic-beta", "interleaved-thinking-2025-05-14"))
         );
-        let local = plan("http://127.0.0.1:9", &req, &key_account()).unwrap();
+        let local = plan("http://127.0.0.1:9", &req, &key_account(), false).unwrap();
         assert!(!local
             .headers
             .iter()
@@ -1362,13 +1427,13 @@ mod tests {
             ]
         });
         let req = request(Inbound::Messages, body);
-        let local = plan("http://127.0.0.1:9", &req, &key_account()).unwrap();
+        let local = plan("http://127.0.0.1:9", &req, &key_account(), false).unwrap();
         let wire: Value = serde_json::from_slice(&local.body).unwrap();
         assert_eq!(
             wire.pointer("/messages/0/content").unwrap(),
             &json!([{ "type": "thinking", "thinking": "step" }])
         );
-        let remote = plan("https://api.anthropic.com", &req, &key_account()).unwrap();
+        let remote = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap();
         let wire: Value = serde_json::from_slice(&remote.body).unwrap();
         assert_eq!(wire["messages"][0]["content"][0]["signature"], "sig");
         assert_eq!(
@@ -1391,7 +1456,7 @@ mod tests {
                 ]
             }),
         );
-        let plan = plan("https://api.anthropic.com", &req, &key_account()).unwrap();
+        let plan = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap();
         let wire: Value = serde_json::from_slice(&plan.body).unwrap();
         assert!(plan.stream);
         assert_eq!(wire["messages"][0]["role"], "user");
@@ -1408,7 +1473,7 @@ mod tests {
             Inbound::Responses,
             json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
         );
-        let failure = plan("https://api.anthropic.com", &req, &key_account()).unwrap_err();
+        let failure = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap_err();
         match failure {
             Failure::Fatal { status, body } => {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1425,7 +1490,7 @@ mod tests {
             Inbound::Messages,
             json!({ "model": "m", "max_tokens": 8, "messages": [] }),
         );
-        let failure = plan("https://api.example.com", &req, &oauth_account()).unwrap_err();
+        let failure = plan("https://api.example.com", &req, &oauth_account(), false).unwrap_err();
         assert!(matches!(failure, Failure::Fatal { .. }));
     }
 
@@ -1575,6 +1640,38 @@ mod tests {
 
     fn messages_request(body: Value) -> Request {
         request(Inbound::Messages, body)
+    }
+
+    #[test]
+    fn fast_plan_sends_speed_with_its_beta() {
+        let req = messages_request(json!({ "model": "m", "messages": [] }));
+        let plan = plan("https://api.anthropic.com", &req, &key_account(), true).unwrap();
+        let wire: Value = serde_json::from_slice(&plan.body).unwrap();
+        assert_eq!(wire["speed"], "fast");
+        let beta = plan
+            .headers
+            .iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .map(|(_, value)| value.as_str());
+        assert!(beta.unwrap().contains(FAST_BETA));
+    }
+
+    #[tokio::test]
+    async fn refused_fast_mode_resends_at_standard_speed() {
+        let (base, seen) = spawn(Fake {
+            status: 400,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"type":"error","error":{"type":"invalid_request_error","message":"Fast mode is not enabled for your organization."}}"#.to_vec(),
+        })
+        .await;
+        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let mut req = messages_request(json!({ "model": "claude-opus-5", "messages": [] }));
+        req.model = "claude-opus-5".into();
+        req.fast = Some(true);
+        let _ = failure_of(&adapter, &req, &key_account()).await;
+        let last = seen.lock().unwrap().clone().unwrap();
+        let wire: Value = serde_json::from_slice(&last.body).unwrap();
+        assert!(wire.get("speed").is_none());
     }
 
     #[tokio::test]

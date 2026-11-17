@@ -773,7 +773,11 @@ async fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
             targets.sort_by(|a, b| room(b).total_cmp(&room(a)));
         }
         if combo.strategy == gw::combo::Strategy::Cheapest {
-            targets.sort_by(|a, b| prices.rank(&a.model).total_cmp(&prices.rank(&b.model)));
+            targets.sort_by(|a, b| {
+                prices
+                    .rank(&a.provider, &a.model)
+                    .total_cmp(&prices.rank(&b.provider, &b.model))
+            });
         }
         for (i, t) in targets.iter().enumerate() {
             let first = i == 0;

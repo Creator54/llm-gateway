@@ -62,16 +62,18 @@ impl Prices {
     }
 
     /// Input plus output dollars per million tokens, for ordering models; unpriced sort last.
-    pub fn rank(&self, model: &str) -> f64 {
-        self.find(model)
-            .map_or(f64::INFINITY, |price| price.input + price.output)
+    pub fn rank(&self, provider: &str, model: &str) -> f64 {
+        self.find(model).map_or(f64::INFINITY, |price| {
+            (price.input + price.output) * fast_multiplier(provider, model)
+        })
     }
 
     /// Equivalent list-price dollars for a usage row, or `None` for an unpriced model.
     pub fn cost(&self, row: &UsageSummary) -> Option<f64> {
         let price = self.find(&row.model)?;
         let cached = price.input_cached.unwrap_or(price.input);
-        let tokens = |n: u64, per_million: f64| n as f64 * per_million / 1e6;
+        let multiplier = fast_multiplier(&row.provider, &row.model);
+        let tokens = |n: u64, per_million: f64| n as f64 * per_million * multiplier / 1e6;
         Some(
             tokens(row.input, price.input)
                 + tokens(row.cached_read, cached)
@@ -95,6 +97,21 @@ async fn fetch() -> anyhow::Result<(Prices, Vec<u8>)> {
         .error_for_status()?;
     let raw = response.bytes().await?.to_vec();
     Ok((serde_json::from_slice(&raw)?, raw))
+}
+
+/// The list-price factor of a `--fast` model on the tiers gw actually sends: OpenAI's
+/// priority tier and Anthropic's fast mode on Opus. Other providers get no fast tier.
+fn fast_multiplier(provider: &str, model: &str) -> f64 {
+    let Some(base) = model.strip_suffix("--fast") else {
+        return 1.0;
+    };
+    let name = normalise(base);
+    match provider {
+        "openai" if name == "gpt-5-5" => 2.5,
+        "openai" => 2.0,
+        "anthropic" if name.contains("opus") => 2.0,
+        _ => 1.0,
+    }
 }
 
 /// `deepseek/deepseek-v4.1-flash--fast` → `deepseek-v4-1-flash`: drop the vendor prefix and
@@ -122,7 +139,9 @@ mod tests {
         serde_json::from_str(
             r#"{"prices":[
                 {"id":"claude-haiku-4.5","input":1,"output":5,"input_cached":0.1},
-                {"id":"gpt-x","input":2,"output":8,"input_cached":null}]}"#,
+                {"id":"gpt-x","input":2,"output":8,"input_cached":null},
+                {"id":"gpt-5.5","input":2,"output":8,"input_cached":null},
+                {"id":"claude-opus-5","input":5,"output":5,"input_cached":0.5}]}"#,
         )
         .unwrap()
     }
@@ -150,18 +169,36 @@ mod tests {
     }
 
     #[test]
-    fn cached_tokens_fall_back_to_the_input_price_and_fast_suffix_is_ignored() {
+    fn cached_tokens_fall_back_to_the_input_price() {
         // 2 + 2 + 8
-        let cost = prices().cost(&row("gpt-x--fast")).unwrap();
+        let cost = prices().cost(&row("gpt-x")).unwrap();
         assert!((cost - 12.0).abs() < 1e-9);
         assert!(prices().cost(&row("unknown")).is_none());
     }
 
     #[test]
+    fn fast_costs_more_only_where_gw_sends_a_fast_tier() {
+        let p = prices();
+        let fast = |provider: &str, model: &str| {
+            p.cost(&UsageSummary {
+                provider: provider.into(),
+                ..row(model)
+            })
+            .unwrap()
+        };
+        assert!((fast("openai", "gpt-x--fast") - 24.0).abs() < 1e-9);
+        assert!((fast("openai", "gpt-5.5--fast") - 30.0).abs() < 1e-9);
+        assert!((fast("anthropic", "claude-opus-5--fast") - 21.0).abs() < 1e-9);
+        assert!((fast("anthropic", "claude-haiku-4.5--fast") - 6.1).abs() < 1e-9);
+        assert!((fast("antigravity", "gpt-x--fast") - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn rank_orders_cheap_before_dear_and_unknown_last() {
         let p = prices();
-        assert!(p.rank("claude-haiku-4.5") < p.rank("gpt-x"));
-        assert!(p.rank("gpt-x") < p.rank("unknown"));
+        assert!(p.rank("anthropic", "claude-haiku-4.5") < p.rank("openai", "gpt-x"));
+        assert!(p.rank("openai", "gpt-x") < p.rank("openai", "gpt-x--fast"));
+        assert!(p.rank("openai", "gpt-x--fast") < p.rank("openai", "unknown"));
     }
 
     #[test]

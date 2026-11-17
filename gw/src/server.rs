@@ -695,14 +695,19 @@ impl Gateway {
             let Some(account) = Self::declared(&creds, &target.provider, &id) else {
                 continue;
             };
+            // A combo target may name the fast tier itself, as `model--fast`.
+            let (model, fast) = match target.model.strip_suffix(FAST) {
+                Some(model) => (model.to_owned(), true),
+                None => (target.model.clone(), info.fast),
+            };
             let request = provider::Request {
                 inbound,
-                model: target.model.clone(),
+                model,
                 headers: plan.headers.clone(),
                 body: plan.body.clone(),
                 stream,
                 session: info.session.clone(),
-                fast: info.fast.then_some(true),
+                fast: fast.then_some(true),
             };
             // Attempting it means it is not cooling, even if the gauge was never
             // cleared after an earlier cooldown expired.
@@ -764,8 +769,8 @@ impl Gateway {
             if combo.strategy == combo::Strategy::Cheapest {
                 targets.sort_by(|a, b| {
                     self.prices
-                        .rank(&a.model)
-                        .total_cmp(&self.prices.rank(&b.model))
+                        .rank(&a.provider, &a.model)
+                        .total_cmp(&self.prices.rank(&b.provider, &b.model))
                 });
             }
             if combo.strategy == combo::Strategy::QuotaAware {
@@ -1079,6 +1084,10 @@ impl Gateway {
         // A combo request counts under the provider model that really answered it.
         info.provider.clone_from(&target.provider);
         info.model.clone_from(&target.model);
+        // Usage and pricing tell the fast tier apart by its suffix.
+        if info.fast && !info.model.ends_with(FAST) {
+            info.model.push_str(FAST);
+        }
         let sse = is_event_stream(&reply.headers);
         let mut headers = HeaderMap::new();
         for (name, value) in &reply.headers {
