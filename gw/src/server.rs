@@ -649,7 +649,17 @@ impl Gateway {
         };
         let shape = wire(inbound);
         let info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
-        let route = self.route(&info)?;
+        let Some(route) = self.route(&info) else {
+            // Unknown combos must not fall through to plain forwarding.
+            return (info.provider == "combo").then(|| {
+                error_reply(
+                    shape,
+                    StatusCode::NOT_FOUND,
+                    &format!("unknown combo: {}", info.model),
+                    None,
+                )
+            });
+        };
         let creds = match creds::Store::load(&self.state_dir) {
             Ok(creds) => creds,
             Err(e) => {

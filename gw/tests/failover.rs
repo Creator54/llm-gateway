@@ -166,6 +166,26 @@ async fn combo_skips_a_target_without_an_adapter() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
+/// A combo name the config does not define is an error, never a plain forward.
+#[tokio::test]
+async fn unknown_combo_is_not_found() {
+    let (base, hits) = upstream("never").await;
+    let dir = temp_dir("unknown-combo");
+    let addr = serve(Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        state_dir: dir,
+        profile: Profile::Parity,
+        fallback: Some(base),
+        ..Config::default()
+    })
+    .await;
+
+    let (status, body) = chat(addr, "combo/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("unknown combo: nope"), "{body}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
 /// An account in the store that the adapter cannot serve must not stop the loop
 /// from reaching a later target either.
 #[tokio::test]
