@@ -54,10 +54,10 @@ impl Error {
 
     /// Error body in the shape the inbound protocol expects.
     pub fn to_body(&self, inbound: Inbound) -> Value {
-        let kind = if self.status < 500 {
-            "invalid_request_error"
-        } else {
-            "upstream_error"
+        let kind = match self.status {
+            429 => "rate_limit_error",
+            0..500 => "invalid_request_error",
+            _ => "upstream_error",
         };
         match inbound {
             Inbound::Messages => json!({
@@ -196,6 +196,14 @@ mod tests {
             error.to_body(Inbound::Messages),
             json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "bad input" } })
         );
+
+        let error = Error {
+            status: 429,
+            message: "slow down".into(),
+        };
+        for inbound in [Inbound::Chat, Inbound::Messages] {
+            assert_eq!(error.to_body(inbound)["error"]["type"], "rate_limit_error");
+        }
 
         let error = Error::bad_gateway("upstream failed");
         assert_eq!(
