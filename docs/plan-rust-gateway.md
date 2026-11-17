@@ -147,6 +147,6 @@ Anthropic breakpoints rather than keep-alive requests.
 ## Open
 
 - opencode-cli: keep subprocess (1:1) or switch to HTTP.
-- phoenix listeners `127.0.0.1:10200`, `:18765` unidentified.
+- phoenix `127.0.0.1:10200` is the live service's own opencodex (user `llm-gateway`); it goes when the service is replaced.
 - omnix references the gateway; check before deployment.
 - phoenix privileged steps need sudo.
