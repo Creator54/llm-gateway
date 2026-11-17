@@ -775,3 +775,36 @@ fn wire_client_constant_is_used() {
     assert_eq!(WireClient::Cli.origin(), "KIRO_CLI");
     assert_eq!(WireClient::Ide.origin(), "AI_EDITOR");
 }
+
+#[tokio::test]
+async fn turns_without_token_usage_report_an_estimate() {
+    let body = encode_message(
+        &[
+            (":message-type", "event"),
+            (":event-type", "assistantResponseEvent"),
+        ],
+        br#"{"content":"Hello there, friend."}"#,
+    );
+    let (base, _) = upstream(
+        200,
+        vec![("content-type", "application/vnd.amazon.eventstream")],
+        body,
+    )
+    .await;
+    let reply = provider(&base)
+        .send(
+            &request(Inbound::Chat, chat_body(false), false),
+            &account(&[], "aoa-token"),
+        )
+        .await
+        .expect("reply");
+    let mut bytes = Vec::new();
+    let mut stream = reply.body;
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.expect("chunk"));
+    }
+    let body: Value = serde_json::from_slice(&bytes).expect("json");
+    let usage = &body["usage"];
+    assert!(usage["prompt_tokens"].as_u64().unwrap() > 0, "{usage}");
+    assert_eq!(usage["completion_tokens"], 6, "20 chars / 3.5");
+}

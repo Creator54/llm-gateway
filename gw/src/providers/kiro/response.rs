@@ -196,6 +196,8 @@ pub(super) struct Translator {
     calls: Vec<Value>,
     open: Option<(String, String, String)>,
     usage: Option<Usage>,
+    /// Estimated prompt tokens, for turns where Kiro reports no `tokenUsage` (the usual case).
+    input_estimate: u64,
     stop_reason: Option<String>,
     next_index: u64,
     answered: bool,
@@ -211,7 +213,12 @@ fn tool_call(index: u64, id: &str, name: &str, arguments: &str) -> Value {
 }
 
 impl Translator {
-    pub(super) fn new(model: &str, names: ToolNames, mode: CompletionMode) -> Self {
+    pub(super) fn new(
+        model: &str,
+        names: ToolNames,
+        mode: CompletionMode,
+        input_estimate: u64,
+    ) -> Self {
         Self {
             model: model.to_owned(),
             names,
@@ -222,6 +229,7 @@ impl Translator {
             calls: Vec::new(),
             open: None,
             usage: None,
+            input_estimate,
             stop_reason: None,
             next_index: 0,
             answered: false,
@@ -399,9 +407,7 @@ impl Translator {
         {
             choice["finish_reason"] = json!(finish);
         }
-        if let Some(usage) = &self.usage {
-            Object::insert_usage(&mut chunk, usage);
-        }
+        Object::insert_usage(&mut chunk, &self.usage());
         vec![chunk]
     }
 
@@ -442,10 +448,28 @@ impl Translator {
                 "finish_reason": finish,
             }],
         });
-        if let Some(usage) = &self.usage {
-            Object::insert_usage(&mut completion, usage);
-        }
+        Object::insert_usage(&mut completion, &self.usage());
         completion
+    }
+
+    /// Kiro's own counts, else an estimate from the prompt and the streamed text and arguments.
+    fn usage(&self) -> Usage {
+        if let Some(usage) = &self.usage {
+            return usage.clone();
+        }
+        let arguments: String = self
+            .calls
+            .iter()
+            .filter_map(|call| call.pointer("/function/arguments").and_then(Value::as_str))
+            .collect();
+        let output =
+            crate::tokens::text_tokens(&self.text) + crate::tokens::text_tokens(&arguments);
+        Usage {
+            input: self.input_estimate,
+            cached: None,
+            output,
+            total: self.input_estimate + output,
+        }
     }
 
     fn chunk(&self, delta: Value) -> Value {

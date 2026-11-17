@@ -169,7 +169,7 @@ fn json_tokens(value: &Value) -> u64 {
 }
 
 /// ceil(chars / 3.5), with the divisor kept integral to avoid float drift.
-fn text_tokens(text: &str) -> u64 {
+pub fn text_tokens(text: &str) -> u64 {
     let chars = text.chars().count() as u64;
     (chars * 2).div_ceil(7)
 }

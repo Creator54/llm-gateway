@@ -383,6 +383,8 @@ struct Session {
     model: String,
     inbound: Protocol,
     names: wire::ToolNames,
+    /// Estimated prompt tokens, reported when Kiro sends no counts.
+    input_estimate: u64,
     /// The client's request body, which declares its tools.
     request: Value,
     mode: payload::CompletionMode,
@@ -404,6 +406,7 @@ fn session_parts(req: &Request, chat: &Value, built: &payload::Built, call: Call
         model,
         inbound,
         names: built.names.clone(),
+        input_estimate: crate::tokens::estimate(&serde_json::to_vec(chat).unwrap_or_default()),
         request: serde_json::from_slice(&req.body).unwrap_or_default(),
         mode: built.mode,
         call,
@@ -433,8 +436,12 @@ async fn drain(
 
 /// Collect the whole eventstream for a non-streamed client request.
 async fn collect(response: reqwest::Response, session: &Session) -> Result<Value, Failure> {
-    let mut translator =
-        response::Translator::new(&session.model, session.names.clone(), session.mode);
+    let mut translator = response::Translator::new(
+        &session.model,
+        session.names.clone(),
+        session.mode,
+        session.input_estimate,
+    );
     drain(response, &mut translator).await?;
     translator.finish();
     if let Some(text) = translator.fallback_text() {
@@ -445,6 +452,7 @@ async fn collect(response: reqwest::Response, session: &Session) -> Result<Value
                 &session.model,
                 session.names.clone(),
                 payload::CompletionMode::TextFallback,
+                session.input_estimate,
             );
             if drain(response, &mut retry).await.is_ok() {
                 retry.finish();
@@ -467,8 +475,12 @@ fn stream_reply(response: reqwest::Response, session: Session) -> Reply {
                 return;
             }
         }
-        let mut translator =
-            response::Translator::new(&session.model, session.names.clone(), session.mode);
+        let mut translator = response::Translator::new(
+            &session.model,
+            session.names.clone(),
+            session.mode,
+            session.input_estimate,
+        );
         let mut chunks = match pump(response, &mut translator, &mut sink, &tx).await {
             Ok(()) => translator.finish(),
             Err(error) => {
@@ -489,6 +501,7 @@ fn stream_reply(response: reqwest::Response, session: Session) -> Reply {
                     &session.model,
                     built.names,
                     payload::CompletionMode::TextFallback,
+                    session.input_estimate,
                 );
                 if pump(retry, &mut second, &mut sink, &tx).await.is_ok() {
                     let mut retry_chunks = second.finish();
