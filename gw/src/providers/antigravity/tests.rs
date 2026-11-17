@@ -413,6 +413,12 @@ async fn maps_upstream_statuses_to_failures() {
             None,
             "quota",
         ),
+        (
+            429,
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"You have exhausted your capacity on this model.","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","metadata":{"quotaResetDelay":"1h2m3s"}},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3723.5s"}]}}"#,
+            None,
+            "quota-body",
+        ),
         (401, "{}", None, "auth"),
         (
             403,
@@ -452,6 +458,9 @@ async fn maps_upstream_statuses_to_failures() {
                 assert_eq!(*retry_after, Some(Duration::from_secs(3)));
             }
             ("quota", Failure::Quota { reset_after }) => assert_eq!(*reset_after, None),
+            ("quota-body", Failure::Quota { reset_after }) => {
+                assert_eq!(*reset_after, Some(Duration::from_secs_f64(3723.5)));
+            }
             ("auth", Failure::Auth) => {}
             ("disabled", Failure::Disabled) => {}
             ("retry", Failure::Retryable) => {}
@@ -510,4 +519,15 @@ async fn overrides_base_url_and_reports_missing_wrapper() {
         }
         other => panic!("unexpected failure: {other:?}"),
     }
+}
+
+#[test]
+fn go_durations_parse_and_reject_unknown_units() {
+    assert_eq!(
+        go_duration("1h2m3.5s"),
+        Some(Duration::from_secs_f64(3723.5))
+    );
+    assert_eq!(go_duration("250ms"), Some(Duration::from_millis(250)));
+    assert_eq!(go_duration("3d"), None);
+    assert_eq!(go_duration("0s"), None);
 }

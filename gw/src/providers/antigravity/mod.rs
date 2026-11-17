@@ -496,6 +496,47 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// Google's own wait in a 429 body: `RetryInfo.retryDelay` or `ErrorInfo.metadata.quotaResetDelay`,
+/// both Go durations such as `"1h2m3.5s"`. The longer one wins, since both must have passed.
+fn body_delay(body: &str) -> Option<Duration> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .pointer("/error/details")?
+        .as_array()?
+        .iter()
+        .filter_map(|detail| {
+            detail["retryDelay"]
+                .as_str()
+                .or_else(|| detail.pointer("/metadata/quotaResetDelay")?.as_str())
+        })
+        .filter_map(go_duration)
+        .max()
+}
+
+/// A Go duration string (`h`, `m`, `s`, `ms` units); `None` when anything else is in it.
+fn go_duration(text: &str) -> Option<Duration> {
+    let (mut total, mut rest) = (0.0, text.trim());
+    while !rest.is_empty() {
+        let split = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+        let (number, tail) = rest.split_at(split);
+        let number: f64 = number.parse().ok()?;
+        let unit_len = tail
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        let (unit, tail) = tail.split_at(unit_len);
+        total += number
+            * match unit {
+                "h" => 3600.0,
+                "m" => 60.0,
+                "s" => 1.0,
+                "ms" => 0.001,
+                _ => return None,
+            };
+        rest = tail;
+    }
+    (total > 0.0).then(|| Duration::from_secs_f64(total))
+}
+
 const QUOTA_NEEDLES: [&str; 10] = [
     "quotafailure",
     "quota exceeded",
@@ -542,8 +583,9 @@ fn banned(body: &str) -> bool {
 }
 
 async fn failure(status: StatusCode, response: reqwest::Response) -> Failure {
-    let retry = retry_after(response.headers());
+    let header = retry_after(response.headers());
     let body = read_bounded(response, ERROR_BODY_CAP).await;
+    let retry = header.or_else(|| body_delay(&String::from_utf8_lossy(&body)));
     tracing::debug!(%status, body = %String::from_utf8_lossy(&body), "antigravity upstream error");
     match status.as_u16() {
         429 if quota_exhausted(&String::from_utf8_lossy(&body)) => {
