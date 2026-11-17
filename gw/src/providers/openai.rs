@@ -120,6 +120,10 @@ impl OpenAi {
         }
 
         let mut headers = reply_headers(response.headers());
+        if req.stream {
+            // The backend may omit it; usage tracking and clients rely on it.
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        }
         let body = if chat && req.stream {
             let include_usage = chat_body
                 .as_ref()
@@ -1055,6 +1059,21 @@ mod tests {
                 ]}
             ]
         })
+    }
+
+    /// The ChatGPT backend can stream without a Content-Type; usage tracking needs one.
+    #[tokio::test]
+    async fn streamed_reply_is_labelled_as_an_event_stream() {
+        let upstream = Upstream::start("200 OK", &[], "").await;
+        let req = request(Inbound::Responses, &[], &codex_body(), true);
+        let reply = adapter(&upstream).send(&req, &account()).await.unwrap();
+        assert_eq!(
+            reply
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
     }
 
     #[tokio::test]
