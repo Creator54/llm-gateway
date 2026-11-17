@@ -734,6 +734,11 @@ impl Gateway {
                     if failure == provider::Failure::Disabled {
                         Self::mark_disabled(&creds, &target.provider, &id);
                     }
+                    // A rejected token before its expiry means a logout or revocation:
+                    // refresh now, so a refused refresh marks the account for re-login.
+                    if failure == provider::Failure::Auth {
+                        self.force_refresh(&creds, &target.provider, &id).await;
+                    }
                     last = Some(failure);
                     tried.push((target.provider.clone(), id));
                 }
@@ -861,6 +866,22 @@ impl Gateway {
             .refresh_if_due(&refresher, provider, id, now, creds::DEFAULT_SKEW_SECS)
             .await
             .map(|_| ())
+    }
+
+    /// Refresh regardless of expiry (`u64::MAX` skew); a refusal marks `needs_reauth`.
+    async fn force_refresh(&self, creds: &creds::Store, provider: &str, id: &str) {
+        let refresher = crate::login::refresh::TokenRefresher {
+            provider: provider.to_owned(),
+            http: self.client.clone(),
+            endpoints: Default::default(),
+        };
+        let now = crate::login::now_secs();
+        if let Err(e) = creds
+            .refresh_if_due(&refresher, provider, id, now, u64::MAX)
+            .await
+        {
+            tracing::warn!(provider, account = id, error = %e, "rejected token did not refresh; log in again: gw login --expired");
+        }
     }
 
     /// The credential snapshot's copy of one account.

@@ -1249,6 +1249,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forced_refresh_of_a_fresh_token_marks_it_when_refused() {
+        let dir = TempDir::new("refresh-forced");
+        let store = Store::load(&dir.0).unwrap();
+        store.upsert(oauth_entry("anthropic", "a1", 1_000_000));
+        let refresher = FailingRefresher {
+            calls: AtomicUsize::new(0),
+        };
+        assert!(store
+            .refresh_if_due(&refresher, "anthropic", "a1", 900, u64::MAX)
+            .await
+            .is_err());
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+        assert!(store.get("anthropic", "a1").unwrap().needs_reauth);
+    }
+
+    #[tokio::test]
     async fn refresh_failure_marks_the_entry_and_stops_retrying() {
         let dir = TempDir::new("refresh-fail");
         let store = Store::load(&dir.0).unwrap();
