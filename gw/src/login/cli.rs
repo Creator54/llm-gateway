@@ -84,9 +84,9 @@ pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Log in again to each account marked as needing it, keeping its label. A login that
-/// lands on an identity another account already holds is refused, so accounts stay
-/// distinct; the stale entry is replaced only by a fresh login of a new identity.
+/// Log in again to each account marked as needing it, keeping its label. Each step names
+/// the email the account was stored with; signing in as another one needs a yes, and
+/// one already held by a different account is refused, so accounts stay distinct.
 pub async fn relogin(no_browser: bool, dir: PathBuf) -> Result<()> {
     let store = creds::Store::load(&dir)?;
     let stale: Vec<creds::Entry> = store.all().into_iter().filter(|e| e.needs_reauth).collect();
@@ -99,7 +99,12 @@ pub async fn relogin(no_browser: bool, dir: PathBuf) -> Result<()> {
     let mut done = 0;
     for (n, old) in stale.into_iter().enumerate() {
         let name = old.label.clone().unwrap_or_else(|| old.id.clone());
-        ui::step(n + 1, total, &format!("{} {name}", old.provider));
+        let expected = old.email().map(str::to_owned);
+        let target = match &expected {
+            Some(email) => format!("{} {name}: sign in as {email}", old.provider),
+            None => format!("{} {name}", old.provider),
+        };
+        ui::step(n + 1, total, &target);
         if !ui::confirm("log in now?", true) {
             continue;
         }
@@ -116,6 +121,20 @@ pub async fn relogin(no_browser: bool, dir: PathBuf) -> Result<()> {
                 continue;
             }
         };
+        if let (Some(want), Some(got)) = (expected.as_deref(), entry.email()) {
+            if !want.eq_ignore_ascii_case(got)
+                && !ui::confirm(
+                    &format!("signed in as {got}, not {want}; replace {name} with it?"),
+                    false,
+                )
+            {
+                ui::warn(&format!(
+                    "{} {name}: kept; still needs a login",
+                    old.provider
+                ));
+                continue;
+            }
+        }
         let store = creds::Store::load(&dir)?;
         if let Some(other) = store
             .get(&entry.provider, &entry.id)
