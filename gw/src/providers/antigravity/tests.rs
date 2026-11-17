@@ -420,6 +420,12 @@ async fn maps_upstream_statuses_to_failures() {
             None,
             "auth",
         ),
+        (
+            403,
+            r#"{"error":{"status":"PERMISSION_DENIED","details":[{"reason":"TOS_VIOLATION"}]}}"#,
+            None,
+            "disabled",
+        ),
         (500, "{}", None, "retry"),
         (400, r#"{"error":{"message":"bad"}}"#, None, "fatal"),
     ];
@@ -447,6 +453,7 @@ async fn maps_upstream_statuses_to_failures() {
             }
             ("quota", Failure::Quota { reset_after }) => assert_eq!(*reset_after, None),
             ("auth", Failure::Auth) => {}
+            ("disabled", Failure::Disabled) => {}
             ("retry", Failure::Retryable) => {}
             ("fatal", Failure::Fatal { status, body }) => {
                 assert_eq!(*status, StatusCode::BAD_REQUEST);

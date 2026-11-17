@@ -156,6 +156,13 @@ enum AccountCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Recheck an account the provider disabled, on the next request
+    Recheck {
+        #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
+        provider: String,
+        /// Account id or label, as shown by `gw account list`
+        id: String,
+    },
     /// Remove one stored account
     Remove {
         #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
@@ -273,6 +280,16 @@ async fn run() -> anyhow::Result<()> {
                 cfg.state_dir,
             ),
             AccountCmd::List { json } => gw::login::cli::list(json, cfg.state_dir),
+            AccountCmd::Recheck { provider, id } => {
+                let store = gw::creds::Store::load(&cfg.state_dir)?;
+                anyhow::ensure!(
+                    store.set_disabled_until(&provider, &id, None),
+                    "no {provider} account {id}"
+                );
+                store.save()?;
+                gw::ui::ok(&format!("{provider}/{id}: the next request rechecks it"));
+                Ok(())
+            }
             AccountCmd::Remove { provider, id, json } => {
                 gw::login::cli::remove(&provider, &id, json, &cfg.state_dir)
             }
@@ -290,10 +307,17 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<Vec<String>> {
     }
     for e in &all {
         let name = e.label.as_deref().unwrap_or(&e.id);
-        let flag = match (e.needs_reauth, e.paused) {
-            (true, _) => " (needs login)",
-            (_, true) => " (paused)",
-            _ => "",
+        let now = gw::login::now_secs();
+        let flag = match (e.needs_reauth, e.paused, e.disabled_until) {
+            (true, ..) => " (needs login)".to_owned(),
+            (_, true, _) => " (paused)".to_owned(),
+            (.., Some(until)) if until > now => format!(
+                " (disabled by provider, rechecks in {}h or `gw account recheck {} {name}`)",
+                (until - now).div_ceil(3600),
+                e.provider
+            ),
+            (.., Some(_)) => " (disabled by provider, rechecks on next request)".to_owned(),
+            _ => String::new(),
         };
         let email = match e.email() {
             Some(email) if emails => format!(" <{email}>"),

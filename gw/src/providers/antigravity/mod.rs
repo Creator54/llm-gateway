@@ -536,6 +536,11 @@ fn quota_exhausted(body: &str) -> bool {
     status_ok && QUOTA_NEEDLES.iter().any(|needle| lower.contains(needle))
 }
 
+/// Google's terms-of-service ban, as opposed to a rejected token.
+fn banned(body: &str) -> bool {
+    body.contains("TOS_VIOLATION") || body.contains("violation of Terms of Service")
+}
+
 async fn failure(status: StatusCode, response: reqwest::Response) -> Failure {
     let retry = retry_after(response.headers());
     let body = read_bounded(response, ERROR_BODY_CAP).await;
@@ -545,6 +550,7 @@ async fn failure(status: StatusCode, response: reqwest::Response) -> Failure {
             Failure::Quota { reset_after: retry }
         }
         429 => Failure::RateLimited { retry_after: retry },
+        403 if banned(&String::from_utf8_lossy(&body)) => Failure::Disabled,
         401 | 403 => Failure::Auth,
         code if code >= 500 => Failure::Retryable,
         _ => Failure::Fatal { status, body },

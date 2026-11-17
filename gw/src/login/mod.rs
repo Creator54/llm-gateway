@@ -173,6 +173,7 @@ impl Tokens {
             paused: false,
             needs_reauth: false,
             last_error: None,
+            disabled_until: None,
             credential: creds::Secret::OAuth(creds::OAuthCred {
                 access: self.access,
                 refresh: self.refresh,
@@ -210,6 +211,7 @@ impl Credential {
                 paused: false,
                 needs_reauth: false,
                 last_error: None,
+                disabled_until: None,
                 credential: creds::Secret::ApiKey { key },
             },
         }

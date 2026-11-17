@@ -712,6 +712,13 @@ impl Gateway {
                 .await;
             match outcome {
                 AttemptResult::Served(reply) => {
+                    // A served recheck means the provider lifted the ban.
+                    if account_disabled(&creds, &target.provider, &id) {
+                        creds.set_disabled_until(&target.provider, &id, None);
+                        if let Err(e) = creds.save() {
+                            tracing::warn!(error = %e, "could not clear the disabled marker");
+                        }
+                    }
                     self.remember(&session, &route, &target, &id, index);
                     // Clearing on success keeps the gauge honest after a recovery.
                     self.metrics.set_cooling(&target.provider, &id, false);
@@ -719,6 +726,9 @@ impl Gateway {
                 }
                 // The same account must not be tried twice in one request.
                 AttemptResult::Cooled(failure) => {
+                    if failure == provider::Failure::Disabled {
+                        Self::mark_disabled(&creds, &target.provider, &id);
+                    }
                     last = Some(failure);
                     tried.push((target.provider.clone(), id));
                 }
@@ -799,6 +809,21 @@ impl Gateway {
         for entry in creds.all() {
             pool.add(&entry.provider, &entry.id);
             pool.set_paused(&entry.provider, &entry.id, entry.paused);
+            let now = crate::login::now_secs();
+            let until = entry
+                .disabled_until
+                .filter(|until| *until > now)
+                .map(|until| Instant::now() + Duration::from_secs(until - now));
+            pool.set_disabled(&entry.provider, &entry.id, until);
+        }
+    }
+
+    /// Persist a provider ban so `gw status` shows it and a restart keeps it.
+    fn mark_disabled(creds: &creds::Store, provider: &str, id: &str) {
+        let until = crate::login::now_secs() + pool::DISABLED_COOLDOWN.as_secs();
+        creds.set_disabled_until(provider, id, Some(until));
+        if let Err(e) = creds.save() {
+            tracing::warn!(error = %e, "could not persist the disabled marker");
         }
     }
 
@@ -1574,12 +1599,19 @@ fn json_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+fn account_disabled(creds: &creds::Store, provider: &str, id: &str) -> bool {
+    creds
+        .get(provider, id)
+        .is_some_and(|entry| entry.disabled_until.is_some())
+}
+
 /// Short label for the reason a route moved on.
 fn failure_label(failure: Option<&provider::Failure>) -> &'static str {
     match failure {
         Some(provider::Failure::RateLimited { .. }) => "rate_limited",
         Some(provider::Failure::Quota { .. }) => "quota",
         Some(provider::Failure::Auth) => "auth",
+        Some(provider::Failure::Disabled) => "disabled",
         Some(provider::Failure::Retryable) => "retryable",
         Some(provider::Failure::Fatal { .. }) => "fatal",
         None => "unknown",
@@ -1649,6 +1681,7 @@ fn reason_label(failure: Option<&provider::Failure>) -> &'static str {
         Some(provider::Failure::RateLimited { .. }) => "rate limited upstream",
         Some(provider::Failure::Quota { .. }) => "quota exhausted",
         Some(provider::Failure::Auth) => "authentication failed",
+        Some(provider::Failure::Disabled) => "disabled by the provider",
         Some(provider::Failure::Retryable) => "upstream unreachable",
         Some(provider::Failure::Fatal { .. }) => "upstream rejected the request",
         None => "rate limited",
@@ -1668,6 +1701,12 @@ fn failure_reply(shape: translate::Inbound, failure: provider::Failure) -> Respo
             );
             response
         }
+        provider::Failure::Disabled => error_reply(
+            shape,
+            StatusCode::FORBIDDEN,
+            "the provider disabled this account",
+            None,
+        ),
         provider::Failure::Auth => error_reply(
             shape,
             StatusCode::UNAUTHORIZED,

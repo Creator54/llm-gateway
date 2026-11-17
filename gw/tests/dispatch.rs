@@ -61,6 +61,7 @@ fn accounts(dir: &Path, keys: &[(&str, &str)]) {
             paused: false,
             needs_reauth: false,
             last_error: None,
+            disabled_until: None,
             credential: creds::Secret::ApiKey {
                 key: (*key).to_owned(),
             },

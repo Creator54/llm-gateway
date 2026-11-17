@@ -75,6 +75,8 @@ pub enum Failure {
     RateLimited { retry_after: Option<Duration> },
     /// Credential rejected; refresh or skip the account.
     Auth,
+    /// The provider disabled the account (a terms-of-service ban); it may be lifted later.
+    Disabled,
     /// Plan quota used up; cool the account down until `reset_after`.
     Quota { reset_after: Option<Duration> },
     /// Network or 5xx; safe to retry elsewhere.

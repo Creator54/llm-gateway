@@ -106,6 +106,9 @@ pub struct Entry {
     /// Truncated message from the last refresh failure; never token material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Unix time until which the provider-disabled account sits out; the next request after it rechecks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_until: Option<u64>,
     pub credential: Secret,
 }
 
@@ -321,6 +324,22 @@ impl Store {
     }
 
     /// Pause or resume one account; true when it existed.
+    /// Set or clear the provider-disabled mark; false when the account is unknown.
+    pub fn set_disabled_until(&self, provider: &str, id: &str, until: Option<u64>) -> bool {
+        match self
+            .write()
+            .accounts
+            .iter_mut()
+            .find(|e| e.provider == provider && (e.id == id || e.label.as_deref() == Some(id)))
+        {
+            Some(entry) => {
+                entry.disabled_until = until;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_paused(&self, provider: &str, id: &str, paused: bool) -> bool {
         match self
             .write()
@@ -638,6 +657,7 @@ fn entry(provider: &str, id: String, credential: Secret, paused: bool) -> Entry 
         paused,
         needs_reauth: false,
         last_error: None,
+        disabled_until: None,
         credential,
     }
 }
@@ -807,6 +827,7 @@ mod tests {
             paused: false,
             needs_reauth: false,
             last_error: None,
+            disabled_until: None,
             credential: Secret::ApiKey {
                 key: "sk-fake-not-real".into(),
             },
@@ -823,6 +844,7 @@ mod tests {
             paused: false,
             needs_reauth: false,
             last_error: None,
+            disabled_until: None,
             credential: Secret::OAuth(OAuthCred {
                 access: "access-fake".into(),
                 refresh: Some("refresh-fake".into()),

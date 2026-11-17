@@ -12,6 +12,8 @@ const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const QUOTA_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 /// Cooldown after a rejected credential: long enough to stop a retry storm, short enough to recover.
 const AUTH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// How long a provider-disabled account sits out before one request rechecks it.
+pub const DISABLED_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
 /// Sessions untouched for this long are dropped.
 const SESSION_IDLE: Duration = Duration::from_secs(60 * 60);
 /// Idle sweeps run at most once per interval, keeping the insert path cheap.
@@ -23,6 +25,7 @@ pub enum Reason {
     RateLimited,
     Quota,
     Auth,
+    Disabled,
 }
 
 /// What one attempt on an account means for that account.
@@ -39,6 +42,8 @@ pub enum Outcome {
     },
     /// Credential rejected; cool it down for five minutes.
     Auth,
+    /// Disabled by the provider; sit out six hours.
+    Disabled,
 }
 
 impl Outcome {
@@ -52,6 +57,7 @@ impl Outcome {
                 reset_after: *reset_after,
             }),
             Failure::Auth => Some(Outcome::Auth),
+            Failure::Disabled => Some(Outcome::Disabled),
             Failure::Retryable | Failure::Fatal { .. } => None,
         }
     }
@@ -127,6 +133,19 @@ impl Pool {
     pub fn set_paused(&mut self, provider: &str, account: &str, paused: bool) {
         if let Some(state) = self.state_mut(provider, account) {
             state.paused = paused;
+        }
+    }
+
+    /// Mirror the stored disabled mark: cool the account until `until`, or lift a
+    /// disabled cooldown the store no longer has (a manual recheck).
+    pub fn set_disabled(&mut self, provider: &str, account: &str, until: Option<Instant>) {
+        let Some(state) = self.state_mut(provider, account) else {
+            return;
+        };
+        match until {
+            Some(until) => state.cooldown = Some((until, Reason::Disabled)),
+            None if matches!(state.cooldown, Some((_, Reason::Disabled))) => state.cooldown = None,
+            None => {}
         }
     }
 
@@ -293,6 +312,7 @@ impl Pool {
                 (reset_after.unwrap_or(QUOTA_COOLDOWN), Reason::Quota)
             }
             Outcome::Auth => (AUTH_COOLDOWN, Reason::Auth),
+            Outcome::Disabled => (DISABLED_COOLDOWN, Reason::Disabled),
         };
         let Some(state) = self.state_mut(provider, account) else {
             return false;
@@ -495,6 +515,24 @@ mod tests {
     }
 
     #[test]
+    fn disabled_accounts_sit_out_until_rechecked() {
+        let now = Instant::now();
+        let mut pool = pool_of("p", &["a1"]);
+        pool.report("p", "a1", Outcome::Disabled, now);
+        assert_eq!(
+            pool.earliest_free("p", None, now),
+            Some(now + DISABLED_COOLDOWN)
+        );
+        // The store dropping the mark (a manual recheck) frees it at once.
+        pool.set_disabled("p", "a1", None);
+        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+        // Other cooldowns are not the store's to lift.
+        pool.report("p", "a1", Outcome::Auth, now);
+        pool.set_disabled("p", "a1", None);
+        assert_eq!(pool.pick("p", "s2", None, now), None);
+    }
+
+    #[test]
     fn success_keeps_the_account_usable() {
         let mut pool = pool_of("p", &["a1"]);
         let now = Instant::now();
@@ -608,6 +646,7 @@ mod tests {
                 Some(Outcome::Quota { reset_after: None }),
             ),
             (Failure::Auth, Some(Outcome::Auth)),
+            (Failure::Disabled, Some(Outcome::Disabled)),
             (Failure::Retryable, None),
             (fatal, None),
         ];
