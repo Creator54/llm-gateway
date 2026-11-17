@@ -84,6 +84,62 @@ pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Log in again to each account marked as needing it, keeping its label. A login that
+/// lands on an identity another account already holds is refused, so accounts stay
+/// distinct; the stale entry is replaced only by a fresh login of a new identity.
+pub async fn relogin(no_browser: bool, dir: PathBuf) -> Result<()> {
+    let store = creds::Store::load(&dir)?;
+    let stale: Vec<creds::Entry> = store.all().into_iter().filter(|e| e.needs_reauth).collect();
+    if stale.is_empty() {
+        ui::ok("no account needs a login");
+        return Ok(());
+    }
+    let http = reqwest::Client::new();
+    let total = stale.len();
+    let mut done = 0;
+    for (n, old) in stale.into_iter().enumerate() {
+        let name = old.label.clone().unwrap_or_else(|| old.id.clone());
+        ui::step(n + 1, total, &format!("{} {name}", old.provider));
+        if !ui::confirm("log in now?", true) {
+            continue;
+        }
+        let opts = Options {
+            dir: dir.clone(),
+            open_browser: !no_browser,
+            label: Some(name.clone()),
+            ..Options::default()
+        };
+        let entry = match providers::run(&old.provider, &http, &opts).await {
+            Ok(tokens) => tokens.entry(&old.provider, opts.label.clone()),
+            Err(err) => {
+                ui::err(&format!("{} {name}: {err:#}", old.provider));
+                continue;
+            }
+        };
+        let store = creds::Store::load(&dir)?;
+        if let Some(other) = store
+            .get(&entry.provider, &entry.id)
+            .filter(|e| e.id != old.id)
+        {
+            let other = other.label.unwrap_or(other.id);
+            ui::err(&format!(
+                "{} {name}: that sign-in is already account {other}; use a different one",
+                old.provider
+            ));
+            continue;
+        }
+        if entry.id != old.id {
+            store.remove(&old.provider, &old.id);
+        }
+        store.upsert(entry);
+        store.save()?;
+        ui::ok(&format!("{} {name} logged in", old.provider));
+        done += 1;
+    }
+    ui::info(&format!("{done} of {total} accounts logged in"));
+    Ok(())
+}
+
 /// Import opencodex credentials into the store.
 pub fn import(args: Import, dir: PathBuf) -> Result<()> {
     let from = match args.from {

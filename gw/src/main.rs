@@ -115,8 +115,11 @@ enum Cmd {
     },
     /// Log in to a provider and store the account
     Login {
-        #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
-        provider: String,
+        #[arg(
+            value_parser = PossibleValuesParser::new(gw::providers::NAMES),
+            required_unless_present = "expired"
+        )]
+        provider: Option<String>,
         /// Account label (default: the provider name)
         label: Option<String>,
         /// Force the device-code flow (openai only)
@@ -128,6 +131,9 @@ enum Cmd {
         /// Print JSON
         #[arg(long)]
         json: bool,
+        /// Log in again to every account that needs it, one after another
+        #[arg(long, conflicts_with_all = ["provider", "label", "device", "json"])]
+        expired: bool,
     },
     /// Manage stored accounts
     Account {
@@ -256,7 +262,12 @@ async fn run() -> anyhow::Result<()> {
             device,
             no_browser,
             json,
+            expired,
         } => {
+            if expired {
+                return gw::login::cli::relogin(no_browser, cfg.state_dir).await;
+            }
+            let provider = provider.expect("clap requires a provider without --expired");
             let args = gw::login::cli::Login {
                 provider,
                 device,
@@ -352,7 +363,7 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
         .collect();
     let mut hints = Vec::new();
     if login {
-        hints.push("log in again: gw login <provider> <account>".to_owned());
+        hints.push("log in again: gw login --expired".to_owned());
     }
     if let Some(left) = recheck {
         let when = match left {
