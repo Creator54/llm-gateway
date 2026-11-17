@@ -5,6 +5,8 @@
 
 mod id;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -49,7 +51,12 @@ pub struct Opencode {
     client: reqwest::Client,
     base: String,
     version: String,
+    /// Session ids by client session: the CLI mints one per session and reuses it.
+    sessions: Arc<Mutex<HashMap<String, String>>>,
 }
+
+/// Bound on remembered sessions; past it the map restarts, minting fresh ids.
+const MAX_SESSIONS: usize = 1024;
 
 impl Opencode {
     pub fn new(client: reqwest::Client, base_url: Option<String>) -> Self {
@@ -61,6 +68,7 @@ impl Opencode {
             client,
             base,
             version: "1.19.5".to_string(),
+            sessions: Arc::default(),
         }
     }
 
@@ -121,6 +129,20 @@ impl Opencode {
         })
     }
 
+    /// The CLI's session id for `key`, stamped when the session is first seen.
+    /// Requests without a client session are each their own session, like `opencode run`.
+    fn session_id(&self, key: &str, now: u64) -> String {
+        let mint = || id::session(now, 1, &digest(&format!("{key}:{now}")));
+        if key.is_empty() {
+            return mint();
+        }
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(key) {
+            sessions.clear();
+        }
+        sessions.entry(key.to_owned()).or_insert_with(mint).clone()
+    }
+
     fn outbound_headers(&self, req: &Request, account: &Account) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let key = key_of(account);
@@ -133,8 +155,8 @@ impl Opencode {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let now = now_ms();
-        let session = id::session(now, 1, &digest(&req.session));
-        let request = id::request(now, 2, &digest(&format!("{}:{now}", req.session)));
+        let session = self.session_id(&req.session, now);
+        let request = id::request(now, 1, &digest(&format!("{}:{now}", req.session)));
         let agent = format!(
             "opencode/{} ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
             self.version
@@ -633,6 +655,15 @@ mod tests {
         assert!(header(&seen, "x-opencode-request")
             .unwrap()
             .starts_with("msg_"));
+
+        // The CLI keeps one session id for a whole session.
+        let body = serde_json::json!({"model":"beam-free","messages":[]});
+        let _ = adapter
+            .send(&request(Inbound::Chat, body, false), &anonymous())
+            .await
+            .unwrap();
+        let again = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(header(&again, "x-opencode-session"), Some(session));
     }
 
     #[tokio::test]

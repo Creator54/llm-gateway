@@ -43,14 +43,21 @@ pub fn session(ms: u64, counter: u64, entropy: &[u8]) -> String {
     format!("ses_{}{}", stamp(ms, counter, true), tail(entropy))
 }
 
-/// A full request id: `msg_` plus stamp and tail.
+/// A full request id: `msg_` plus stamp and tail. Message ids ascend, unlike sessions.
 pub fn request(ms: u64, counter: u64, entropy: &[u8]) -> String {
-    format!("msg_{}{}", stamp(ms, counter, true), tail(entropy))
+    format!("msg_{}{}", stamp(ms, counter, false), tail(entropy))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_descend_and_messages_ascend_like_the_cli() {
+        // Decoded from a captured opencode 1.19.5 turn: `ses_e161929b7ffe…`, `msg_1e9e6d65e001…`.
+        assert_eq!(stamp(8_219_186_760, 1, true), "e161929b7ffe");
+        assert!(request(8_219_186_782, 1, b"x").starts_with("msg_1e9e6d65e001"));
+    }
 
     #[test]
     fn stamp_is_twelve_hex_chars() {
