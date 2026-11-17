@@ -584,6 +584,17 @@ async fn missing_credential_is_an_auth_failure() {
 }
 
 #[test]
+fn chat_requests_use_the_routed_model_not_the_pinned_one() {
+    let mut req = request(
+        Inbound::Chat,
+        serde_json::json!({ "model": "kiro@acct/claude-haiku-4.5", "messages": [] }),
+        false,
+    );
+    req.model = "claude-haiku-4.5".into();
+    assert_eq!(chat_request(&req).unwrap()["model"], "claude-haiku-4.5");
+}
+
+#[test]
 fn fallback_endpoint_only_replaces_the_canonical_runtime_host() {
     assert_eq!(
         wire::fallback_endpoint(None, "eu-west-1").as_deref(),

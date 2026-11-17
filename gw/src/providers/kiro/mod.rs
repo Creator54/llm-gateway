@@ -63,7 +63,12 @@ fn chat_request(req: &Request) -> Result<Value, Failure> {
         )
     })?;
     match req.inbound {
-        Inbound::Chat => Ok(body),
+        // The body still names what the client sent (`kiro@account/model`); use the routed id.
+        Inbound::Chat => {
+            let mut body = body;
+            body["model"] = Value::String(req.model.clone());
+            Ok(body)
+        }
         Inbound::Responses => responses_to_chat(&body, &req.model).map_err(translate_failure),
         Inbound::Messages => messages_to_chat(&body, &req.model).map_err(translate_failure),
     }
