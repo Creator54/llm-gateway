@@ -225,16 +225,18 @@ fn finish_reason(stop: Option<&str>) -> &'static str {
 }
 
 /// Messages `usage` as Chat `usage`; Chat counts cached input inside the prompt.
+/// Cache writes go in `cache_write_tokens`, the field OpenRouter-style clients read.
 fn chat_usage(usage: &Value) -> Value {
     let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let cached = number("cache_read_input_tokens");
-    let prompt = number("input_tokens") + cached + number("cache_creation_input_tokens");
+    let written = number("cache_creation_input_tokens");
+    let prompt = number("input_tokens") + cached + written;
     let completion = number("output_tokens");
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
-        "prompt_tokens_details": { "cached_tokens": cached },
+        "prompt_tokens_details": { "cached_tokens": cached, "cache_write_tokens": written },
     })
 }
 
@@ -500,7 +502,7 @@ mod tests {
             "content": [{"type": "text", "text": "hi"},
                 {"type": "tool_use", "id": "tu_1", "name": "get", "input": {"a": 1}}],
             "stop_reason": "tool_use",
-            "usage": {"input_tokens": 10, "cache_read_input_tokens": 5, "output_tokens": 3},
+            "usage": {"input_tokens": 10, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 4, "output_tokens": 3},
         });
         let chat = messages_reply_to_chat(&reply, "anthropic/claude").unwrap();
         assert_eq!(chat["object"], "chat.completion");
@@ -509,9 +511,13 @@ mod tests {
         assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
         let call = &chat["choices"][0]["message"]["tool_calls"][0];
         assert_eq!(call["function"]["arguments"], "{\"a\":1}");
-        assert_eq!(chat["usage"]["prompt_tokens"], 15);
         assert_eq!(chat["usage"]["prompt_tokens_details"]["cached_tokens"], 5);
-        assert_eq!(chat["usage"]["total_tokens"], 18);
+        assert_eq!(
+            chat["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            4
+        );
+        assert_eq!(chat["usage"]["prompt_tokens"], 19);
+        assert_eq!(chat["usage"]["total_tokens"], 22);
     }
 
     #[test]

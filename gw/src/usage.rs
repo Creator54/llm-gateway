@@ -70,19 +70,15 @@ fn walk(value: &Value, out: &mut Tokens) {
 
 fn read(usage: &Value) -> Tokens {
     let num = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let nested = |key: &str| {
-        usage
-            .pointer(&format!("/{key}/cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
+    let nested = |path: &str| usage.pointer(path).and_then(Value::as_u64).unwrap_or(0);
     if usage.get("prompt_tokens").is_some() {
-        // OpenAI Chat: prompt_tokens includes the cached part.
-        let cached = nested("prompt_tokens_details");
+        // OpenAI Chat: prompt_tokens includes the cached and cache-write parts.
+        let cached = nested("/prompt_tokens_details/cached_tokens");
+        let written = nested("/prompt_tokens_details/cache_write_tokens");
         return Tokens {
-            input: num("prompt_tokens").saturating_sub(cached),
+            input: num("prompt_tokens").saturating_sub(cached + written),
             cached_read: cached,
-            cache_write: 0,
+            cache_write: written,
             output: num("completion_tokens"),
         };
     }
@@ -97,7 +93,7 @@ fn read(usage: &Value) -> Tokens {
         };
     }
     // OpenAI Responses: input_tokens includes the cached part.
-    let cached = nested("input_tokens_details");
+    let cached = nested("/input_tokens_details/cached_tokens");
     Tokens {
         input: num("input_tokens").saturating_sub(cached),
         cached_read: cached,
@@ -109,6 +105,15 @@ fn read(usage: &Value) -> Tokens {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_cache_writes_are_not_counted_as_input() {
+        let chat = body(br#"{"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":50}}}"#);
+        assert_eq!(
+            (chat.input, chat.cached_read, chat.cache_write),
+            (10, 40, 50)
+        );
+    }
 
     #[test]
     fn reads_all_three_protocols() {
