@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use super::{post_json, Credential};
+use super::{json_body, post_json, Credential};
 use crate::login::{device, ui, Options, Tokens};
 
 const SOCIAL: &str = "https://prod.us-east-1.auth.desktop.kiro.dev";
@@ -151,19 +151,8 @@ pub async fn login(http: &reqwest::Client, opts: &Options) -> Result<Credential>
 /// The signed-in user's id and email from the usage endpoint, or `None` if it can't be read.
 async fn identity(http: &reqwest::Client, tokens: &Tokens) -> Option<(String, Option<String>)> {
     let arn = tokens.extra.get("profile_arn")?.as_str()?;
-    let body = json!({"origin": "AI_EDITOR", "isEmailRequired": true, "profileArn": arn});
-    let reply = http
-        .post(format!("https://management.{REGION}.kiro.dev/"))
-        .query(&[
-            ("origin", "AI_EDITOR"),
-            ("isEmailRequired", "true"),
-            ("profileArn", arn),
-        ])
+    let reply = crate::providers::kiro::usage_limits(http, REGION, arn, true)
         .bearer_auth(&tokens.access)
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
-        .header("x-amzn-codewhisperer-optout", "true")
-        .body(body.to_string())
         .send()
         .await
         .ok()?
@@ -195,9 +184,24 @@ pub async fn refresh(
     let url = token_url
         .map(str::to_string)
         .unwrap_or_else(|| REFRESH_URL.replace("{region}", region));
-    let (status, body) = post_json(http, &url, &json!({"refreshToken": refresh_token})).await?;
+    // kiro-cli's exact request shape: JSON body, `Kiro-CLI` agent, `*/*` accept.
+    let response = http
+        .post(&url)
+        .timeout(super::TIMEOUT)
+        .header("content-type", "application/json")
+        .header("user-agent", "Kiro-CLI")
+        .header("accept", "*/*")
+        .body(json!({"refreshToken": refresh_token}).to_string())
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = json_body(response).await;
     if !(200..300).contains(&status) {
-        return Err(anyhow!("Kiro token refresh failed: HTTP {status}"));
+        let code = ["error", "code", "__type", "message"]
+            .iter()
+            .find_map(|key| body.get(key).and_then(Value::as_str))
+            .unwrap_or("no error code");
+        return Err(anyhow!("Kiro token refresh failed: HTTP {status} ({code})"));
     }
     let access = field(&body, "accessToken")
         .ok_or_else(|| anyhow!("Kiro refresh returned no accessToken"))?;

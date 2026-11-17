@@ -179,24 +179,12 @@ async fn probe(
                     .map_or(command_code::DEFAULT_VERSION, String::as_str),
             )
             .header("x-cli-environment", "production"),
-        "kiro" => {
-            let arn = account_extra(&entry, "profile_arn")?;
-            let host = format!("https://management.{}.kiro.dev/", kiro::region(&extra));
-            client
-                .post(host)
-                .query(&[
-                    ("origin", "AI_EDITOR"),
-                    ("isEmailRequired", "true"),
-                    ("profileArn", arn.as_str()),
-                ])
-                .header("content-type", "application/x-amz-json-1.0")
-                .header("x-amz-target", "AmazonCodeWhispererService.GetUsageLimits")
-                .header("x-amzn-codewhisperer-optout", "true")
-                .body(
-                    json!({ "origin": "AI_EDITOR", "isEmailRequired": true, "profileArn": arn })
-                        .to_string(),
-                )
-        }
+        "kiro" => kiro::usage_limits(
+            client,
+            &kiro::region(&extra),
+            &account_extra(&entry, "profile_arn")?,
+            false,
+        ),
         _ => client
             .post(format!(
                 "{}/v1internal:fetchAvailableModels",

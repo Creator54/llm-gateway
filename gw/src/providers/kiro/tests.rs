@@ -1,7 +1,6 @@
 //! End-to-end checks against an in-process fake Kiro runtime.
 
 use super::eventstream::encode_message;
-use super::wire::WireClient;
 use super::*;
 use axum::body::Body;
 use axum::extract::State;
@@ -241,15 +240,19 @@ async fn cli_egress_matches_spec_and_streams_chat() {
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
+    // kiro-cli 2.23.1's header order, from a captured request.
     assert!(
         names.starts_with(&[
-            "authorization",
             "content-type",
-            "accept",
             "x-amz-target",
             "user-agent",
             "x-amz-user-agent",
             "x-amzn-codewhisperer-optout",
+            "x-kiro-attempt",
+            "authorization",
+            "amz-sdk-request",
+            "amz-sdk-invocation-id",
+            "accept",
         ]),
         "{names:?}"
     );
@@ -266,9 +269,18 @@ async fn cli_egress_matches_spec_and_streams_chat() {
         header("x-amz-target"),
         "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
     );
-    assert!(header("user-agent")
-        .starts_with("aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/"));
-    assert!(!header("x-amz-user-agent").contains("md/appVersion"));
+    assert_eq!(
+        header("user-agent"),
+        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/linux \
+         lang/rust/1.92.0 md/appVersion-2.23.1 app/AmazonQ-For-CLI"
+    );
+    assert_eq!(
+        header("x-amz-user-agent"),
+        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/linux \
+         lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"
+    );
+    assert_eq!(header("x-amzn-codewhisperer-optout"), "false");
+    assert_eq!(header("x-kiro-attempt"), "1;max=3");
     assert_eq!(header("amz-sdk-request"), "attempt=1; max=3");
     assert!(header("amz-sdk-invocation-id").len() == 36);
     assert_eq!(header("tokentype"), "");
@@ -278,13 +290,15 @@ async fn cli_egress_matches_spec_and_streams_chat() {
     let state = &body["conversationState"];
     assert_eq!(state["chatTriggerType"], "MANUAL");
     assert_eq!(state["agentTaskType"], "vibe");
-    assert!(state["agentContinuationId"]
-        .as_str()
-        .is_some_and(|id| id.len() == 36));
+    assert!(state.get("agentContinuationId").is_none());
     assert!(state.get("history").is_none());
     let user = &state["currentMessage"]["userInputMessage"];
     assert_eq!(user["modelId"], "claude-sonnet-4.5");
     assert_eq!(user["origin"], "KIRO_CLI");
+    assert_eq!(
+        user["userInputMessageContext"]["envState"]["operatingSystem"],
+        "linux"
+    );
     let content = user["content"].as_str().expect("content");
     assert!(
         content.starts_with("Be terse.\n\nTool contract:"),
@@ -328,7 +342,7 @@ async fn cli_egress_matches_spec_and_streams_chat() {
 }
 
 #[tokio::test]
-async fn ide_egress_uses_profile_arn_and_streams_responses() {
+async fn profile_accounts_send_the_arn_in_the_body_and_stream_responses() {
     let (base, upstream) = upstream(
         200,
         vec![("content-type", "application/vnd.amazon.eventstream")],
@@ -368,36 +382,13 @@ async fn ide_egress_uses_profile_arn_and_streams_responses() {
             .map(|(_, value)| value.as_str())
             .unwrap_or_default()
     };
-    assert_eq!(header("accept"), "application/vnd.amazon.eventstream");
-    assert_eq!(header("x-amzn-kiro-agent-mode"), "vibe");
-    assert!(header("user-agent").starts_with("aws-sdk-js/1.0.27 ua/2.1 os/"));
-    assert_eq!(
-        header("x-amzn-kiro-profile-arn"),
-        "arn:aws:codewhisperer:eu-west-1:1:profile/x"
-    );
-    // Transport headers (`content-length`, `host`) trail the request headers.
-    let names: Vec<&str> = captured
-        .headers
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
-    let profile_at = names
-        .iter()
-        .position(|name| *name == "x-amzn-kiro-profile-arn")
-        .expect("profile header");
-    assert!(
-        names[profile_at + 1..].iter().all(|name| matches!(
-            *name,
-            "content-length" | "host" | "accept-encoding" | "connection"
-        )),
-        "{names:?}"
-    );
+    assert_eq!(header("x-amzn-kiro-profile-arn"), "");
     let body: Value = serde_json::from_slice(&captured.body).expect("json");
     assert_eq!(
         body["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
-        "AI_EDITOR"
+        "KIRO_CLI"
     );
-    assert!(body["conversationState"].get("agentTaskType").is_none());
+    assert_eq!(body["conversationState"]["agentTaskType"], "vibe");
     assert_eq!(
         body["profileArn"],
         "arn:aws:codewhisperer:eu-west-1:1:profile/x"
@@ -638,7 +629,10 @@ async fn tool_choice_none_sends_no_tools() {
         .expect("request");
     let body: Value = serde_json::from_slice(&captured.body).expect("json");
     let user = &body["conversationState"]["currentMessage"]["userInputMessage"];
-    assert!(user.get("userInputMessageContext").is_none(), "{body}");
+    assert!(
+        user["userInputMessageContext"].get("tools").is_none(),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -738,6 +732,8 @@ async fn required_completion_retries_once_then_takes_the_answer() {
         .as_str()
         .expect("content");
     assert!(first.starts_with("Be terse."), "{first}");
+    // kiro-cli's history user turns carry only content and origin (plus any tool results).
+    assert!(history[0]["userInputMessage"].get("modelId").is_none());
     assert!(first.ends_with("Say hello."), "{first}");
     assert_eq!(
         history[1]["assistantResponseMessage"]["content"],
@@ -768,12 +764,6 @@ fn tool_alias_round_trips_to_the_client_name() {
     assert_ne!(alias, long);
     assert_eq!(names.restore(&alias), long);
     assert_eq!(names.restore("plain"), "plain");
-}
-
-#[test]
-fn wire_client_constant_is_used() {
-    assert_eq!(WireClient::Cli.origin(), "KIRO_CLI");
-    assert_eq!(WireClient::Ide.origin(), "AI_EDITOR");
 }
 
 #[tokio::test]

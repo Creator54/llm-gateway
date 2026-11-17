@@ -9,6 +9,28 @@ mod wire;
 
 pub(crate) use wire::region;
 
+/// kiro-cli's `GetUsageLimits` request, without auth; `with_email` also asks for the user's email.
+pub(crate) fn usage_limits(
+    client: &reqwest::Client,
+    region: &str,
+    profile_arn: &str,
+    with_email: bool,
+) -> reqwest::RequestBuilder {
+    let mut query = vec![("profileArn", profile_arn), ("origin", wire::ORIGIN)];
+    let mut body = serde_json::json!({ "profileArn": profile_arn, "origin": wire::ORIGIN });
+    if with_email {
+        query.push(("isEmailRequired", "true"));
+        body["isEmailRequired"] = true.into();
+    }
+    let mut request = client
+        .post(format!("https://management.{region}.kiro.dev/"))
+        .query(&query);
+    for (name, value) in wire::usage_headers() {
+        request = request.header(name, value);
+    }
+    request.body(body.to_string())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -92,9 +114,9 @@ fn fatal(status: StatusCode, message: impl Into<String>) -> Failure {
     }
 }
 
-fn headers(token: &str, profile_arn: Option<&str>, client: wire::WireClient) -> HeaderMap {
+fn headers(token: &str) -> HeaderMap {
     let mut out = HeaderMap::new();
-    for (name, value) in wire::headers(token, profile_arn, client) {
+    for (name, value) in wire::headers(token) {
         if let Ok(value) = HeaderValue::from_str(&value) {
             out.insert(name, value);
         }
@@ -236,17 +258,11 @@ impl Provider for Kiro {
             } else {
                 None
             };
-            let wire_client = if api_key || builder_id || profile_arn.is_none() {
-                wire::WireClient::Cli
-            } else {
-                wire::WireClient::Ide
-            };
             let call = Call {
                 client: self.client.clone(),
                 base_url: self.base_url.clone(),
                 token,
                 profile_arn,
-                wire_client,
                 chat,
                 session: req.session.clone(),
                 region: wire::region(&account.extra),
@@ -282,7 +298,6 @@ struct Call {
     base_url: Option<String>,
     token: String,
     profile_arn: Option<String>,
-    wire_client: wire::WireClient,
     chat: Value,
     session: String,
     region: String,
@@ -295,7 +310,6 @@ impl Call {
     ) -> Result<(reqwest::Response, payload::Built), Failure> {
         let built = payload::build(
             &self.chat,
-            self.wire_client,
             self.profile_arn.as_deref(),
             &self.session,
             forced,
@@ -304,7 +318,7 @@ impl Call {
         let url = wire::endpoint(self.base_url.as_deref(), &self.region)
             .map_err(|message| fatal(StatusCode::INTERNAL_SERVER_ERROR, message))?;
         let body = serde_json::to_vec(&built.body).unwrap_or_default();
-        let headers = headers(&self.token, self.profile_arn.as_deref(), self.wire_client);
+        let headers = headers(&self.token);
         let mut response = self
             .client
             .post(&url)
@@ -354,7 +368,6 @@ impl Call {
             base_url: self.base_url.clone(),
             token: self.token.clone(),
             profile_arn: self.profile_arn.clone(),
-            wire_client: self.wire_client,
             chat,
             session: self.session.clone(),
             region: self.region.clone(),

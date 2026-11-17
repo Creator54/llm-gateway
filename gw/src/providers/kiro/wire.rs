@@ -4,27 +4,10 @@ use super::digest::{sha256, sha256_hex};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const AMZ_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
-const SDK_VERSION: &str = "1.0.27";
-const NODE_VERSION: &str = "22.21.1";
-const KIRO_IDE_VERSION: &str = "1.0.0";
+/// The kiro-cli release whose traffic gw reproduces, header for header.
+const CLI_VERSION: &str = "2.23.1";
 const DEFAULT_REGION: &str = "us-east-1";
 pub(super) const COMPLETION_TOOL: &str = "codex_kiro_final_answer";
-
-/// Which first-party client shape the request imitates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireClient {
-    Cli,
-    Ide,
-}
-
-impl WireClient {
-    pub(super) fn origin(self) -> &'static str {
-        match self {
-            WireClient::Cli => "KIRO_CLI",
-            WireClient::Ide => "AI_EDITOR",
-        }
-    }
-}
 
 /// `api_region` → region from the profile ARN → `sso_region` → `us-east-1`.
 pub(crate) fn region(extra: &BTreeMap<String, String>) -> String {
@@ -91,58 +74,58 @@ fn is_runtime_host(host: &str) -> bool {
     normalize_region(Some(region)).is_some()
 }
 
-/// Ordered header list; insertion order is wire order.
-pub(super) fn headers(
-    token: &str,
-    profile_arn: Option<&str>,
-    client: WireClient,
-) -> Vec<(&'static str, String)> {
-    let is_api_key = token.starts_with("ksk_");
-    let mut headers: Vec<(&'static str, String)> = vec![
-        ("authorization", format!("Bearer {token}")),
+/// The origin kiro-cli stamps on user messages and management calls.
+pub(super) const ORIGIN: &str = "KIRO_CLI";
+
+/// Ordered header list matching kiro-cli; insertion order is wire order.
+pub(super) fn headers(token: &str) -> Vec<(&'static str, String)> {
+    let (agent, amz_agent) = user_agents("codewhispererstreaming/0.1.17975");
+    let mut headers = vec![
         ("content-type", "application/x-amz-json-1.0".to_owned()),
+        ("x-amz-target", AMZ_TARGET.to_owned()),
+        ("user-agent", agent),
+        ("x-amz-user-agent", amz_agent),
+        ("x-amzn-codewhisperer-optout", "false".to_owned()),
+        ("x-kiro-attempt", "1;max=3".to_owned()),
+        ("authorization", format!("Bearer {token}")),
+        ("amz-sdk-request", "attempt=1; max=3".to_owned()),
+        ("amz-sdk-invocation-id", uuid_v4()),
+        ("accept", "*/*".to_owned()),
     ];
-    match client {
-        WireClient::Cli => {
-            headers.push(("accept", "*/*".to_owned()));
-            headers.push(("x-amz-target", AMZ_TARGET.to_owned()));
-            headers.push(("user-agent", cli_user_agent(true)));
-            headers.push(("x-amz-user-agent", cli_user_agent(false)));
-            headers.push(("x-amzn-codewhisperer-optout", "true".to_owned()));
-            headers.push(("amz-sdk-request", "attempt=1; max=3".to_owned()));
-            headers.push(("amz-sdk-invocation-id", uuid_v4()));
-            if is_api_key {
-                headers.push(("tokentype", "API_KEY".to_owned()));
-            }
-        }
-        WireClient::Ide => {
-            headers.push(("accept", "application/vnd.amazon.eventstream".to_owned()));
-            headers.push(("x-amz-target", AMZ_TARGET.to_owned()));
-            let fingerprint = fingerprint();
-            headers.push((
-                "user-agent",
-                format!(
-                    "aws-sdk-js/{SDK_VERSION} ua/2.1 os/{} lang/js md/nodejs#{NODE_VERSION} \
-                     api/codewhispererstreaming#{SDK_VERSION} m/E KiroIDE-{KIRO_IDE_VERSION}-{fingerprint}",
-                    os_tag()
-                ),
-            ));
-            headers.push((
-                "x-amz-user-agent",
-                format!("aws-sdk-js/{SDK_VERSION} KiroIDE-{KIRO_IDE_VERSION}-{fingerprint}"),
-            ));
-            headers.push(("x-amzn-codewhisperer-optout", "true".to_owned()));
-            headers.push(("x-amzn-kiro-agent-mode", "vibe".to_owned()));
-            headers.push(("amz-sdk-invocation-id", uuid_v4()));
-        }
-    }
-    if let Some(arn) = profile_arn {
-        headers.push(("x-amzn-kiro-profile-arn", arn.to_owned()));
+    if token.starts_with("ksk_") {
+        headers.push(("tokentype", "API_KEY".to_owned()));
     }
     headers
 }
 
-fn cli_platform() -> &'static str {
+/// Headers for kiro-cli's `GetUsageLimits` call, minus `authorization`.
+pub(super) fn usage_headers() -> Vec<(&'static str, String)> {
+    let (agent, amz_agent) = user_agents("codewhispererruntime/0.1.17975");
+    vec![
+        ("content-type", "application/x-amz-json-1.0".to_owned()),
+        (
+            "x-amz-target",
+            "AmazonCodeWhispererService.GetUsageLimits".to_owned(),
+        ),
+        ("user-agent", agent),
+        ("x-amz-user-agent", amz_agent),
+        ("x-amzn-codewhisperer-optout", "false".to_owned()),
+        ("amz-sdk-request", "attempt=1; max=3".to_owned()),
+        ("amz-sdk-invocation-id", uuid_v4()),
+        ("accept", "*/*".to_owned()),
+    ]
+}
+
+/// kiro-cli's `envState`: the host OS and the working directory it runs in.
+pub(super) fn env_state() -> serde_json::Value {
+    let mut state = serde_json::json!({ "operatingSystem": platform() });
+    if let Ok(dir) = std::env::current_dir() {
+        state["currentWorkingDirectory"] = dir.to_string_lossy().into();
+    }
+    state
+}
+
+fn platform() -> &'static str {
     if cfg!(target_os = "windows") {
         "windows"
     } else if cfg!(target_os = "macos") {
@@ -152,55 +135,16 @@ fn cli_platform() -> &'static str {
     }
 }
 
-fn cli_user_agent(include_app_version: bool) -> String {
-    let mut parts = vec![
-        "aws-sdk-rust/1.3.15".to_owned(),
-        "ua/2.1".to_owned(),
-        "api/codewhispererstreaming/0.1.17975".to_owned(),
-        format!("os/{}", cli_platform()),
-        "lang/rust/1.92.0".to_owned(),
-    ];
-    if include_app_version {
-        parts.push("md/appVersion-2.14.2".to_owned());
-    }
-    parts.push("m/F".to_owned());
-    parts.push("app/AmazonQ-For-CLI".to_owned());
-    parts.join(" ")
-}
-
-fn os_tag() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos#24.0.0"
-    } else if cfg!(target_os = "windows") {
-        "win32#10.0.26100"
-    } else {
-        "linux#6.8.0"
-    }
-}
-
-fn fingerprint() -> String {
-    let host = hostname().unwrap_or_else(|| "default".to_owned());
-    let user = username().unwrap_or_else(|| "user".to_owned());
-    sha256_hex(format!("{host}-{user}-kiro").as_bytes())
-        .chars()
-        .take(64)
-        .collect()
-}
-
-fn hostname() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-}
-
-fn username() -> Option<String> {
-    ["USER", "LOGNAME", "USERNAME"]
-        .iter()
-        .find_map(|key| std::env::var(key).ok())
-        .filter(|value| !value.is_empty())
+/// The `user-agent` and `x-amz-user-agent` pair the CLI's AWS SDK sends for `api`.
+fn user_agents(api: &str) -> (String, String) {
+    let base = format!(
+        "aws-sdk-rust/1.3.15 ua/2.1 api/{api} os/{} lang/rust/1.92.0",
+        platform()
+    );
+    (
+        format!("{base} md/appVersion-{CLI_VERSION} app/AmazonQ-For-CLI"),
+        format!("{base} m/F app/AmazonQ-For-CLI"),
+    )
 }
 
 /// UUID v4 text, from the OS CSPRNG when available.

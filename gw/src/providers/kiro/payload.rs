@@ -1,7 +1,7 @@
 //! Chat request to Kiro `GenerateAssistantResponse` body.
 
 use super::tools::{completion_tool, convert_tools};
-use super::wire::{self, ToolNames, WireClient};
+use super::wire::{self, ToolNames};
 use serde_json::{json, Map, Value};
 
 pub(super) const CONTINUATION_MESSAGE: &str =
@@ -57,7 +57,6 @@ pub(super) fn validate_capabilities(chat: &Value) -> Result<(), String> {
 
 pub(super) fn build(
     chat: &Value,
-    client: WireClient,
     profile_arn: Option<&str>,
     session: &str,
     forced: Option<CompletionMode>,
@@ -165,7 +164,6 @@ pub(super) fn build(
     let system_prefix = bounded_system(system);
     assembled(
         chat,
-        client,
         model_id,
         session,
         profile_arn,
@@ -180,7 +178,6 @@ pub(super) fn build(
 #[allow(clippy::too_many_arguments)]
 fn assembled(
     chat: &Value,
-    client: WireClient,
     model_id: String,
     session: &str,
     profile_arn: Option<&str>,
@@ -237,7 +234,6 @@ fn assembled(
     }
     finish(
         chat,
-        client,
         model_id,
         session,
         profile_arn,
@@ -252,7 +248,6 @@ fn assembled(
 #[allow(clippy::too_many_arguments)]
 fn finish(
     chat: &Value,
-    client: WireClient,
     model_id: String,
     session: &str,
     profile_arn: Option<&str>,
@@ -288,18 +283,12 @@ fn finish(
             }
         }
     }
-    let history: Vec<Value> = history
-        .iter()
-        .map(|turn| entry(turn, &model_id, client, &[]))
-        .collect();
-    let current = entry(&current, &model_id, client, &tools);
+    let history: Vec<Value> = history.iter().map(|turn| entry(turn, None, &[])).collect();
+    let current = entry(&current, Some(&model_id), &tools);
 
     let mut state = Map::new();
     state.insert("chatTriggerType".into(), json!("MANUAL"));
-    if client == WireClient::Cli {
-        state.insert("agentContinuationId".into(), json!(wire::uuid_v4()));
-        state.insert("agentTaskType".into(), json!("vibe"));
-    }
+    state.insert("agentTaskType".into(), json!("vibe"));
     state.insert(
         "conversationId".into(),
         json!(wire::conversation_id(session)),
@@ -331,8 +320,9 @@ fn continuation() -> Turn {
     }
 }
 
-/// Wire entry for a turn. `tools` is only attached to the current user message.
-fn entry(turn: &Turn, model_id: &str, client: WireClient, tools: &[Value]) -> Value {
+/// Wire entry for a turn. kiro-cli names the model and attaches `tools` on the current user
+/// message only; history user turns carry just their content and origin.
+fn entry(turn: &Turn, model_id: Option<&str>, tools: &[Value]) -> Value {
     match turn {
         Turn::Assistant { content, tool_uses } => {
             let mut message = Map::new();
@@ -349,13 +339,19 @@ fn entry(turn: &Turn, model_id: &str, client: WireClient, tools: &[Value]) -> Va
         } => {
             let mut message = Map::new();
             message.insert("content".into(), json!(content));
-            message.insert("modelId".into(), json!(model_id));
-            message.insert("origin".into(), json!(client.origin()));
+            if let Some(model_id) = model_id {
+                message.insert("modelId".into(), json!(model_id));
+            }
+            message.insert("origin".into(), json!(wire::ORIGIN));
             if !images.is_empty() {
                 message.insert("images".into(), Value::Array(images.clone()));
             }
-            if !tool_results.is_empty() || !tools.is_empty() {
+            let current = model_id.is_some();
+            if current || !tool_results.is_empty() {
                 let mut context = Map::new();
+                if current {
+                    context.insert("envState".into(), wire::env_state());
+                }
                 if !tool_results.is_empty() {
                     context.insert("toolResults".into(), Value::Array(tool_results.clone()));
                 }
