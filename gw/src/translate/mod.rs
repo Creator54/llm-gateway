@@ -12,7 +12,22 @@ pub use claude::{chat_request_to_messages, messages_reply_to_chat, MessagesToCha
 pub use reply::{chat_to_messages, chat_to_responses, responses_reply_to_chat};
 pub use request::{
     chat_to_responses as chat_request_to_responses, messages_to_chat, responses_to_chat,
+    tool_namespaces,
 };
+
+/// Flattened tool name to the `(namespace, name)` the client declared it under.
+pub type ToolNamespaces = std::collections::BTreeMap<String, (String, String)>;
+
+/// A `function_call` item's `name`, plus `namespace` when the wire name was flattened.
+fn name_call(item: &mut serde_json::Value, wire: &str, namespaces: &ToolNamespaces) {
+    match namespaces.get(wire) {
+        Some((namespace, name)) => {
+            item["namespace"] = namespace.as_str().into();
+            item["name"] = name.as_str().into();
+        }
+        None => item["name"] = wire.into(),
+    }
+}
 pub use sse::SseParser;
 pub use stream::{ChatStream, MessagesStream, ResponsesStream};
 

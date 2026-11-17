@@ -1121,7 +1121,7 @@ impl Gateway {
         info.account = account.to_owned();
         // A combo request counts under the provider model that really answered it.
         info.provider.clone_from(&target.provider);
-        info.model.clone_from(&target.model);
+        info.model = providers::usage_model(&target.provider, &target.model);
         // Usage and pricing tell the fast tier apart by its suffix.
         if info.fast && !info.model.ends_with(FAST) {
             info.model.push_str(FAST);

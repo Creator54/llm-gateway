@@ -332,9 +332,7 @@ async fn buffered_reply(req: &Request, response: reqwest::Response) -> Result<Re
         Inbound::Responses => chat_to_responses(
             &chat,
             &req.model,
-            serde_json::from_slice::<Value>(&req.body)
-                .ok()
-                .and_then(|body| body.get("parallel_tool_calls").and_then(Value::as_bool)),
+            &serde_json::from_slice(&req.body).unwrap_or_default(),
         )
         .map_err(|error| translate_failure(&error, req.inbound))?,
         Inbound::Messages => chat_to_messages(&chat, &req.model)
@@ -364,9 +362,11 @@ impl Decoder {
     fn new(req: &Request) -> Self {
         let unique = format!("{:032x}", unique_suffix());
         let encoder = match req.inbound {
-            Inbound::Responses => {
-                Encoder::Responses(ResponsesStream::new(format!("resp_{unique}"), &req.model))
-            }
+            Inbound::Responses => Encoder::Responses(ResponsesStream::new(
+                format!("resp_{unique}"),
+                &req.model,
+                &serde_json::from_slice(&req.body).unwrap_or_default(),
+            )),
             _ => Encoder::Messages(MessagesStream::new(format!("msg_{unique}"), &req.model)),
         };
         Self {

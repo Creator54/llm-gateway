@@ -1,6 +1,9 @@
 //! Live Chat chunks rewritten as Responses or Messages events.
 
-use super::{chat_usage, messages_usage, new_id, now, responses_usage, stop_reason};
+use super::{
+    chat_usage, messages_usage, name_call, new_id, now, responses_usage, stop_reason,
+    ToolNamespaces,
+};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
@@ -54,11 +57,13 @@ impl CallState {
         }
     }
 
-    fn item(&self, status: &str, arguments: &str) -> Value {
-        json!({
+    fn item(&self, status: &str, arguments: &str, namespaces: &ToolNamespaces) -> Value {
+        let mut item = json!({
             "id": self.item_id, "type": "function_call", "status": status,
-            "call_id": self.call_id, "name": self.name, "arguments": arguments,
-        })
+            "call_id": self.call_id, "arguments": arguments,
+        });
+        name_call(&mut item, &self.name, namespaces);
+        item
     }
 }
 
@@ -219,6 +224,7 @@ pub struct ResponsesStream {
     message_id: String,
     text: String,
     calls: BTreeMap<u64, CallState>,
+    namespaces: ToolNamespaces,
     usage: Value,
     seq: u64,
     started: bool,
@@ -226,14 +232,15 @@ pub struct ResponsesStream {
 }
 
 impl ResponsesStream {
-    /// Start a stream for one client response.
-    pub fn new(response_id: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Start a stream for one client response; `request` is the client's Responses body.
+    pub fn new(response_id: impl Into<String>, model: impl Into<String>, request: &Value) -> Self {
         Self {
             response_id: response_id.into(),
             model: model.into(),
             message_id: new_id("msg"),
             text: String::new(),
             calls: BTreeMap::new(),
+            namespaces: super::tool_namespaces(request),
             usage: json!({}),
             seq: 0,
             started: false,
@@ -323,7 +330,7 @@ impl ResponsesStream {
                 let item = {
                     let state = self.calls.get_mut(&index).expect("call state");
                     state.announced = true;
-                    state.item("in_progress", "")
+                    state.item("in_progress", "", &self.namespaces)
                 };
                 let event = self.event(
                     "response.output_item.added",
@@ -390,7 +397,7 @@ impl ResponsesStream {
             .collect();
         for (index, state) in calls {
             if !state.announced {
-                let item = state.item("in_progress", "");
+                let item = state.item("in_progress", "", &self.namespaces);
                 let event = self.event(
                     "response.output_item.added",
                     json!({ "output_index": index + 1, "item": item }),
@@ -403,7 +410,7 @@ impl ResponsesStream {
                     "arguments": state.arguments
                 }),
             ));
-            let item = state.item("completed", &state.arguments);
+            let item = state.item("completed", &state.arguments, &self.namespaces);
             out.extend(self.event(
                 "response.output_item.done",
                 json!({ "output_index": index + 1, "item": item }),
@@ -425,7 +432,7 @@ impl ResponsesStream {
     fn output_items(&self) -> Vec<Value> {
         let mut output = vec![self.message_item()];
         for state in self.calls.values() {
-            output.push(state.item("completed", &state.arguments));
+            output.push(state.item("completed", &state.arguments, &self.namespaces));
         }
         output
     }
@@ -696,7 +703,7 @@ mod tests {
 
     #[test]
     fn streams_responses_text() {
-        let mut stream = ResponsesStream::new("resp_1", "provider/model");
+        let mut stream = ResponsesStream::new("resp_1", "provider/model", &json!({}));
         let mut out = stream.start();
         out.extend(stream.push_chunk(r#"{"choices":[{"delta":{"content":"Hel"}}]}"#));
         out.extend(stream.push_chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#));
@@ -727,7 +734,7 @@ mod tests {
 
     #[test]
     fn streams_responses_tool_arguments_in_pieces() {
-        let mut stream = ResponsesStream::new("resp_2", "m");
+        let mut stream = ResponsesStream::new("resp_2", "m", &json!({}));
         let mut out = stream.start();
         out.extend(stream.push_chunk(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",

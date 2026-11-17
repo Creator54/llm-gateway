@@ -637,15 +637,26 @@ async fn status(
     if rows.is_empty() {
         println!("\nno usage in the last {since}");
     } else {
-        // Group by provider, busiest first within each.
+        // Group by provider, then model, busiest model and account first within each.
+        let mut model_requests = std::collections::HashMap::new();
+        for row in &rows {
+            *model_requests
+                .entry((row.provider.clone(), row.model.clone()))
+                .or_insert(0) += row.requests;
+        }
+        let busy = |row: &gw::store::UsageSummary| {
+            model_requests[&(row.provider.clone(), row.model.clone())]
+        };
         rows.sort_by(|a, b| {
             a.provider
                 .cmp(&b.provider)
+                .then(busy(b).cmp(&busy(a)))
+                .then(a.model.cmp(&b.model))
                 .then(b.requests.cmp(&a.requests))
         });
         let prices = gw::pricing::Prices::load(state_dir).await;
         let (headers, mut cells) = gw::metrics::stats_table(&rows, &prices);
-        blank_repeats(&mut cells, 1);
+        blank_repeats(&mut cells, 2);
         print!(
             "\n{}",
             ui.render_table(

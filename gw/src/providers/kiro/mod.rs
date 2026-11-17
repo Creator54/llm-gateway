@@ -12,6 +12,11 @@ pub(crate) use wire::region;
 #[cfg(test)]
 mod tests;
 
+/// The CodeWhisperer id for a user model id, folding `claude-haiku-4-5` into `claude-haiku-4.5`.
+pub fn model_id(model: &str) -> String {
+    wire::normalize_model_id(model)
+}
+
 use crate::provider::{Account, Credential, Failure, Inbound, Provider, Reply, Request};
 use crate::translate::{
     chat_to_messages, chat_to_responses, messages_to_chat, responses_to_chat, Inbound as Protocol,
@@ -248,16 +253,19 @@ impl Provider for Kiro {
             };
             let (response, built) = call.send(None).await?;
             let chat = call.chat.clone();
-            let session = session_parts(&chat, req.inbound, &built, call);
+            let session = session_parts(req, &chat, &built, call);
             if req.stream {
                 Ok(stream_reply(response, session))
             } else {
                 let chat = collect(response, &session).await?;
                 let body = match req.inbound {
                     Inbound::Chat => chat,
-                    Inbound::Responses => {
-                        chat_to_responses(&chat, &req.model, None).map_err(translate_failure)?
-                    }
+                    Inbound::Responses => chat_to_responses(
+                        &chat,
+                        &req.model,
+                        &serde_json::from_slice(&req.body).unwrap_or_default(),
+                    )
+                    .map_err(translate_failure)?,
                     Inbound::Messages => {
                         chat_to_messages(&chat, &req.model).map_err(translate_failure)?
                     }
@@ -375,17 +383,19 @@ struct Session {
     model: String,
     inbound: Protocol,
     names: wire::ToolNames,
+    /// The client's request body, which declares its tools.
+    request: Value,
     mode: payload::CompletionMode,
     call: Call,
 }
 
-fn session_parts(chat: &Value, inbound: Inbound, built: &payload::Built, call: Call) -> Session {
+fn session_parts(req: &Request, chat: &Value, built: &payload::Built, call: Call) -> Session {
     let model = chat
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let inbound = match inbound {
+    let inbound = match req.inbound {
         Inbound::Chat => Protocol::Chat,
         Inbound::Responses => Protocol::Responses,
         Inbound::Messages => Protocol::Messages,
@@ -394,6 +404,7 @@ fn session_parts(chat: &Value, inbound: Inbound, built: &payload::Built, call: C
         model,
         inbound,
         names: built.names.clone(),
+        request: serde_json::from_slice(&req.body).unwrap_or_default(),
         mode: built.mode,
         call,
     }
@@ -450,7 +461,7 @@ async fn collect(response: reqwest::Response, session: &Session) -> Result<Value
 fn stream_reply(response: reqwest::Response, session: Session) -> Reply {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
-        let mut sink = Sink::new(session.inbound, &session.model);
+        let mut sink = Sink::new(&session);
         if let Some(bytes) = sink.start() {
             if tx.send(Ok(bytes)).await.is_err() {
                 return;
@@ -560,10 +571,13 @@ enum Sink {
 }
 
 impl Sink {
-    fn new(inbound: Protocol, model: &str) -> Self {
-        match inbound {
+    fn new(session: &Session) -> Self {
+        let model = &session.model;
+        match session.inbound {
             Protocol::Chat => Sink::Chat,
-            Protocol::Responses => Sink::Responses(ResponsesStream::new("resp_kiro", model)),
+            Protocol::Responses => {
+                Sink::Responses(ResponsesStream::new("resp_kiro", model, &session.request))
+            }
             Protocol::Messages => Sink::Messages(MessagesStream::new("msg_kiro", model)),
         }
     }

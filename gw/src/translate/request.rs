@@ -1,6 +1,6 @@
 //! Client requests in Chat, Responses, or Messages form, rewritten for the upstream wire.
 
-use super::{new_id, Error};
+use super::{new_id, Error, ToolNamespaces};
 use serde_json::{json, Map, Value};
 
 /// Chat completions request as an equivalent Responses request body.
@@ -282,7 +282,11 @@ pub fn responses_to_chat(request: &Value, upstream_model: &str) -> Result<Value,
     }
     if let Some(choice) = request.get("tool_choice") {
         let choice = match choice.get("name").and_then(Value::as_str) {
-            Some(name) => json!({ "type": "function", "function": { "name": name } }),
+            Some(name) => {
+                let namespace = choice.get("namespace").and_then(Value::as_str);
+                let name = namespaced(namespace.unwrap_or_default(), name);
+                json!({ "type": "function", "function": { "name": name } })
+            }
             None => choice.clone(),
         };
         object.insert("tool_choice".into(), choice);
@@ -383,7 +387,10 @@ fn responses_item(item: &Value, messages: &mut Vec<Value>) -> Result<(), Error> 
                 "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
                 "type": "function",
                 "function": {
-                    "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    "name": namespaced(
+                        item.get("namespace").and_then(Value::as_str).unwrap_or_default(),
+                        item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    ),
                     "arguments": arguments_text(item.get("arguments")),
                 }
             });
@@ -531,6 +538,61 @@ fn messages_tool_choice(choice: &Value) -> Value {
     }
 }
 
+/// Responses tool types executed by OpenAI rather than the client.
+const HOSTED_TOOLS: [&str; 11] = [
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "computer_use_preview",
+    "computer_use",
+    "code_interpreter",
+    "image_generation",
+    "image_gen",
+    "mcp",
+    "tool_search",
+    "local_shell",
+];
+
+/// Wire name of a namespaced tool for upstreams that only know flat function names.
+fn namespaced(namespace: &str, name: &str) -> String {
+    match namespace {
+        "" | "functions" => name.to_owned(),
+        _ => format!("{namespace}__{name}"),
+    }
+}
+
+/// Flattened wire name to `(namespace, name)` for every namespaced tool in a Responses request,
+/// so replies can name calls the way the client declared them.
+pub fn tool_namespaces(request: &Value) -> ToolNamespaces {
+    let mut map = ToolNamespaces::new();
+    let groups = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for group in groups.filter(|tool| tool.get("type").and_then(Value::as_str) == Some("namespace"))
+    {
+        let namespace = group
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for child in group
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = child.get("name").and_then(Value::as_str) {
+                let wire = namespaced(namespace, name);
+                if wire != name {
+                    map.insert(wire, (namespace.to_owned(), name.to_owned()));
+                }
+            }
+        }
+    }
+    map
+}
+
 fn chat_tools(tools: Option<&Value>) -> Result<Option<Vec<Value>>, Error> {
     let Some(tools) = tools.and_then(Value::as_array) else {
         return Ok(None);
@@ -539,6 +601,25 @@ fn chat_tools(tools: Option<&Value>) -> Result<Option<Vec<Value>>, Error> {
     for tool in tools {
         match tool.get("type").and_then(Value::as_str) {
             Some("function") => {}
+            Some("namespace") => {
+                let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+                for child in tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(name) = child.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let mut child = child.clone();
+                    child["name"] = Value::String(namespaced(namespace, name));
+                    converted.extend(chat_tools(Some(&json!([child])))?.into_iter().flatten());
+                }
+                continue;
+            }
+            // Hosted tools run on OpenAI's side; a Chat upstream can only lack them.
+            Some(hosted) if HOSTED_TOOLS.contains(&hosted) => continue,
             // Older clients omit `type` and send `function` or `name` directly.
             None if tool.get("function").is_some() || tool.get("name").is_some() => {}
             Some(other) => {
@@ -788,10 +869,10 @@ mod tests {
     #[test]
     fn rejects_unsupported_tool_types() {
         let responses = json!({ "model": "m", "input": "hi",
-            "tools": [{ "type": "web_search" }] });
+            "tools": [{ "type": "custom", "name": "apply_patch" }] });
         let error = responses_to_chat(&responses, "m").unwrap_err();
         assert_eq!(error.status, 400);
-        assert!(error.message.contains("web_search"), "{}", error.message);
+        assert!(error.message.contains("custom"), "{}", error.message);
 
         let messages = json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }],
             "tools": [{ "type": "computer_20241022", "name": "computer" }] });
@@ -801,6 +882,40 @@ mod tests {
             error.message.contains("computer_20241022"),
             "{}",
             error.message
+        );
+    }
+
+    #[test]
+    fn flattens_namespaces_and_drops_hosted_tools() {
+        let responses = json!({ "model": "m",
+            "input": [{ "type": "function_call", "call_id": "c1", "namespace": "multi_agent_v1",
+                "name": "wait_agent", "arguments": "{}" }],
+            "tools": [
+                { "type": "function", "name": "exec_command" },
+                { "type": "namespace", "name": "multi_agent_v1", "tools": [
+                    { "type": "function", "name": "spawn_agent", "parameters": { "type": "object" } },
+                    { "type": "function", "name": "wait_agent" },
+                ] },
+                { "type": "web_search", "external_web_access": false },
+            ] });
+        let chat = responses_to_chat(&responses, "m").unwrap();
+        let names: Vec<_> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "exec_command",
+                "multi_agent_v1__spawn_agent",
+                "multi_agent_v1__wait_agent"
+            ]
+        );
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "multi_agent_v1__wait_agent"
         );
     }
 }

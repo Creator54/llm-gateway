@@ -1,6 +1,9 @@
 //! Whole (non-streamed) Chat replies in Responses or Messages form, and the inverse.
 
-use super::{chat_usage, messages_usage, new_id, now, responses_usage, stop_reason, Error};
+use super::{
+    chat_usage, messages_usage, name_call, new_id, now, responses_usage, stop_reason, Error,
+    ToolNamespaces,
+};
 use serde_json::{json, Value};
 
 /// Responses reply as a Chat completion; text and tool calls keep their order.
@@ -71,8 +74,10 @@ pub fn responses_reply_to_chat(response: &Value, requested_model: &str) -> Resul
 pub fn chat_to_responses(
     chat: &Value,
     requested_model: &str,
-    parallel_tool_calls: Option<bool>,
+    request: &Value,
 ) -> Result<Value, Error> {
+    let namespaces = super::tool_namespaces(request);
+    let parallel_tool_calls = request.get("parallel_tool_calls").and_then(Value::as_bool);
     let message = chat
         .pointer("/choices/0/message")
         .ok_or_else(|| Error::bad_gateway("upstream response has no choices"))?;
@@ -85,7 +90,7 @@ pub fn chat_to_responses(
         }));
     }
     for call in &calls {
-        output.push(function_call_item(call, "completed"));
+        output.push(function_call_item(call, "completed", &namespaces));
     }
     let finish = finish_reason(chat);
     let truncated = finish == Some("length");
@@ -175,14 +180,16 @@ pub(super) fn input_of(call: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-pub(super) fn function_call_item(call: &Value, status: &str) -> Value {
-    json!({
+fn function_call_item(call: &Value, status: &str, namespaces: &ToolNamespaces) -> Value {
+    let mut item = json!({
         "id": new_id("fc"), "type": "function_call", "status": status,
-        "call_id": call_id(call), "name": name_of(call),
+        "call_id": call_id(call),
         "arguments": call.pointer("/function/arguments")
             .and_then(Value::as_str)
             .unwrap_or_default(),
-    })
+    });
+    name_call(&mut item, &name_of(call), namespaces);
+    item
 }
 
 #[cfg(test)]
@@ -197,7 +204,7 @@ mod tests {
                 "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
             }),
             "provider/model",
-            None,
+            &json!({}),
         )
         .unwrap();
         assert_eq!(response["object"], "response");
@@ -222,7 +229,7 @@ mod tests {
                 }
             }),
             "m",
-            None,
+            &json!({}),
         )
         .unwrap();
         assert_eq!(response["usage"]["input_tokens"], 100);
@@ -240,7 +247,7 @@ mod tests {
                 "function": { "name": "read", "arguments": "{\"path\":\"a\"}" }
             }]}, "finish_reason": "tool_calls" }] }),
             "m",
-            None,
+            &json!({}),
         )
         .unwrap();
         let item = &response["output"][0];
@@ -284,7 +291,9 @@ mod tests {
     fn rejects_reply_without_choices() {
         assert_eq!(chat_to_messages(&json!({}), "m").unwrap_err().status, 502);
         assert_eq!(
-            chat_to_responses(&json!({}), "m", None).unwrap_err().status,
+            chat_to_responses(&json!({}), "m", &json!({}))
+                .unwrap_err()
+                .status,
             502
         );
     }
@@ -294,7 +303,7 @@ mod tests {
         let response = chat_to_responses(
             &json!({ "choices": [{ "message": { "content": "cut" }, "finish_reason": "length" }] }),
             "m",
-            Some(false),
+            &json!({ "parallel_tool_calls": false }),
         )
         .unwrap();
         assert_eq!(response["status"], "incomplete");
@@ -303,5 +312,24 @@ mod tests {
             "max_output_tokens"
         );
         assert_eq!(response["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn restores_namespaces_on_flattened_tool_calls() {
+        let request = json!({ "tools": [{ "type": "namespace", "name": "multi_agent_v1",
+            "tools": [{ "type": "function", "name": "spawn_agent" }] }] });
+        let response = chat_to_responses(
+            &json!({ "choices": [{ "message": { "tool_calls": [
+                { "id": "c1", "function": { "name": "multi_agent_v1__spawn_agent", "arguments": "{}" } },
+                { "id": "c2", "function": { "name": "exec_command", "arguments": "{}" } },
+            ] }, "finish_reason": "tool_calls" }] }),
+            "m",
+            &request,
+        )
+        .unwrap();
+        assert_eq!(response["output"][0]["namespace"], "multi_agent_v1");
+        assert_eq!(response["output"][0]["name"], "spawn_agent");
+        assert!(response["output"][1].get("namespace").is_none());
+        assert_eq!(response["output"][1]["name"], "exec_command");
     }
 }

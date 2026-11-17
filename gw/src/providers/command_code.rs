@@ -1175,13 +1175,12 @@ async fn buffered_reply(req: &Request, response: reqwest::Response) -> Result<Re
     let chat = fold.chat();
     let reply = match req.inbound {
         Inbound::Chat => chat,
-        Inbound::Responses => {
-            let parallel = serde_json::from_slice::<Value>(&req.body)
-                .ok()
-                .and_then(|body| body.get("parallel_tool_calls").and_then(Value::as_bool));
-            chat_to_responses(&chat, &req.model, parallel)
-                .map_err(|error| translate_failure(&error, req.inbound))?
-        }
+        Inbound::Responses => chat_to_responses(
+            &chat,
+            &req.model,
+            &serde_json::from_slice(&req.body).unwrap_or_default(),
+        )
+        .map_err(|error| translate_failure(&error, req.inbound))?,
         Inbound::Messages => chat_to_messages(&chat, &req.model)
             .map_err(|error| translate_failure(&error, req.inbound))?,
     };
@@ -1254,7 +1253,11 @@ impl Decoder {
                 let id = format!("resp_{unique}");
                 (
                     id.clone(),
-                    Encoder::Responses(ResponsesStream::new(id, &req.model)),
+                    Encoder::Responses(ResponsesStream::new(
+                        id,
+                        &req.model,
+                        &serde_json::from_slice(&req.body).unwrap_or_default(),
+                    )),
                 )
             }
             Inbound::Messages => {

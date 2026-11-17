@@ -197,9 +197,7 @@ async fn whole(
         Inbound::Responses => chat_to_responses(
             &chat,
             &req.model,
-            serde_json::from_slice::<Value>(&req.body)
-                .ok()
-                .and_then(|body| body.get("parallel_tool_calls").and_then(Value::as_bool)),
+            &serde_json::from_slice(&req.body).unwrap_or_default(),
         )
         .map_err(|error| translated(&error))?,
         Inbound::Messages => {
@@ -264,6 +262,7 @@ fn streamed(
         Inbound::Responses => Outbound::Responses(ResponsesStream::new(
             format!("resp_{}", &util::uuid4()[..8]),
             &req.model,
+            &serde_json::from_slice(&req.body).unwrap_or_default(),
         )),
         Inbound::Messages => Outbound::Messages(MessagesStream::new(
             format!("msg_{}", &util::uuid4()[..8]),

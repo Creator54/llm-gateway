@@ -29,6 +29,14 @@ pub fn canonical(name: &str) -> &str {
     }
 }
 
+/// One spelling per model for usage rows, where a provider accepts several.
+pub fn usage_model(provider: &str, model: &str) -> String {
+    match provider {
+        "kiro" => kiro::model_id(model),
+        _ => model.to_owned(),
+    }
+}
+
 /// Whether `name` has a native adapter.
 pub fn is_provider(name: &str) -> bool {
     NAMES.contains(&name)
