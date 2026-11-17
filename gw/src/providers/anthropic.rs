@@ -53,13 +53,21 @@ const PASSTHROUGH_FIELDS: [&str; 15] = [
 pub struct Anthropic {
     client: reqwest::Client,
     base_url: String,
+    /// Chat Completions bodies only become Messages here, after the gateway's
+    /// cache edits, so their breakpoints are added on translation.
+    cache: crate::cache::Options,
 }
 
 impl Anthropic {
-    pub fn new(client: reqwest::Client, base_url: Option<String>) -> Self {
+    pub fn new(
+        client: reqwest::Client,
+        base_url: Option<String>,
+        cache: crate::cache::Options,
+    ) -> Self {
         Self {
             client,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE.to_owned()),
+            cache,
         }
     }
 }
@@ -97,12 +105,12 @@ impl Provider for Anthropic {
     ) -> futures_util::future::BoxFuture<'a, Result<Reply, Failure>> {
         Box::pin(async move {
             let fast = req.fast == Some(true) && fast_model(&req.model);
-            let mut plan = plan(&self.base_url, req, account, fast)?;
+            let mut plan = plan(&self.base_url, req, account, fast, &self.cache)?;
             let mut resp = self.post(&plan).await?;
             if fast && fast_refused(&mut resp).await {
                 // Fast mode is a separately entitled lane; Claude Code resends at standard speed.
                 tracing::debug!(model = %req.model, "fast mode refused; resending at standard speed");
-                plan = self::plan(&self.base_url, req, account, false)?;
+                plan = self::plan(&self.base_url, req, account, false, &self.cache)?;
                 resp = self.post(&plan).await?;
             }
             let reply = reply(resp, plan.stream, plan.renames).await?;
@@ -228,7 +236,13 @@ fn protocol(inbound: Inbound) -> crate::translate::Inbound {
 }
 
 /// Decide the whole request: URL, headers in order, wire body.
-fn plan(base_url: &str, req: &Request, account: &Account, fast: bool) -> Result<Plan, Failure> {
+fn plan(
+    base_url: &str,
+    req: &Request,
+    account: &Account,
+    fast: bool,
+    cache: &crate::cache::Options,
+) -> Result<Plan, Failure> {
     if req.inbound == Inbound::Responses {
         return Err(fatal(
             req.inbound,
@@ -257,9 +271,9 @@ fn plan(base_url: &str, req: &Request, account: &Account, fast: bool) -> Result<
             .and_then(Value::as_str)
             .unwrap_or(&req.model)
             .to_owned();
-        caller = match crate::translate::chat_request_to_messages(&source, &req.model)
-            .map_err(|e| translated(req.inbound, &e))?
-        {
+        let messages = crate::translate::chat_request_to_messages(&source, &req.model)
+            .map_err(|e| translated(req.inbound, &e))?;
+        caller = match crate::cache::anthropic_messages(messages, cache) {
             Value::Object(body) => body,
             _ => return Err(fatal(req.inbound, "request body is not a JSON object")),
         };
@@ -1180,6 +1194,7 @@ async fn read_capped(resp: &mut reqwest::Response, max: usize) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Options;
     use axum::extract::State;
     use axum::response::Response;
     use axum::routing::any;
@@ -1295,7 +1310,14 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("interleaved-thinking-2025-05-14,other-beta"),
         );
-        let plan = plan("https://api.anthropic.com", &req, &oauth_account(), false).unwrap();
+        let plan = plan(
+            "https://api.anthropic.com",
+            &req,
+            &oauth_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
 
         assert_eq!(plan.url, "https://api.anthropic.com/v1/messages");
         assert!(!plan.stream);
@@ -1367,7 +1389,14 @@ mod tests {
             Inbound::Messages,
             json!({ "model": "m", "max_tokens": 8, "messages": [], "stream": true }),
         );
-        let direct = plan("http://127.0.0.1:9", &req, &key_account(), false).unwrap();
+        let direct = plan(
+            "http://127.0.0.1:9",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         assert_eq!(direct.url, "http://127.0.0.1:9/v1/messages");
         let pairs = header_pairs(&direct.headers);
         assert_eq!(pairs[2], ("Accept", "text/event-stream"));
@@ -1384,7 +1413,14 @@ mod tests {
         bearer
             .extra
             .insert("api_key_transport".into(), "bearer".into());
-        let by_bearer = plan("http://127.0.0.1:9", &req, &bearer, false).unwrap();
+        let by_bearer = plan(
+            "http://127.0.0.1:9",
+            &req,
+            &bearer,
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         assert_eq!(
             header_pairs(&by_bearer.headers)[4],
             ("Authorization", "Bearer sk-ant-test")
@@ -1401,12 +1437,26 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("interleaved-thinking-2025-05-14"),
         );
-        let first = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap();
+        let first = plan(
+            "https://api.anthropic.com",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         assert_eq!(
             header_pairs(&first.headers).last().copied(),
             Some(("anthropic-beta", "interleaved-thinking-2025-05-14"))
         );
-        let local = plan("http://127.0.0.1:9", &req, &key_account(), false).unwrap();
+        let local = plan(
+            "http://127.0.0.1:9",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         assert!(!local
             .headers
             .iter()
@@ -1427,13 +1477,27 @@ mod tests {
             ]
         });
         let req = request(Inbound::Messages, body);
-        let local = plan("http://127.0.0.1:9", &req, &key_account(), false).unwrap();
+        let local = plan(
+            "http://127.0.0.1:9",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         let wire: Value = serde_json::from_slice(&local.body).unwrap();
         assert_eq!(
             wire.pointer("/messages/0/content").unwrap(),
             &json!([{ "type": "thinking", "thinking": "step" }])
         );
-        let remote = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap();
+        let remote = plan(
+            "https://api.anthropic.com",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         let wire: Value = serde_json::from_slice(&remote.body).unwrap();
         assert_eq!(wire["messages"][0]["content"][0]["signature"], "sig");
         assert_eq!(
@@ -1456,7 +1520,14 @@ mod tests {
                 ]
             }),
         );
-        let plan = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap();
+        let plan = plan(
+            "https://api.anthropic.com",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap();
         let wire: Value = serde_json::from_slice(&plan.body).unwrap();
         assert!(plan.stream);
         assert_eq!(wire["messages"][0]["role"], "user");
@@ -1468,12 +1539,46 @@ mod tests {
     }
 
     #[test]
+    fn chat_inbound_gets_cache_breakpoints() {
+        let req = request(
+            Inbound::Chat,
+            json!({
+                "model": "anthropic/claude-haiku-4-5",
+                "messages": [
+                    { "role": "system", "content": "be brief" },
+                    { "role": "user", "content": "hi" }
+                ]
+            }),
+        );
+        let marked = |opts: &Options| {
+            let plan = plan(
+                "https://api.anthropic.com",
+                &req,
+                &key_account(),
+                false,
+                opts,
+            )
+            .unwrap();
+            plan.body.windows(13).any(|w| w == b"cache_control")
+        };
+        assert!(marked(&Options::default()));
+        assert!(!marked(&Options::parity()));
+    }
+
+    #[test]
     fn responses_inbound_is_refused_before_io() {
         let req = request(
             Inbound::Responses,
             json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
         );
-        let failure = plan("https://api.anthropic.com", &req, &key_account(), false).unwrap_err();
+        let failure = plan(
+            "https://api.anthropic.com",
+            &req,
+            &key_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap_err();
         match failure {
             Failure::Fatal { status, body } => {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1490,7 +1595,14 @@ mod tests {
             Inbound::Messages,
             json!({ "model": "m", "max_tokens": 8, "messages": [] }),
         );
-        let failure = plan("https://api.example.com", &req, &oauth_account(), false).unwrap_err();
+        let failure = plan(
+            "https://api.example.com",
+            &req,
+            &oauth_account(),
+            false,
+            &Options::default(),
+        )
+        .unwrap_err();
         assert!(matches!(failure, Failure::Fatal { .. }));
     }
 
@@ -1645,7 +1757,14 @@ mod tests {
     #[test]
     fn fast_plan_sends_speed_with_its_beta() {
         let req = messages_request(json!({ "model": "m", "messages": [] }));
-        let plan = plan("https://api.anthropic.com", &req, &key_account(), true).unwrap();
+        let plan = plan(
+            "https://api.anthropic.com",
+            &req,
+            &key_account(),
+            true,
+            &Options::default(),
+        )
+        .unwrap();
         let wire: Value = serde_json::from_slice(&plan.body).unwrap();
         assert_eq!(wire["speed"], "fast");
         let beta = plan
@@ -1664,7 +1783,11 @@ mod tests {
             body: br#"{"type":"error","error":{"type":"invalid_request_error","message":"Fast mode is not enabled for your organization."}}"#.to_vec(),
         })
         .await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(base),
+            crate::cache::Options::default(),
+        );
         let mut req = messages_request(json!({ "model": "claude-opus-5", "messages": [] }));
         req.model = "claude-opus-5".into();
         req.fast = Some(true);
@@ -1687,7 +1810,11 @@ mod tests {
             body: answer.to_string().into_bytes(),
         })
         .await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(format!("{base}/v1")));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(format!("{base}/v1")),
+            crate::cache::Options::default(),
+        );
         let mut req = messages_request(json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 16,
@@ -1739,7 +1866,11 @@ mod tests {
         let second = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec();
         let (base, _seen) =
             spawn_chunked(vec![first.clone(), second.clone()], Duration::from_secs(5)).await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(base),
+            crate::cache::Options::default(),
+        );
         let req = messages_request(json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 16,
@@ -1778,7 +1909,11 @@ mod tests {
             body: sse.as_bytes().to_vec(),
         })
         .await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(base),
+            crate::cache::Options::default(),
+        );
         let req = messages_request(json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 16,
@@ -1816,7 +1951,11 @@ mod tests {
             body: answer.to_string().into_bytes(),
         })
         .await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(base),
+            crate::cache::Options::default(),
+        );
         let req = messages_request(json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 16,
@@ -1842,7 +1981,11 @@ mod tests {
                         .to_vec(),
             })
             .await;
-            let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+            let adapter = Anthropic::new(
+                reqwest::Client::new(),
+                Some(base),
+                crate::cache::Options::default(),
+            );
             let failure = failure_of(
                 &adapter,
                 &messages_request(json!({ "model": "m", "max_tokens": 1, "messages": [] })),
@@ -1868,7 +2011,11 @@ mod tests {
             body: b"{}".to_vec(),
         })
         .await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(base),
+            crate::cache::Options::default(),
+        );
         let failure = failure_of(
             &adapter,
             &messages_request(json!({ "model": "m", "max_tokens": 1, "messages": [] })),
@@ -1902,7 +2049,11 @@ mod tests {
             body: b"{}".to_vec(),
         })
         .await;
-        let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some(base),
+            crate::cache::Options::default(),
+        );
         let failure = failure_of(
             &adapter,
             &messages_request(json!({ "model": "m", "max_tokens": 1, "messages": [] })),
@@ -1926,7 +2077,11 @@ mod tests {
                 body: br#"{"type":"error","error":{"type":"invalid_request_error","message":"You have reached your usage limit"}}"#.to_vec(),
             })
             .await;
-            let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+            let adapter = Anthropic::new(
+                reqwest::Client::new(),
+                Some(base),
+                crate::cache::Options::default(),
+            );
             let failure = failure_of(
                 &adapter,
                 &messages_request(json!({ "model": "m", "max_tokens": 1, "messages": [] })),
@@ -1946,7 +2101,11 @@ mod tests {
                 body: b"{}".to_vec(),
             })
             .await;
-            let adapter = Anthropic::new(reqwest::Client::new(), Some(base));
+            let adapter = Anthropic::new(
+                reqwest::Client::new(),
+                Some(base),
+                crate::cache::Options::default(),
+            );
             let failure = failure_of(
                 &adapter,
                 &messages_request(json!({ "model": "m", "max_tokens": 1, "messages": [] })),
@@ -1959,7 +2118,11 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_upstream_is_retryable() {
-        let adapter = Anthropic::new(reqwest::Client::new(), Some("http://127.0.0.1:1".into()));
+        let adapter = Anthropic::new(
+            reqwest::Client::new(),
+            Some("http://127.0.0.1:1".into()),
+            crate::cache::Options::default(),
+        );
         let failure = failure_of(
             &adapter,
             &messages_request(json!({ "model": "m", "max_tokens": 1, "messages": [] })),
