@@ -35,6 +35,10 @@ fn read(provider: &str, source: KeySource) -> Result<String> {
             let value = std::env::var(&var).map_err(|_| anyhow!("{var} is not set"))?;
             clean(&value)
         }
+        KeySource::Value(value) => {
+            ui::warn("a key on the command line stays in shell history; prefer --key or --env");
+            clean(&value)
+        }
         KeySource::Prompt => {
             if let Some(url) = dashboard(provider) {
                 ui::info(&format!("create a key at {url}"));

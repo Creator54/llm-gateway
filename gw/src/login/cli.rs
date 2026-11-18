@@ -24,6 +24,8 @@ pub const PROVIDERS: &[&str] = &[
 pub enum KeySource {
     Prompt,
     Env(String),
+    /// Given on the command line, so it lands in shell history.
+    Value(String),
 }
 
 /// Providers that also take a direct API key.

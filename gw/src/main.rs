@@ -129,8 +129,14 @@ enum Cmd {
         #[arg(long)]
         no_browser: bool,
         /// Store an API key instead of signing in (anthropic, openai, command-code, opencode)
-        #[arg(long, conflicts_with = "device")]
-        key: bool,
+        #[arg(
+            long,
+            value_name = "KEY",
+            num_args = 0..=1,
+            require_equals = true,
+            conflicts_with = "device"
+        )]
+        key: Option<Option<String>>,
         /// Like --key, reading the key from this environment variable
         #[arg(long, value_name = "VAR", conflicts_with_all = ["device", "key"])]
         env: Option<String>,
@@ -291,8 +297,9 @@ async fn run() -> anyhow::Result<()> {
                 json,
                 key: match (key, env) {
                     (_, Some(var)) => Some(gw::login::cli::KeySource::Env(var)),
-                    (true, None) => Some(gw::login::cli::KeySource::Prompt),
-                    _ => None,
+                    (Some(Some(key)), None) => Some(gw::login::cli::KeySource::Value(key)),
+                    (Some(None), None) => Some(gw::login::cli::KeySource::Prompt),
+                    (None, None) => None,
                 },
             };
             gw::login::cli::login(args, cfg.state_dir).await
