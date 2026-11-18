@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 const MIN_COOLDOWN: Duration = Duration::from_secs(1);
 /// Cooldown for a rate limit that came without `Retry-After`.
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
-/// Cooldown for an exhausted plan quota with no reset time.
-const QUOTA_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+/// Longest a rate-limit or quota cooldown is trusted. Upstream reset hints can be stale or
+/// over-long, so an account is probed again at least this often.
+const MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Cooldown after a rejected credential: long enough to stop a retry storm, short enough to recover.
 const AUTH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// How long a provider-disabled account sits out before one request rechecks it.
@@ -326,9 +327,7 @@ impl Pool {
                 retry_after.unwrap_or(RATE_LIMIT_COOLDOWN),
                 Reason::RateLimited,
             ),
-            Outcome::Quota { reset_after } => {
-                (reset_after.unwrap_or(QUOTA_COOLDOWN), Reason::Quota)
-            }
+            Outcome::Quota { reset_after } => (reset_after.unwrap_or(MAX_COOLDOWN), Reason::Quota),
             Outcome::Auth => (AUTH_COOLDOWN, Reason::Auth),
             Outcome::Disabled => (DISABLED_COOLDOWN, Reason::Disabled),
         };
@@ -336,7 +335,11 @@ impl Pool {
             return false;
         };
         // A provider may send `Retry-After: 0`; a zero cooldown would retry forever.
-        state.cooldown = Some((now + cooldown.0.max(MIN_COOLDOWN), cooldown.1));
+        let cap = match cooldown.1 {
+            Reason::RateLimited | Reason::Quota => MAX_COOLDOWN,
+            _ => Duration::MAX,
+        };
+        state.cooldown = Some((now + cooldown.0.clamp(MIN_COOLDOWN, cap), cooldown.1));
         true
     }
 
@@ -526,10 +529,27 @@ mod tests {
         );
         assert_eq!(
             pool.earliest_free("p", Some("quota"), now),
-            Some(now + QUOTA_COOLDOWN)
+            Some(now + MAX_COOLDOWN)
         );
         // A usable account means nothing is waiting to free up.
         assert_eq!(pool.earliest_free("p", Some("missing"), now), None);
+    }
+
+    #[test]
+    fn long_reset_hints_are_capped_so_the_account_is_probed_again() {
+        let now = Instant::now();
+        let mut pool = pool_of("p", &["a1", "a2"]);
+        let hours = Some(Duration::from_secs(3 * 3600));
+        pool.report("p", "a1", Outcome::Quota { reset_after: hours }, now);
+        pool.report("p", "a2", Outcome::RateLimited { retry_after: hours }, now);
+        assert_eq!(
+            pool.earliest_free("p", Some("a1"), now),
+            Some(now + MAX_COOLDOWN)
+        );
+        assert_eq!(
+            pool.earliest_free("p", Some("a2"), now),
+            Some(now + MAX_COOLDOWN)
+        );
     }
 
     #[test]

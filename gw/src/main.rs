@@ -331,7 +331,12 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
     let mut login = false;
     let mut recheck: Option<u64> = None;
     for e in &all {
-        let state = match (e.needs_reauth, e.paused, e.disabled_until) {
+        // An expired mark is only awaiting its recheck on the next request.
+        let state = match (
+            e.needs_reauth,
+            e.paused,
+            e.disabled_until.filter(|until| *until > now),
+        ) {
             (true, ..) => {
                 login = true;
                 "needs login".to_owned()
