@@ -145,10 +145,27 @@ async fn tools_with_reasoning_effort_go_through_responses() {
 }
 
 #[tokio::test]
-async fn tools_without_reasoning_stay_on_chat_completions() {
+async fn tools_without_an_effort_also_go_through_responses() {
+    let responses = r#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-6.2-sol","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}"#;
+    let (adapter, seen) = spawn(200, responses).await;
+    let body = json!({
+        "model": "gpt-6.2-sol",
+        "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    adapter
+        .send(&request(Inbound::Chat, body, false, false), &keyed())
+        .await
+        .expect("reply");
+    assert_eq!(seen.lock().unwrap()[0].path, "/v1/responses");
+}
+
+#[tokio::test]
+async fn tools_with_reasoning_none_stay_on_chat_completions() {
     let (adapter, seen) = spawn(200, CHAT).await;
     let body = json!({
         "model": "gpt-5.5",
+        "reasoning_effort": "none",
         "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
         "messages": [{"role":"user","content":"hi"}]
     });

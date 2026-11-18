@@ -73,6 +73,7 @@ impl OpenAiApi {
                     .or_insert_with(|| Value::String(PRIORITY_TIER.into()));
             }
         }
+        let sent = body.clone();
         let bytes = serde_json::to_vec(&body)
             .map_err(|_| invalid("request body is not serializable", req.inbound))?;
 
@@ -94,7 +95,15 @@ impl OpenAiApi {
         };
         let status = response.status();
         if !status.is_success() {
-            return Err(reject(status, response).await);
+            let failure = reject(status, response).await;
+            if let Failure::Fatal { body: reply, .. } = &failure {
+                tracing::warn!(
+                    %status, %url, sent = %shape(&sent),
+                    reply = %String::from_utf8_lossy(reply),
+                    "openai-api refused the request"
+                );
+            }
+            return Err(failure);
         }
 
         if req.inbound == Inbound::Messages {
@@ -146,18 +155,33 @@ impl Provider for OpenAiApi {
     }
 }
 
-/// Function tools combined with a reasoning effort are refused on chat completions by the
-/// newer models; the Responses endpoint accepts them.
+/// Function tools are refused on chat completions by models that reason by default, even when
+/// the caller names no effort; the Responses endpoint accepts them. Only an explicit `none`
+/// is known to be safe on chat completions.
 fn needs_responses(body: &Value) -> bool {
     let tools = body
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty());
-    let reasoning = body
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .is_some_and(|effort| effort != "none");
-    tools && reasoning
+    let no_reasoning = body.get("reasoning_effort").and_then(Value::as_str) == Some("none");
+    tools && !no_reasoning
+}
+
+/// Top-level keys of a body, with the sizes that matter when a request is refused.
+fn shape(body: &Value) -> String {
+    let Some(object) = body.as_object() else {
+        return String::new();
+    };
+    object
+        .iter()
+        .map(|(key, value)| match value {
+            Value::Array(items) => format!("{key}[{}]", items.len()),
+            Value::String(text) if key != "model" => format!("{key}=<{} chars>", text.len()),
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => format!("{key}={value}"),
+            _ => key.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether the caller asked for the final usage chunk of a chat stream.
