@@ -220,7 +220,8 @@ pub fn status(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
 pub const SUBAGENT_MODEL: &str = "gw/combo/failover";
 
 /// `text` with the `model:` line of its front matter set to `model`, or `None` when it
-/// already is, or has no front matter or no such line.
+/// already is, has no front matter or no such line, or already runs on one of gw's combos
+/// (a combo chosen for that role, such as `gw/combo/smart`, is kept).
 fn retarget(text: &str, model: &str) -> Option<String> {
     let body = text.strip_prefix("---\n")?;
     let end = body.find("\n---")?;
@@ -228,7 +229,7 @@ fn retarget(text: &str, model: &str) -> Option<String> {
     let front: Vec<String> = body[..end]
         .lines()
         .map(|line| match line.strip_prefix("model:") {
-            Some(value) if value.trim() != model => {
+            Some(value) if value.trim() != model && !value.trim().starts_with("gw/combo/") => {
                 changed = true;
                 format!("model: {model}")
             }
@@ -1274,6 +1275,10 @@ mod tests {
             "---\nname: x\nmodel: gw/combo/failover\nskills: true\n---\nmodel: keep\n"
         );
         assert_eq!(retarget("---\nmodel: m\n---\n", "m"), None);
+        assert_eq!(
+            retarget("---\nmodel: gw/combo/smart\n---\n", "gw/combo/failover"),
+            None
+        );
         assert_eq!(retarget("---\nname: x\n---\n", "m"), None);
         assert_eq!(retarget("no front matter\nmodel: a", "m"), None);
     }

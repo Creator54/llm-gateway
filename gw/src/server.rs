@@ -1888,7 +1888,7 @@ struct Route {
 /// The provider does not serve the requested model: missing, retired or not entitled.
 /// Any other client error is the request's own fault and goes back unchanged.
 fn model_unavailable(status: StatusCode, body: &[u8]) -> bool {
-    if status == StatusCode::NOT_FOUND {
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
         return true;
     }
     if status == StatusCode::FORBIDDEN {
@@ -2065,6 +2065,7 @@ mod tests {
     fn only_missing_models_count_as_unavailable() {
         let bad = StatusCode::BAD_REQUEST;
         assert!(model_unavailable(StatusCode::NOT_FOUND, b"{}"));
+        assert!(model_unavailable(StatusCode::GONE, b"{}"));
         assert!(model_unavailable(
             bad,
             br#"{"error":{"message":"The model `x` does not exist"}}"#
