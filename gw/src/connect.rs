@@ -216,6 +216,54 @@ pub fn status(home: &Path, state_dir: &Path) -> anyhow::Result<Vec<String>> {
     Ok(lines)
 }
 
+/// The model pi's subagents run on once pointed at gw.
+pub const SUBAGENT_MODEL: &str = "gw/combo/failover";
+
+/// `text` with the `model:` line of its front matter set to `model`, or `None` when it
+/// already is, or has no front matter or no such line.
+fn retarget(text: &str, model: &str) -> Option<String> {
+    let body = text.strip_prefix("---\n")?;
+    let end = body.find("\n---")?;
+    let mut changed = false;
+    let front: Vec<String> = body[..end]
+        .lines()
+        .map(|line| match line.strip_prefix("model:") {
+            Some(value) if value.trim() != model => {
+                changed = true;
+                format!("model: {model}")
+            }
+            _ => line.to_owned(),
+        })
+        .collect();
+    changed.then(|| format!("---\n{}{}", front.join("\n"), &body[end..]))
+}
+
+/// Point every pi subagent definition at `model`, backing each file up first.
+/// Returns one line per file changed.
+pub fn point_subagents(home: &Path, model: &str, dry_run: bool) -> anyhow::Result<Vec<String>> {
+    let dir = home.join(".pi/agent/agents");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| Some(e.ok()?.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    files.sort();
+    let mut lines = Vec::new();
+    for file in files {
+        let Some(text) = retarget(&fs::read_to_string(&file)?, model) else {
+            continue;
+        };
+        if !dry_run {
+            backup(&file)?;
+            fs::write(&file, text)?;
+        }
+        lines.push(format!("pi: {} -> model {model}", file_name(&file)));
+    }
+    Ok(lines)
+}
+
 /// Client-side cache rewrites stay installed; gw does not touch them.
 fn client_cache_tools(home: &Path) -> Option<String> {
     let settings = fs::read_to_string(home.join(".pi/agent/settings.json")).unwrap_or_default();
@@ -1216,6 +1264,18 @@ mod tests {
             & 0o777;
         assert_eq!(manifest, 0o600);
         assert_eq!(sandbox.mode(".pi/agent/models.json"), 0o600);
+    }
+
+    #[test]
+    fn retarget_changes_only_the_model_line_of_the_front_matter() {
+        let text = "---\nname: x\nmodel: old/combo\nskills: true\n---\nmodel: keep\n";
+        assert_eq!(
+            retarget(text, "gw/combo/failover").unwrap(),
+            "---\nname: x\nmodel: gw/combo/failover\nskills: true\n---\nmodel: keep\n"
+        );
+        assert_eq!(retarget("---\nmodel: m\n---\n", "m"), None);
+        assert_eq!(retarget("---\nname: x\n---\n", "m"), None);
+        assert_eq!(retarget("no front matter\nmodel: a", "m"), None);
     }
 
     #[test]

@@ -570,7 +570,21 @@ async fn setup(
     for line in &accounts {
         gw::ui::info(line);
     }
-    let found = gw::connect::detect(&home);
+    let state_dir = cfg.state_dir.clone();
+    connect_tools(cfg, &home, url, models, yes, dry_run).await?;
+    offer_subagents(&state_dir, &home, yes, dry_run)
+}
+
+/// Let the user pick the coding tools to connect, then connect them.
+async fn connect_tools(
+    cfg: gw::config::Config,
+    home: &Path,
+    url: String,
+    models: Vec<String>,
+    yes: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let found = gw::connect::detect(home);
     if found.is_empty() {
         gw::ui::warn("no coding tools found (looked for pi, opencode, claude, codex)");
         return Ok(());
@@ -613,7 +627,7 @@ async fn setup(
                     dry_run: true,
                     ..opts.clone()
                 },
-                &home,
+                home,
             )?);
         }
         if !gw::ui::confirm("Apply?", true) {
@@ -621,7 +635,25 @@ async fn setup(
         }
     }
     for agent in chosen {
-        report(gw::connect::connect(agent, &opts, &home)?);
+        report(gw::connect::connect(agent, &opts, home)?);
+    }
+    Ok(())
+}
+
+/// Offer to move pi's subagents from whatever model they name onto a gw combo.
+fn offer_subagents(state_dir: &Path, home: &Path, yes: bool, dry_run: bool) -> anyhow::Result<()> {
+    if !gw::connect::connected(state_dir)?.iter().any(|a| a == "pi") {
+        return Ok(());
+    }
+    let model = gw::connect::SUBAGENT_MODEL;
+    let pending = gw::connect::point_subagents(home, model, true)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    gw::ui::heading("pi subagents");
+    report(pending);
+    if !dry_run && (yes || gw::ui::confirm("Run pi subagents on gw?", true)) {
+        gw::connect::point_subagents(home, model, false)?;
     }
     Ok(())
 }
