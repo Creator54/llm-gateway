@@ -88,7 +88,7 @@ enum Cmd {
         /// Window of usage to summarise, e.g. 24h, 7d, 30m
         #[arg(long, default_value = "7d")]
         since: String,
-        /// Fetch quota from the providers instead of using the cache
+        /// Fetch quota and prices again instead of showing the last saved figures
         #[arg(long)]
         refresh: bool,
         /// Show each account's login email
@@ -724,7 +724,14 @@ async fn status(
     let store = gw::store::Store::open(state_dir)?;
     let mut rows = store.usage_summary(gw::store::now_secs() - seconds)?;
     gw::store::label_accounts(&mut rows, state_dir)?;
-    let (windows, failures) = gw::quota::load(cfg, refresh).await?;
+    // Status reads the last fetch; only `--refresh` (or having none yet) asks the providers.
+    let (windows, failures, fetched_at) = match gw::quota::saved(cfg).filter(|_| !refresh) {
+        Some((windows, at)) => (windows, Vec::new(), at),
+        None => {
+            let (windows, failures) = gw::quota::load(cfg, true).await?;
+            (windows, failures, gw::login::now_secs())
+        }
+    };
 
     if json {
         // Hand-rolled so the shape stays stable.
@@ -791,7 +798,7 @@ async fn status(
                 .then(a.model.cmp(&b.model))
                 .then(b.requests.cmp(&a.requests))
         });
-        let prices = gw::pricing::Prices::load(state_dir).await;
+        let prices = gw::pricing::Prices::saved_or_fetch(state_dir, refresh).await;
         let (headers, mut cells) = gw::metrics::stats_table(&rows, &prices);
         blank_repeats(&mut cells, 2);
         print!(
@@ -802,7 +809,7 @@ async fn status(
             )
         );
     }
-    combos(cfg, state_dir, &ui).await;
+    combos(cfg, state_dir, &ui, &windows);
     // Accounts that need a login are already flagged above; their figures are stale.
     let relogin: Vec<(String, String)> = gw::creds::Store::load(state_dir)?
         .all()
@@ -844,8 +851,18 @@ async fn status(
             .collect();
         blank_repeats(&mut cells, 2);
         let headers = ["provider", "account", "window", "used", "resets in"];
+        let age = gw::login::now_secs().saturating_sub(fetched_at);
+        let note = if age < 60 {
+            "just now".to_owned()
+        } else {
+            format!(
+                "{} ago; `gw status --refresh` updates it",
+                gw::quota::duration(age)
+            )
+        };
+        ui.heading(&format!("\nquota (fetched {note})"));
         print!(
-            "\n{}",
+            "{}",
             ui.render_table(
                 &headers,
                 &views(&cells).iter().map(Vec::as_slice).collect::<Vec<_>>()
@@ -873,7 +890,8 @@ async fn combo_cmd(
             if cfg.combos.is_empty() {
                 println!("no combos; create one with `gw combo set <name> <strategy> provider/model ...`");
             } else {
-                combos(cfg, &cfg.state_dir, &gw::ui::Ui::from_env()).await;
+                let windows = gw::quota::saved(cfg).map(|s| s.0).unwrap_or_default();
+                combos(cfg, &cfg.state_dir, &gw::ui::Ui::from_env(), &windows);
             }
             return Ok(());
         }
@@ -913,7 +931,12 @@ async fn combo_cmd(
 }
 
 /// Combos as a table, one row per target in the order they are tried.
-async fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
+fn combos(
+    cfg: &gw::config::Config,
+    state_dir: &Path,
+    ui: &gw::ui::Ui,
+    windows: &[gw::quota::Window],
+) {
     if cfg.combos.is_empty() {
         return;
     }
@@ -922,12 +945,8 @@ async fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
     for (name, combo) in &cfg.combos {
         let mut targets: Vec<_> = combo.targets.iter().collect();
         if combo.strategy == gw::combo::Strategy::QuotaAware {
-            let windows = gw::quota::load(cfg, false)
-                .await
-                .map(|r| r.0)
-                .unwrap_or_default();
             let room = |t: &gw::combo::Target| {
-                gw::quota::headroom(&windows, &t.provider, &t.model).unwrap_or(-1.0)
+                gw::quota::headroom(windows, &t.provider, &t.model).unwrap_or(-1.0)
             };
             targets.sort_by(|a, b| room(b).total_cmp(&room(a)));
         }

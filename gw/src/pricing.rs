@@ -29,6 +29,20 @@ impl Prices {
     /// The cached feed, refreshed when older than a day. A failed refresh falls back to the
     /// stale cache; without any cache the result is empty and no cost is shown.
     pub async fn load(state_dir: &Path) -> Self {
+        Self::fetch_if(state_dir, false).await
+    }
+
+    /// Like `load`, but only the network is consulted when `force` is set, or when nothing
+    /// usable has been saved yet. A cache of any age is otherwise kept as is.
+    pub async fn saved_or_fetch(state_dir: &Path, force: bool) -> Self {
+        let cached = Self::cached(state_dir);
+        if !force && !cached.prices.is_empty() {
+            return cached;
+        }
+        Self::fetch_if(state_dir, true).await
+    }
+
+    async fn fetch_if(state_dir: &Path, force: bool) -> Self {
         let path = state_dir.join(FILE);
         let age = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -39,7 +53,7 @@ impl Prices {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok());
         if let (Some(prices), Some(age)) = (&cached, age) {
-            if age < MAX_AGE_SECS && !prices.prices.is_empty() {
+            if !force && age < MAX_AGE_SECS && !prices.prices.is_empty() {
                 return cached.unwrap_or_default();
             }
         }

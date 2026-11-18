@@ -56,13 +56,18 @@ pub async fn load(cfg: &Config, force: bool) -> anyhow::Result<(Vec<Window>, Vec
         .any(|w| w.resets_at.is_some_and(|at| at <= now));
     let known = |store: &creds::Store| {
         PROVIDERS.iter().all(|p| {
-            store.accounts(p).iter().all(|e| {
-                let name = e.label.as_deref().unwrap_or(&e.id);
-                cached
-                    .windows
-                    .iter()
-                    .any(|w| w.provider == *p && w.account == name)
-            })
+            // Only subscription logins are probed, so a key account never gets a window.
+            store
+                .accounts(p)
+                .iter()
+                .filter(|e| matches!(e.credential, creds::Secret::OAuth(_)))
+                .all(|e| {
+                    let name = e.label.as_deref().unwrap_or(&e.id);
+                    cached
+                        .windows
+                        .iter()
+                        .any(|w| w.provider == *p && w.account == name)
+                })
         })
     };
     let store = creds::Store::load(&cfg.state_dir)?;
@@ -87,6 +92,13 @@ pub async fn load(cfg: &Config, force: bool) -> anyhow::Result<(Vec<Window>, Vec
         let _ = std::fs::write(&path, bytes);
     }
     Ok((cache.windows, failures))
+}
+
+/// The windows saved by the last fetch and when it ran, or `None` when nothing was saved yet.
+pub fn saved(cfg: &Config) -> Option<(Vec<Window>, u64)> {
+    let bytes = std::fs::read(cfg.state_dir.join(FILE)).ok()?;
+    let cache: Cache = serde_json::from_slice(&bytes).ok()?;
+    (cache.fetched_at > 0).then_some((cache.windows, cache.fetched_at))
 }
 
 /// Percent of quota the provider's best account still has for `model`, or `None` when no
@@ -482,5 +494,73 @@ mod headroom_tests {
         ];
         assert_eq!(headroom(&windows, "antigravity", "claude-opus"), Some(0.0));
         assert_eq!(headroom(&windows, "antigravity", "gemini-3"), Some(100.0));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn config(tag: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("gw-quota-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Config {
+            state_dir: dir,
+            ..Config::default()
+        }
+    }
+
+    fn window() -> Window {
+        Window {
+            provider: "anthropic".into(),
+            account: "a".into(),
+            name: "5h".into(),
+            used_percent: 10.0,
+            resets_at: None,
+        }
+    }
+
+    fn save(cfg: &Config, fetched_at: u64) {
+        let cache = Cache {
+            fetched_at,
+            windows: vec![window()],
+        };
+        std::fs::write(
+            cfg.state_dir.join(FILE),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn saved_is_none_without_a_fetch_and_ignores_age() {
+        let cfg = config("saved");
+        assert!(saved(&cfg).is_none());
+        save(&cfg, 1);
+        assert_eq!(saved(&cfg), Some((vec![window()], 1)));
+    }
+
+    #[tokio::test]
+    async fn a_key_account_does_not_make_the_cache_stale() {
+        let cfg = config("key");
+        let store = creds::Store::load(&cfg.state_dir).unwrap();
+        store.upsert(creds::Entry {
+            provider: "openai".into(),
+            id: "k".into(),
+            label: Some("k".into()),
+            paused: false,
+            needs_reauth: false,
+            last_error: None,
+            disabled_until: None,
+            credential: creds::Secret::ApiKey { key: "sk-x".into() },
+        });
+        store.save().unwrap();
+        let now = crate::login::now_secs();
+        save(&cfg, now);
+        let (windows, failures) = load(&cfg, false).await.unwrap();
+        assert_eq!(windows, [window()], "a fresh cache must be served as is");
+        assert!(failures.is_empty());
+        assert_eq!(saved(&cfg).unwrap().1, now, "nothing was refetched");
     }
 }
