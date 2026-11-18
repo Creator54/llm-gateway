@@ -136,7 +136,7 @@ fn classify(status: StatusCode, retry_after: Option<Duration>, body: &Bytes) -> 
     }
     // A 403 that names an unknown model is a request problem: retrying or cooling
     // the account would only hide the mistake and take the account out of service.
-    if status == StatusCode::FORBIDDEN && unknown_model(body) {
+    if status == StatusCode::FORBIDDEN && (unknown_model(body) || not_in_plan(body)) {
         return Failure::Fatal {
             status,
             body: body.clone(),
@@ -165,6 +165,11 @@ fn quota_exhausted(body: &Bytes) -> bool {
     ["quota", "credit", "allowance", "usage limit"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+/// The plan does not include this model. The login is fine, so other models still work.
+fn not_in_plan(body: &Bytes) -> bool {
+    String::from_utf8_lossy(body).contains("MODEL_NOT_IN_PLAN")
 }
 
 /// The API says the model or provider id is not one it serves.
@@ -1520,6 +1525,16 @@ mod tests {
         let body = Bytes::from_static(br#"{"error":"forbidden"}"#);
         let failure = classify(StatusCode::FORBIDDEN, None, &body);
         assert!(matches!(failure, Failure::Auth));
+    }
+
+    #[test]
+    fn a_model_outside_the_plan_is_fatal_not_a_bad_login() {
+        let body =
+            Bytes::from_static(b"{\"error\":{\"message\":\"MODEL_NOT_IN_PLAN: GPT-6.2 Sol\"}}");
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN, None, &body),
+            Failure::Fatal { .. }
+        ));
     }
 
     #[test]

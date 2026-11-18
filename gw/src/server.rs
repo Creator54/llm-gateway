@@ -1778,6 +1778,12 @@ fn model_unavailable(status: StatusCode, body: &[u8]) -> bool {
     if status == StatusCode::NOT_FOUND {
         return true;
     }
+    if status == StatusCode::FORBIDDEN {
+        let text = String::from_utf8_lossy(body);
+        return ["MODEL_NOT_IN_PLAN", "Model/provider not recognized"]
+            .iter()
+            .any(|phrase| text.contains(phrase));
+    }
     if status != StatusCode::BAD_REQUEST {
         return false;
     }
@@ -1942,6 +1948,11 @@ mod tests {
         ));
         assert!(model_unavailable(bad, b"model x is deprecated"));
         assert!(!model_unavailable(bad, b"messages: field required"));
+        assert!(model_unavailable(
+            StatusCode::FORBIDDEN,
+            b"MODEL_NOT_IN_PLAN: GPT-6.2 Sol available in Pro and above plans"
+        ));
+        assert!(!model_unavailable(StatusCode::FORBIDDEN, b"Forbidden"));
         assert!(!model_unavailable(
             StatusCode::UNPROCESSABLE_ENTITY,
             b"model not found"

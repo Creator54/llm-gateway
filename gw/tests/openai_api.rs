@@ -119,6 +119,19 @@ async fn chat_goes_to_the_api_with_the_key_and_the_routed_model() {
 }
 
 #[tokio::test]
+async fn max_tokens_becomes_max_completion_tokens() {
+    let (adapter, seen) = spawn(200, CHAT).await;
+    let body = json!({"model":"gpt-6.2-sol","max_tokens":16,"messages":[]});
+    adapter
+        .send(&request(Inbound::Chat, body, false, false), &keyed())
+        .await
+        .expect("reply");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0].body["max_completion_tokens"], 16);
+    assert!(seen[0].body.get("max_tokens").is_none());
+}
+
+#[tokio::test]
 async fn chat_streams_ask_for_usage_and_fast_asks_for_priority() {
     let (adapter, seen) = spawn(200, CHAT).await;
     let body = json!({"model":"gpt-5.5","stream":true,"messages":[]});

@@ -132,6 +132,12 @@ fn passthrough(req: &Request, chat: bool) -> Result<Value, Failure> {
         return Err(invalid("request body is not a JSON object", req.inbound));
     };
     object.insert("model".into(), Value::String(req.model.clone()));
+    // Newer models refuse the deprecated `max_tokens`; `max_completion_tokens` works on all.
+    if chat && !object.contains_key("max_completion_tokens") {
+        if let Some(limit) = object.remove("max_tokens") {
+            object.insert("max_completion_tokens".into(), limit);
+        }
+    }
     if chat && object.get("stream").and_then(Value::as_bool) == Some(true) {
         if let Some(options) = object
             .entry("stream_options")
