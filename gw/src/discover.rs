@@ -202,9 +202,15 @@ async fn json_body(response: reqwest::Response) -> anyhow::Result<Value> {
 /// Model ids from a provider's listing: `{data:[{id}]}` or antigravity's `{models:{id:{…}}}`.
 fn ids(provider: &str, body: &Value) -> Vec<String> {
     if provider == "antigravity" {
+        // `chat_*` and `tab_*` are the editor's internal models, not something to route to.
         return body["models"]
             .as_object()
-            .map(|m| m.keys().cloned().collect())
+            .map(|m| {
+                m.keys()
+                    .filter(|id| !id.starts_with("chat_") && !id.starts_with("tab_"))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
     }
     body["data"]
@@ -223,7 +229,8 @@ mod tests {
     fn reads_both_listing_shapes() {
         let openai_style = json!({ "data": [{ "id": "claude-a" }, { "id": "claude-b" }] });
         assert_eq!(ids("anthropic", &openai_style), ["claude-a", "claude-b"]);
-        let cca = json!({ "models": { "gemini-x": {}, "claude-y": {} } });
+        let cca =
+            json!({ "models": { "gemini-x": {}, "claude-y": {}, "chat_1": {}, "tab_flash": {} } });
         let mut got = ids("antigravity", &cca);
         got.sort();
         assert_eq!(got, ["claude-y", "gemini-x"]);

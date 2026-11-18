@@ -569,8 +569,10 @@ impl Gateway {
             .values()
             .flat_map(|combo| &combo.targets)
             .map(|t| (t.provider.as_str(), t.model.as_str()));
+        let mut ids: Vec<(&str, &str)> = listed.chain(targets).collect();
+        ids.sort_unstable();
         let mut entries: Vec<models::Entry> = Vec::new();
-        for (provider, model) in listed.chain(targets) {
+        for (provider, model) in ids {
             let id = format!("{provider}/{model}");
             if !entries.iter().any(|entry| entry.id == id) {
                 entries.push(models::Entry {
@@ -620,7 +622,19 @@ impl Gateway {
     async fn send(&self, plan: Plan) -> Response {
         let started = Instant::now();
         let Some(base) = self.fallback.as_deref() else {
-            return json_error(StatusCode::BAD_GATEWAY, "no upstream configured");
+            let info = RequestInfo::of(&plan.body, self.default_provider.as_deref());
+            return if info.model.is_empty() {
+                json_error(StatusCode::BAD_GATEWAY, "no upstream configured")
+            } else {
+                let asked = match info.provider.as_str() {
+                    "" => info.model,
+                    provider => format!("{provider}/{}", info.model),
+                };
+                json_error(
+                    StatusCode::NOT_FOUND,
+                    &format!("unknown model `{asked}`; `gw models` lists what this gateway serves"),
+                )
+            };
         };
         let url = format!("{}{}", base.trim_end_matches('/'), plan.path_and_query);
         let mut outbound = self
@@ -1132,8 +1146,12 @@ impl Gateway {
                     .iter()
                     .map(|target| target.provider.as_str())
                     .collect();
+                let hint = match last {
+                    Some(provider::Failure::Auth) => "; run `gw login --expired`",
+                    _ => "",
+                };
                 let message = format!(
-                    "no account for {} can serve this now ({}); retry in {}s",
+                    "no account for {} can serve this now ({}); retry in {}s{hint}",
                     providers.join(", "),
                     reason_label(last.as_ref()),
                     wait.as_millis().div_ceil(1000).max(1),
@@ -1142,20 +1160,35 @@ impl Gateway {
             }
             (None, Some(failure)) => failure_reply(shape, failure),
             (None, None) => {
-                let known = {
-                    let pool = self.lock_pool();
-                    route
-                        .targets
-                        .iter()
-                        .any(|target| !pool.accounts(&target.provider).is_empty())
-                };
-                let message = if known {
-                    "no usable account for this provider"
-                } else {
-                    "no account for this provider"
-                };
-                error_reply(shape, StatusCode::BAD_GATEWAY, message, None)
+                let message = self.no_account_message(route);
+                error_reply(shape, StatusCode::BAD_GATEWAY, &message, None)
             }
+        }
+    }
+
+    /// Why no account is eligible at all: nobody logged in, or the pinned name matches none.
+    fn no_account_message(&self, route: &Route) -> String {
+        let pool = self.lock_pool();
+        let Some(target) = route.targets.first() else {
+            return "no account for this provider".into();
+        };
+        let accounts = pool.accounts(&target.provider);
+        let provider = &target.provider;
+        if accounts.is_empty() {
+            return format!("no account for {provider}; run `gw login {provider}`");
+        }
+        match &route.pin {
+            Some(pin) => {
+                let names: Vec<String> = accounts
+                    .into_iter()
+                    .map(|a| a.label.unwrap_or(a.id))
+                    .collect();
+                format!(
+                    "no {provider} account named `{pin}`; have: {}",
+                    names.join(", ")
+                )
+            }
+            None => format!("every {provider} account is paused; see `gw status`"),
         }
     }
 

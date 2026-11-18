@@ -116,6 +116,7 @@ pub struct Pool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountInfo {
     pub id: String,
+    pub label: Option<String>,
     pub paused: bool,
     /// Cooldown end and reason, when the account is cooling down.
     pub cooldown: Option<(Instant, Reason)>,
@@ -305,6 +306,7 @@ impl Pool {
                     .iter()
                     .map(|state| AccountInfo {
                         id: state.id.clone(),
+                        label: state.label.clone(),
                         paused: state.paused,
                         cooldown: state.cooldown,
                     })
@@ -657,11 +659,13 @@ mod tests {
             [
                 AccountInfo {
                     id: "a1".into(),
+                    label: None,
                     paused: false,
                     cooldown: Some((now + AUTH_COOLDOWN, Reason::Auth)),
                 },
                 AccountInfo {
                     id: "a2".into(),
+                    label: None,
                     paused: true,
                     cooldown: None,
                 },

@@ -285,3 +285,42 @@ async fn account_pinned_models_are_listed_on_request() {
     assert!(pinned.contains(&"opencode@a2/beam-free".to_owned()));
     assert!(!pinned.iter().any(|id| id.starts_with("anthropic@")));
 }
+
+/// A model nobody serves says so, instead of "no upstream configured".
+#[tokio::test]
+async fn unknown_model_without_a_fallback_is_not_found() {
+    let addr = serve(Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        state_dir: temp_dir("unknown-model"),
+        profile: Profile::Parity,
+        ..Config::default()
+    })
+    .await;
+
+    let (status, body) = chat(addr, "nope/model").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("unknown model `nope/model`"), "{body}");
+}
+
+/// A pin that names no account lists the names that exist; a provider with no
+/// login says how to log in.
+#[tokio::test]
+async fn a_missing_account_says_what_to_do() {
+    let dir = temp_dir("missing-account");
+    creds(&dir, &[("opencode", "a1", "k1"), ("opencode", "a2", "k2")]);
+    let addr = serve(Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        state_dir: dir,
+        profile: Profile::Parity,
+        ..Config::default()
+    })
+    .await;
+
+    let (_, body) = chat(addr, "opencode@zzz/beam-free").await;
+    assert!(
+        body.contains("no opencode account named `zzz`; have: a1, a2"),
+        "{body}"
+    );
+    let (_, body) = chat(addr, "kiro/claude-haiku-4.5").await;
+    assert!(body.contains("run `gw login kiro`"), "{body}");
+}

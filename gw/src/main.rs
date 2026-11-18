@@ -115,6 +115,8 @@ enum Cmd {
         /// Print JSON
         #[arg(long)]
         json: bool,
+        /// Only models whose id contains this text
+        filter: Option<String>,
     },
     /// Log in to a provider and store the account
     Login {
@@ -262,6 +264,7 @@ async fn run() -> anyhow::Result<()> {
             accounts,
             pinned,
             json,
+            filter,
         } => {
             if refresh {
                 refresh_models(&cfg).await?;
@@ -269,7 +272,7 @@ async fn run() -> anyhow::Result<()> {
             if accounts {
                 return account_models(&cfg);
             }
-            models(&cfg, json, pinned).await
+            models(&cfg, json, pinned, filter.as_deref()).await
         }
         Cmd::Setup { yes, dry_run } => {
             let config = cli
@@ -494,21 +497,27 @@ async fn refresh_models(cfg: &gw::config::Config) -> anyhow::Result<()> {
 }
 
 /// `gw models`: ask the running gateway what it serves.
-async fn models(cfg: &gw::config::Config, json: bool, pinned: bool) -> anyhow::Result<()> {
+async fn models(
+    cfg: &gw::config::Config,
+    json: bool,
+    pinned: bool,
+    filter: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut body: serde_json::Value = serde_json::from_slice(&fetch_models(cfg, pinned).await?)?;
+    if let Some(text) = filter {
+        if let Some(rows) = body["data"].as_array_mut() {
+            rows.retain(|m| m["id"].as_str().is_some_and(|id| id.contains(text)));
+        }
+    }
     if json {
-        println!(
-            "{}",
-            String::from_utf8_lossy(&fetch_models(cfg, pinned).await?)
-        );
+        println!("{body}");
         return Ok(());
     }
-    let body: serde_json::Value = serde_json::from_slice(&fetch_models(cfg, pinned).await?)?;
-    for id in body["data"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["id"].as_str())
-    {
+    let rows = body["data"].as_array().map_or(&[][..], Vec::as_slice);
+    if rows.is_empty() && filter.is_some() {
+        anyhow::bail!("no model matches that text; run `gw models` for the full list");
+    }
+    for id in rows.iter().filter_map(|m| m["id"].as_str()) {
         println!("{id}");
     }
     Ok(())
