@@ -30,7 +30,7 @@ pub enum KeySource {
 }
 
 /// Providers that also take a direct API key.
-const KEY_PROVIDERS: [&str; 4] = ["anthropic", "openai-api", "command-code", "opencode"];
+pub const KEY_PROVIDERS: [&str; 4] = ["anthropic", "openai-api", "command-code", "opencode"];
 
 pub struct Login {
     pub provider: String,
@@ -60,6 +60,12 @@ pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
         anyhow::bail!("{provider} has no device-code flow; drop --device");
     }
     if args.key.is_some() && !KEY_PROVIDERS.contains(&provider.as_str()) {
+        let api = format!("{provider}-api");
+        if KEY_PROVIDERS.contains(&api.as_str()) {
+            anyhow::bail!(
+                "{provider} takes a subscription login; API keys go to {api}: gw login {api} --key"
+            );
+        }
         anyhow::bail!(
             "{provider} has no API key access; keys work for: {}",
             KEY_PROVIDERS.join(", ")

@@ -105,3 +105,33 @@ fn empty_store_lists_empty_json() {
     let text = stdout(&out);
     assert_eq!(text.trim(), "[]");
 }
+
+#[test]
+fn a_key_for_a_subscription_provider_points_at_its_api_provider() {
+    let dir = Temp::new("keyhint");
+    let out = gw(&dir.0, &["login", "openai", "--key=sk-x"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("gw login openai-api --key"), "{err}");
+}
+
+#[test]
+fn status_flags_a_key_stored_under_a_subscription_provider() {
+    let dir = Temp::new("keystatus");
+    let state = dir.0.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let file = state.join("credentials.json");
+    std::fs::write(
+        &file,
+        r#"{"version":1,"accounts":[{"provider":"openai","id":"k1","label":"old","paused":false,"needs_reauth":false,"credential":{"type":"api_key","key":"sk-fake"}}]}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let out = gw(&dir.0, &["status"]);
+    let text = stdout(&out);
+    assert!(text.contains("unusable key: old (key)"), "{text}");
+    assert!(
+        text.contains("gw login openai-api --key, then gw account remove openai k1"),
+        "{text}"
+    );
+}

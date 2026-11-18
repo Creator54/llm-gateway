@@ -356,9 +356,11 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
             .insert(String::new(), vec!["free tier (no login)".into()]);
     }
     let mut login = false;
+    let mut hints = Vec::new();
     let mut recheck: Option<u64> = None;
     for e in &all {
         // An expired mark is only awaiting its recheck on the next request.
+        let keyed = matches!(e.credential, gw::creds::Secret::ApiKey { .. });
         let state = match (
             e.needs_reauth,
             e.paused,
@@ -367,6 +369,21 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
             (true, ..) => {
                 login = true;
                 "needs login".to_owned()
+            }
+            _ if keyed && !gw::login::cli::KEY_PROVIDERS.contains(&e.provider.as_str()) => {
+                let api = format!("{}-api", e.provider);
+                hints.push(if gw::login::cli::KEY_PROVIDERS.contains(&api.as_str()) {
+                    format!(
+                        "{} cannot use a key: gw login {api} --key, then gw account remove {} {}",
+                        e.provider, e.provider, e.id
+                    )
+                } else {
+                    format!(
+                        "{} cannot use a key: gw account remove {} {}",
+                        e.provider, e.provider, e.id
+                    )
+                });
+                "unusable key".to_owned()
             }
             (_, true, _) => "paused".to_owned(),
             (.., Some(until)) => {
@@ -404,7 +421,6 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
             format!("{provider}: {}", groups.join("; "))
         })
         .collect();
-    let mut hints = Vec::new();
     if login {
         hints.push("log in again: gw login --expired".to_owned());
     }
