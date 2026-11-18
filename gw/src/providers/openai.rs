@@ -264,11 +264,10 @@ fn outbound_body(raw: &Bytes, model: &str, fast: bool) -> Result<Value, Failure>
         "stop",
         "user",
         "prompt_cache_options",
+        // The ChatGPT backend rejects it ("Unsupported parameter") for every model.
+        "prompt_cache_retention",
     ] {
         object.remove(key);
-    }
-    if model == "gpt-5.6" || model.starts_with("gpt-5.6-") {
-        object.remove("prompt_cache_retention");
     }
     object.remove("truncation");
     fold_system_messages(object);
@@ -1099,8 +1098,7 @@ mod tests {
                 "instructions",
                 "input",
                 "stream",
-                "store",
-                "prompt_cache_retention"
+                "store"
             ]
         );
         assert_eq!(body["instructions"], "caller instructions\n\nbe terse");
