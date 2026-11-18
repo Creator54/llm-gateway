@@ -6,7 +6,7 @@
 
 use crate::config::Config;
 use crate::creds::{self, Entry};
-use crate::providers::{anthropic, antigravity, openai_api};
+use crate::providers::{anthropic, antigravity, command_code, openai_api};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -43,7 +43,7 @@ pub async fn refresh(cfg: &Config) -> anyhow::Result<Vec<(String, anyhow::Result
     let client = reqwest::Client::new();
     let mut saved = load_accounts(&cfg.state_dir);
     let mut report = Vec::new();
-    for provider in ["anthropic", "antigravity", "openai-api"] {
+    for provider in ["anthropic", "antigravity", "command-code", "openai-api"] {
         let accounts = store.accounts(provider);
         let mut first_error = None;
         let mut succeeded = false;
@@ -130,13 +130,15 @@ async fn discover(
             let base = base.unwrap_or(anthropic::DEFAULT_BASE);
             get(client, &format!("{base}/v1/models?limit=1000"), &token).await?
         }
-        "openai-api" => {
-            let base = base.unwrap_or(openai_api::DEFAULT_BASE_URL);
-            let response = client
-                .get(format!("{base}/models"))
-                .bearer_auth(&token)
-                .send()
-                .await?;
+        "openai-api" | "command-code" => {
+            let url = match provider {
+                "command-code" => format!(
+                    "{}/provider/v1/models",
+                    base.unwrap_or(command_code::DEFAULT_BASE_URL)
+                ),
+                _ => format!("{}/models", base.unwrap_or(openai_api::DEFAULT_BASE_URL)),
+            };
+            let response = client.get(url).bearer_auth(&token).send().await?;
             json_body(response).await?
         }
         _ => {

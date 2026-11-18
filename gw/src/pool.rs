@@ -78,8 +78,14 @@ struct AccountState {
 
 impl AccountState {
     /// Whether the account may serve a request now; expired cooldowns are cleared by the caller.
-    fn usable(&self) -> bool {
-        !self.paused && self.cooldown.is_none()
+    /// A free model costs no credit, so an account that ran out of it can still serve one.
+    fn usable(&self, free: bool) -> bool {
+        let blocked = match self.cooldown {
+            Some((_, Reason::Quota)) => !free,
+            Some(_) => true,
+            None => false,
+        };
+        !self.paused && !blocked
     }
 
     /// Whether a pin names this account, by id or label.
@@ -217,11 +223,13 @@ impl Pool {
     }
 
     /// Pick an account for one request: pinned, sticky for the session, else least recently used.
+    /// `free` marks a model that spends no credit, which a quota cooldown does not block.
     pub fn pick(
         &mut self,
         provider: &str,
         session: &str,
         pinned: Option<&str>,
+        free: bool,
         now: Instant,
     ) -> Option<String> {
         let tick = self.bump();
@@ -239,7 +247,7 @@ impl Pool {
         let chosen = match pinned {
             Some(id) => states
                 .iter_mut()
-                .find(|state| state.is(id) && state.usable())
+                .find(|state| state.is(id) && state.usable(free))
                 .map(|state| {
                     state.assigned = tick;
                     state.id.clone()
@@ -248,7 +256,7 @@ impl Pool {
                 let sticky = bound.and_then(|id| {
                     states
                         .iter_mut()
-                        .find(|state| state.id == id && state.usable())
+                        .find(|state| state.id == id && state.usable(free))
                         .map(|state| {
                             state.assigned = tick;
                             state.id.clone()
@@ -257,7 +265,7 @@ impl Pool {
                 sticky.or_else(|| {
                     let state = states
                         .iter_mut()
-                        .filter(|state| state.usable())
+                        .filter(|state| state.usable(free))
                         .min_by_key(|state| state.assigned)?;
                     state.assigned = tick;
                     Some(state.id.clone())
@@ -445,29 +453,56 @@ mod tests {
     fn rotates_round_robin_for_new_sessions() {
         let mut pool = pool_of("p", &["a1", "a2", "a3"]);
         let now = Instant::now();
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
-        assert_eq!(pool.pick("p", "s2", None, now).as_deref(), Some("a2"));
-        assert_eq!(pool.pick("p", "s3", None, now).as_deref(), Some("a3"));
-        assert_eq!(pool.pick("p", "s4", None, now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
+        assert_eq!(
+            pool.pick("p", "s2", None, false, now).as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            pool.pick("p", "s3", None, false, now).as_deref(),
+            Some("a3")
+        );
+        assert_eq!(
+            pool.pick("p", "s4", None, false, now).as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
     fn session_keeps_its_account() {
         let mut pool = pool_of("p", &["a1", "a2"]);
         let now = Instant::now();
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
-        assert_eq!(pool.pick("p", "s2", None, now).as_deref(), Some("a2"));
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
+        assert_eq!(
+            pool.pick("p", "s2", None, false, now).as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
     fn pinning_ignores_stickiness() {
         let mut pool = pool_of("p", &["a1", "a2"]);
         let now = Instant::now();
-        assert_eq!(pool.pick("p", "s1", Some("a2"), now).as_deref(), Some("a2"));
-        assert_eq!(pool.pick("p", "s1", Some("nope"), now), None);
+        assert_eq!(
+            pool.pick("p", "s1", Some("a2"), false, now).as_deref(),
+            Some("a2")
+        );
+        assert_eq!(pool.pick("p", "s1", Some("nope"), false, now), None);
         // The pin did not move the session, which still follows its own pick.
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
@@ -476,14 +511,14 @@ mod tests {
         pool.set_label("p", "id-2", Some("work"));
         let now = Instant::now();
         assert_eq!(
-            pool.pick("p", "s", Some("work"), now).as_deref(),
+            pool.pick("p", "s", Some("work"), false, now).as_deref(),
             Some("id-2")
         );
         assert_eq!(
-            pool.pick("p", "s", Some("id-2"), now).as_deref(),
+            pool.pick("p", "s", Some("id-2"), false, now).as_deref(),
             Some("id-2")
         );
-        assert_eq!(pool.pick("p", "s", Some("home"), now), None);
+        assert_eq!(pool.pick("p", "s", Some("home"), false, now), None);
     }
 
     #[test]
@@ -491,35 +526,59 @@ mod tests {
         let mut pool = pool_of("p", &["a1", "a2"]);
         let now = Instant::now();
         pool.set_paused("p", "a1", true);
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a2"));
-        assert_eq!(pool.pick("p", "s2", Some("a1"), now), None);
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a2")
+        );
+        assert_eq!(pool.pick("p", "s2", Some("a1"), false, now), None);
         pool.set_paused("p", "a1", false);
-        assert_eq!(pool.pick("p", "s2", Some("a1"), now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s2", Some("a1"), false, now).as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
     fn cooldown_moves_the_session_and_expires() {
         let mut pool = pool_of("p", &["a1", "a2"]);
         let now = Instant::now();
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
-        pool.report("p", "a1", Outcome::RateLimited { retry_after: None }, now);
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a2"));
         assert_eq!(
-            pool.pick("p", "s1", None, now + Duration::from_secs(59))
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
+        pool.report("p", "a1", Outcome::RateLimited { retry_after: None }, now);
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now + Duration::from_secs(59))
                 .as_deref(),
             Some("a2")
         );
         // Stickiness keeps the session on the replacement; a new session gets the freed account.
         assert_eq!(
-            pool.pick("p", "s1", None, now + Duration::from_secs(61))
+            pool.pick("p", "s1", None, false, now + Duration::from_secs(61))
                 .as_deref(),
             Some("a2")
         );
         assert_eq!(
-            pool.pick("p", "s2", None, now + Duration::from_secs(61))
+            pool.pick("p", "s2", None, false, now + Duration::from_secs(61))
                 .as_deref(),
             Some("a1")
         );
+    }
+
+    #[test]
+    fn an_account_out_of_credit_still_serves_free_models() {
+        let mut pool = pool_of("p", &["a1"]);
+        let now = Instant::now();
+        pool.report("p", "a1", Outcome::Quota { reset_after: None }, now);
+        assert_eq!(pool.pick("p", "s1", None, false, now), None);
+        assert_eq!(pool.pick("p", "s1", None, true, now).as_deref(), Some("a1"));
+        // Only the credit is gone; a rate limit or a rejected login blocks everything.
+        pool.report("p", "a1", Outcome::RateLimited { retry_after: None }, now);
+        assert_eq!(pool.pick("p", "s1", None, true, now), None);
     }
 
     #[test]
@@ -535,7 +594,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            pool.pick("p", "s1", None, now + Duration::from_secs(4)),
+            pool.pick("p", "s1", None, false, now + Duration::from_secs(4)),
             None
         );
         assert_eq!(
@@ -543,7 +602,7 @@ mod tests {
             Some(now + Duration::from_secs(5))
         );
         assert_eq!(
-            pool.pick("p", "s1", None, now + Duration::from_secs(5))
+            pool.pick("p", "s1", None, false, now + Duration::from_secs(5))
                 .as_deref(),
             Some("a1")
         );
@@ -595,11 +654,14 @@ mod tests {
         );
         // The store dropping the mark (a manual recheck) frees it at once.
         pool.set_disabled("p", "a1", None);
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
         // Other cooldowns are not the store's to lift.
         pool.report("p", "a1", Outcome::Auth, now);
         pool.set_disabled("p", "a1", None);
-        assert_eq!(pool.pick("p", "s2", None, now), None);
+        assert_eq!(pool.pick("p", "s2", None, false, now), None);
     }
 
     #[test]
@@ -608,18 +670,21 @@ mod tests {
         let now = Instant::now();
         pool.report("p", "a1", Outcome::Auth, now - Duration::from_secs(3600));
         pool.report("p", "a1", Outcome::Success, now);
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
     fn session_map_drops_idle_sessions() {
         let mut pool = pool_of("p", &["a1"]);
         let now = Instant::now();
-        pool.pick("p", "old", None, now);
-        pool.pick("p", "fresh", None, now + Duration::from_secs(10));
+        pool.pick("p", "old", None, false, now);
+        pool.pick("p", "fresh", None, false, now + Duration::from_secs(10));
         // The sweep runs on the next insert, once the interval has passed.
         let later = now + SESSION_IDLE + SWEEP_EVERY;
-        pool.pick("p", "new", None, later);
+        pool.pick("p", "new", None, false, later);
         assert!(!pool.sessions.contains_key("old"));
         assert!(!pool.sessions.contains_key("fresh"));
         assert!(pool.sessions.contains_key("new"));
@@ -679,10 +744,13 @@ mod tests {
         let mut pool = pool_of("p", &["a1"]);
         let now = Instant::now();
         pool.report("p", "a1", Outcome::Auth, now);
-        assert_eq!(pool.pick("p", "s1", None, now), None);
+        assert_eq!(pool.pick("p", "s1", None, false, now), None);
         pool.clear_cooldown("p", "a1");
         assert!(pool.accounts("p")[0].cooldown.is_none());
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
@@ -739,10 +807,11 @@ mod tests {
             },
             now,
         );
-        assert_eq!(pool.pick("p", "s1", None, now), None);
+        assert_eq!(pool.pick("p", "s1", None, false, now), None);
         assert_eq!(pool.earliest_free("p", None, now), Some(now + MIN_COOLDOWN));
         assert_eq!(
-            pool.pick("p", "s1", None, now + MIN_COOLDOWN).as_deref(),
+            pool.pick("p", "s1", None, false, now + MIN_COOLDOWN)
+                .as_deref(),
             Some("a1")
         );
     }
@@ -759,13 +828,16 @@ mod tests {
             },
             now,
         );
-        assert_eq!(pool.pick("p", "s1", Some("a1"), now), None);
+        assert_eq!(pool.pick("p", "s1", Some("a1"), false, now), None);
         assert_eq!(
             pool.earliest_free("p", Some("a1"), now),
             Some(now + Duration::from_secs(120))
         );
         // The other account is free, so an unpinned pick works and nothing is pending.
-        assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a2"));
+        assert_eq!(
+            pool.pick("p", "s1", None, false, now).as_deref(),
+            Some("a2")
+        );
         assert_eq!(pool.earliest_free("p", None, now), None);
     }
 }

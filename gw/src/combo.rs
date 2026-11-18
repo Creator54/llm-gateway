@@ -175,6 +175,7 @@ impl<'a> Attempt<'a> {
             &target.provider,
             self.session,
             target.account.as_deref(),
+            crate::providers::is_free(&target.model),
             self.now,
         )?;
         self.last = Some((index, account.clone()));

@@ -32,6 +32,12 @@ pub fn canonical(name: &str) -> &str {
     }
 }
 
+/// Whether a model is one the provider serves at no cost, which an account out of credit
+/// can still use. command-code marks its own with a `:free` suffix.
+pub fn is_free(model: &str) -> bool {
+    model.ends_with(":free")
+}
+
 /// One spelling per model for usage rows, where a provider accepts several.
 pub fn usage_model(provider: &str, model: &str) -> String {
     match provider {

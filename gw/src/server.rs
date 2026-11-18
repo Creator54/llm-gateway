@@ -998,7 +998,8 @@ impl Gateway {
             }
             None => {
                 let target = route.targets.first()?;
-                let id = pool.pick(&target.provider, session, route.pin.as_deref(), now)?;
+                let free = providers::is_free(&target.model);
+                let id = pool.pick(&target.provider, session, route.pin.as_deref(), free, now)?;
                 if seen(&target.provider, &id) {
                     return None;
                 }
