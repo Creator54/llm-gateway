@@ -11,8 +11,8 @@ use http::StatusCode;
 use serde_json::Value;
 
 use super::chat::{
-    buffered_reply, chat_body, error_body, invalid, names_error, relay, retry_after,
-    stream_headers, translated_stream,
+    buffered_reply, chat_body, error_body, invalid, names_error, relay, responses_json_to_chat,
+    responses_to_chat_stream, retry_after, stream_headers, translate_failure, translated_stream,
 };
 use crate::provider::{Account, Credential, Failure, Inbound, Provider, Reply, Request};
 
@@ -50,8 +50,19 @@ impl OpenAiApi {
         if key.is_empty() {
             return Err(Failure::Auth);
         }
+        let mut via_responses = false;
         let (path, mut body) = match req.inbound {
-            Inbound::Chat => ("chat/completions", passthrough(req, true)?),
+            Inbound::Chat => {
+                let body = passthrough(req, true)?;
+                if needs_responses(&body) {
+                    via_responses = true;
+                    let translated = crate::translate::chat_request_to_responses(&body, &req.model)
+                        .map_err(|error| translate_failure(&error, req.inbound))?;
+                    ("responses", translated)
+                } else {
+                    ("chat/completions", body)
+                }
+            }
             Inbound::Responses => ("responses", passthrough(req, false)?),
             Inbound::Messages => ("chat/completions", chat_body(req)?),
         };
@@ -97,6 +108,18 @@ impl OpenAiApi {
                 buffered_reply(req, response).await
             };
         }
+        if via_responses {
+            return if req.stream {
+                let usage = chat_usage_asked(&req.body);
+                Ok(Reply {
+                    status,
+                    headers: stream_headers(),
+                    body: responses_to_chat_stream(response, &req.model, usage),
+                })
+            } else {
+                responses_json_to_chat(response, &req.model).await
+            };
+        }
         let mut headers = reply_headers(response.headers());
         if req.stream {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -121,6 +144,28 @@ impl Provider for OpenAiApi {
     ) -> BoxFuture<'a, Result<Reply, Failure>> {
         self.turn(req, account).boxed()
     }
+}
+
+/// Function tools combined with a reasoning effort are refused on chat completions by the
+/// newer models; the Responses endpoint accepts them.
+fn needs_responses(body: &Value) -> bool {
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let reasoning = body
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort != "none");
+    tools && reasoning
+}
+
+/// Whether the caller asked for the final usage chunk of a chat stream.
+fn chat_usage_asked(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.pointer("/stream_options/include_usage")?.as_bool())
+        .unwrap_or(false)
 }
 
 /// The client's body with the routed model, which is already the API's own shape. A chat

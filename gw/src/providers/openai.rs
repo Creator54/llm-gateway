@@ -14,6 +14,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
 use serde_json::Value;
 
+use super::chat::responses_to_chat_stream as chat_stream;
 use crate::provider::{Account, Credential, Failure, Inbound, Provider, Reply, Request};
 use crate::translate::{Error, SseParser};
 
@@ -725,59 +726,6 @@ fn relay(response: reqwest::Response) -> BoxStream<'static, Result<Bytes, std::i
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other))
         .boxed()
-}
-
-/// Upstream Responses SSE rewritten as Chat completion chunks.
-fn chat_stream(
-    response: reqwest::Response,
-    model: &str,
-    include_usage: bool,
-) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
-    let state = (
-        response.bytes_stream().boxed(),
-        SseParser::new(),
-        crate::translate::ChatStream::new(model, include_usage),
-        false,
-    );
-    stream::unfold(
-        state,
-        |(mut source, mut parser, mut encoder, ended)| async move {
-            if ended {
-                return None;
-            }
-            loop {
-                match source.next().await {
-                    Some(Ok(chunk)) => {
-                        let Ok(payloads) = parser.push(&chunk) else {
-                            let out = encoder.finish();
-                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
-                        };
-                        let out: Vec<u8> = payloads
-                            .iter()
-                            .flat_map(|payload| encoder.push_event(payload))
-                            .collect();
-                        if !out.is_empty() {
-                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, false)));
-                        }
-                    }
-                    Some(Err(error)) => {
-                        return Some((
-                            Err(std::io::Error::other(error)),
-                            (source, parser, encoder, true),
-                        ));
-                    }
-                    None => {
-                        let out = encoder.finish();
-                        if out.is_empty() {
-                            return None;
-                        }
-                        return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
-                    }
-                }
-            }
-        },
-    )
-    .boxed()
 }
 
 /// Folded Responses JSON rewritten as a Chat completion.

@@ -119,6 +119,47 @@ async fn chat_goes_to_the_api_with_the_key_and_the_routed_model() {
 }
 
 #[tokio::test]
+async fn tools_with_reasoning_effort_go_through_responses() {
+    let responses = r#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-6.2-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#;
+    let (adapter, seen) = spawn(200, responses).await;
+    let body = json!({
+        "model": "gpt-6.2-sol",
+        "reasoning_effort": "medium",
+        "max_tokens": 16,
+        "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    let reply = adapter
+        .send(&request(Inbound::Chat, body, false, false), &keyed())
+        .await
+        .expect("reply");
+    let chat: serde_json::Value = serde_json::from_str(&text(reply).await).unwrap();
+    assert_eq!(chat["object"], "chat.completion");
+    assert_eq!(chat["choices"][0]["message"]["content"], "pong");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0].path, "/v1/responses");
+    assert_eq!(seen[0].body["reasoning"]["effort"], "medium");
+    assert_eq!(seen[0].body["max_output_tokens"], 16);
+    assert_eq!(seen[0].body["tools"][0]["name"], "f");
+}
+
+#[tokio::test]
+async fn tools_without_reasoning_stay_on_chat_completions() {
+    let (adapter, seen) = spawn(200, CHAT).await;
+    let body = json!({
+        "model": "gpt-5.5",
+        "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    adapter
+        .send(&request(Inbound::Chat, body, false, false), &keyed())
+        .await
+        .expect("reply");
+    assert_eq!(seen.lock().unwrap()[0].path, "/v1/chat/completions");
+}
+
+#[tokio::test]
 async fn max_tokens_becomes_max_completion_tokens() {
     let (adapter, seen) = spawn(200, CHAT).await;
     let body = json!({"model":"gpt-6.2-sol","max_tokens":16,"messages":[]});

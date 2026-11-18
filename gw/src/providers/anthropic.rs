@@ -133,7 +133,7 @@ impl Anthropic {
             .send()
             .await
             .map_err(|error| {
-                tracing::debug!(%error, "anthropic request failed");
+                tracing::warn!(url = %plan.url, %error, "anthropic upstream request failed");
                 Failure::Retryable
             })
     }
@@ -941,7 +941,11 @@ async fn reply(
         .to_owned();
     if !status.is_success() {
         let body = read_capped(&mut resp, MAX_ERROR_BODY).await;
-        return Err(failure(status, resp.headers(), &body));
+        let failed = failure(status, resp.headers(), &body);
+        if failed == Failure::Retryable {
+            tracing::warn!(%status, body = %String::from_utf8_lossy(&body), "anthropic upstream server error");
+        }
+        return Err(failed);
     }
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(&content_type) {

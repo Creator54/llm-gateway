@@ -4,7 +4,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::{
+    stream::{self, BoxStream},
+    StreamExt,
+};
 use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
 use serde_json::Value;
@@ -12,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::provider::{Failure, Inbound, Reply, Request};
 use crate::translate::{
-    chat_to_messages, chat_to_responses, messages_to_chat, responses_to_chat, MessagesStream,
-    ResponsesStream,
+    chat_to_messages, chat_to_responses, messages_to_chat, responses_reply_to_chat,
+    responses_to_chat, ChatStream, MessagesStream, ResponsesStream, SseParser,
 };
 
 /// Largest error body read before classifying a failure.
@@ -131,6 +134,75 @@ pub(super) fn relay(
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other))
         .boxed()
+}
+
+/// Upstream Responses SSE rewritten as Chat completion chunks.
+pub(super) fn responses_to_chat_stream(
+    response: reqwest::Response,
+    model: &str,
+    include_usage: bool,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    let state = (
+        response.bytes_stream().boxed(),
+        SseParser::new(),
+        ChatStream::new(model, include_usage),
+        false,
+    );
+    stream::unfold(
+        state,
+        |(mut source, mut parser, mut encoder, ended)| async move {
+            if ended {
+                return None;
+            }
+            loop {
+                match source.next().await {
+                    Some(Ok(chunk)) => {
+                        let Ok(payloads) = parser.push(&chunk) else {
+                            let out = encoder.finish();
+                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
+                        };
+                        let out: Vec<u8> = payloads
+                            .iter()
+                            .flat_map(|payload| encoder.push_event(payload))
+                            .collect();
+                        if !out.is_empty() {
+                            return Some((Ok(Bytes::from(out)), (source, parser, encoder, false)));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        return Some((
+                            Err(std::io::Error::other(error)),
+                            (source, parser, encoder, true),
+                        ));
+                    }
+                    None => {
+                        let out = encoder.finish();
+                        if out.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(Bytes::from(out)), (source, parser, encoder, true)));
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// A non-streaming Responses reply as a Chat completion.
+pub(super) async fn responses_json_to_chat(
+    response: reqwest::Response,
+    model: &str,
+) -> Result<Reply, Failure> {
+    let status = response.status();
+    let body = read_body(response).await?;
+    let reply: Value = serde_json::from_slice(&body).map_err(|_| Failure::Retryable)?;
+    let chat = responses_reply_to_chat(&reply, model).map_err(|_| Failure::Retryable)?;
+    Ok(Reply {
+        status,
+        headers: json_headers(),
+        body: stream::once(async move { Ok(Bytes::from(chat.to_string())) }).boxed(),
+    })
 }
 
 async fn read_body(response: reqwest::Response) -> Result<Vec<u8>, Failure> {
