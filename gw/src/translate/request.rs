@@ -55,6 +55,14 @@ pub fn chat_to_responses(request: &Value, upstream_model: &str) -> Result<Value,
         "parallel_tool_calls",
     );
     copy(request, object, "service_tier", "service_tier");
+    // Without the key, requests of one session land on different cache shards.
+    copy(request, object, "prompt_cache_key", "prompt_cache_key");
+    copy(
+        request,
+        object,
+        "prompt_cache_retention",
+        "prompt_cache_retention",
+    );
     if let Some(max) = request
         .get("max_completion_tokens")
         .or_else(|| request.get("max_tokens"))

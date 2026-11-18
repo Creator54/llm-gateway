@@ -18,7 +18,8 @@ const CACHE_SIZE_KIB: i32 = -512;
 const RETENTION_DAYS: u64 = 30;
 
 /// Applied in order; `user_version` records how many have run.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE quirks (
     provider   TEXT NOT NULL,
     model      TEXT NOT NULL,
@@ -51,7 +52,32 @@ CREATE TABLE usage (
 );
 CREATE INDEX usage_ts ON usage(ts);
 CREATE INDEX usage_provider_model ON usage(provider, model);
-"#];
+"#,
+    r#"
+CREATE TABLE holds (
+    provider TEXT NOT NULL,
+    -- An account id, or a model id when kind is 'model'.
+    subject  TEXT NOT NULL,
+    -- 'model' for a model the provider refused, else the cooldown reason of an account.
+    kind     TEXT NOT NULL,
+    until    INTEGER NOT NULL,
+    PRIMARY KEY (provider, subject, kind)
+) WITHOUT ROWID;
+"#,
+];
+
+/// An account cooldown or a refused model that outlives a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    pub provider: String,
+    pub subject: String,
+    pub kind: String,
+    /// Unix seconds.
+    pub until: i64,
+}
+
+/// `Hold::kind` of a model the provider does not serve.
+pub const MODEL_HOLD: &str = "model";
 
 /// One finished request, as appended to the usage table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +259,43 @@ impl Store {
             params![session, target, account, now_secs()],
         )?;
         Ok(())
+    }
+
+    /// Remember that `subject` is held until `until` (Unix seconds); a later call replaces it.
+    pub fn put_hold(&self, provider: &str, subject: &str, kind: &str, until: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO holds (provider, subject, kind, until) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(provider, subject, kind) DO UPDATE SET until = excluded.until",
+            params![provider, subject, kind, until],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the holds on one account or model, so it is tried again.
+    pub fn clear_holds(&self, provider: &str, subject: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM holds WHERE provider = ?1 AND subject = ?2",
+            params![provider, subject],
+        )?;
+        Ok(())
+    }
+
+    /// Holds still running; the ones that ended are deleted.
+    pub fn active_holds(&self) -> Result<Vec<Hold>> {
+        let now = now_secs();
+        self.conn()
+            .execute("DELETE FROM holds WHERE until <= ?1", [now])?;
+        let read = self.read();
+        let mut stmt = read.prepare("SELECT provider, subject, kind, until FROM holds")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Hold {
+                provider: r.get(0)?,
+                subject: r.get(1)?,
+                kind: r.get(2)?,
+                until: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Current pin for a session, if it has not been pruned.
@@ -454,6 +517,26 @@ mod tests {
         let conn = store.conn();
         conn.pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn holds_last_until_they_end_and_clear_on_request() {
+        let dir = TempDir::new("holds");
+        let store = Store::open(dir.path()).unwrap();
+        let now = now_secs();
+        store.put_hold("p", "a", "quota", now + 60).unwrap();
+        store.put_hold("p", "m", MODEL_HOLD, now + 60).unwrap();
+        store.put_hold("p", "old", "auth", now - 1).unwrap();
+        let mut held: Vec<String> = store
+            .active_holds()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.subject)
+            .collect();
+        held.sort();
+        assert_eq!(held, ["a", "m"]);
+        store.clear_holds("p", "a").unwrap();
+        assert_eq!(store.active_holds().unwrap().len(), 1);
     }
 
     #[test]

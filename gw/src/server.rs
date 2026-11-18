@@ -239,7 +239,7 @@ impl Gateway {
             };
             adapters.insert(name.to_owned(), Arc::from(adapter));
         }
-        Ok(Self {
+        let gateway = Self {
             client,
             fallback: cfg.fallback.clone(),
             key,
@@ -275,7 +275,9 @@ impl Gateway {
                 .as_deref()
                 .map(providers::canonical)
                 .map(str::to_owned),
-        })
+        };
+        gateway.restore_holds();
+        Ok(gateway)
     }
 }
 
@@ -501,7 +503,15 @@ async fn list_models(State(st): State<Arc<Gateway>>, req: Request) -> Response {
     if local.is_empty() || declared_len.is_some_and(|len| len > 0) {
         return forward(State(st), req).await;
     }
-    let mut response = Response::new(Body::from(models::render(&local, shape)));
+    let mut rendered = models::render(&local, shape);
+    if req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|p| p == "status=1"))
+    {
+        rendered = st.mark_unavailable(&local, rendered);
+    }
+    let mut response = Response::new(Body::from(rendered));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -549,6 +559,37 @@ impl Gateway {
             "false" | "0" => Some(false),
             _ => None,
         }
+    }
+
+    /// Add `gw_unavailable` (the reason) to each listed model that cannot serve right now: its
+    /// provider refused it, or every account of the provider is cooling down.
+    fn mark_unavailable(&self, entries: &[models::Entry], rendered: Bytes) -> Bytes {
+        let Ok(mut body) = serde_json::from_slice::<Value>(&rendered) else {
+            return rendered;
+        };
+        let now = Instant::now();
+        let pool = self.lock_pool();
+        let reasons: BTreeMap<&str, String> = entries
+            .iter()
+            .filter_map(|entry| {
+                let (provider, model) = entry.id.split_once('/')?;
+                let reason = if pool.unavailable_until(provider, model, now).is_some() {
+                    "not served by the provider".to_owned()
+                } else {
+                    let why = pool.blocked(provider, providers::is_free(model), now)?;
+                    reason_text(why).to_owned()
+                };
+                Some((entry.id.as_str(), reason))
+            })
+            .collect();
+        drop(pool);
+        for item in body["data"].as_array_mut().into_iter().flatten() {
+            let reason = item["id"].as_str().and_then(|id| reasons.get(id)).cloned();
+            if let Some(reason) = reason {
+                item["gw_unavailable"] = Value::String(reason);
+            }
+        }
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_else(|_| rendered.to_vec()))
     }
 
     /// Models this gateway can route, or empty when the config names none.
@@ -818,14 +859,17 @@ impl Gateway {
                         %status,
                         "model unavailable; skipping the target"
                     );
-                    self.lock_pool().set_unavailable(
-                        &target.provider,
-                        &target.model,
-                        Instant::now() + pool::UNAVAILABLE_COOLDOWN,
-                    );
+                    self.hold_model(&target.provider, &target.model);
                     last = Some(provider::Failure::Fatal { status, body });
                 }
                 AttemptResult::Stop(failure @ provider::Failure::Fatal { .. }) => {
+                    // A direct request is still answered as is; the hold only feeds the
+                    // model list and later combos.
+                    if let provider::Failure::Fatal { status, body } = &failure {
+                        if model_unavailable(*status, body) {
+                            self.hold_model(&target.provider, &target.model);
+                        }
+                    }
                     return Some(failure_reply(shape, failure));
                 }
                 AttemptResult::Stop(failure) => {
@@ -910,6 +954,74 @@ impl Gateway {
                 .filter(|until| *until > now)
                 .map(|until| Instant::now() + Duration::from_secs(until - now));
             pool.set_disabled(&entry.provider, &entry.id, until);
+        }
+    }
+
+    /// Sit a refused model out for a while, and remember it across a restart.
+    fn hold_model(&self, provider: &str, model: &str) {
+        self.lock_pool().set_unavailable(
+            provider,
+            model,
+            Instant::now() + pool::UNAVAILABLE_COOLDOWN,
+        );
+        self.save_hold(
+            provider,
+            model,
+            crate::store::MODEL_HOLD,
+            pool::UNAVAILABLE_COOLDOWN,
+        );
+    }
+
+    /// Remember a long account cooldown so a restart does not cost a rejected request.
+    /// A short rate limit is not worth a write, and a disabled account is kept in the
+    /// credential file already.
+    fn persist_cooldown(&self, provider: &str, account: &str) {
+        let held = self
+            .lock_pool()
+            .accounts(provider)
+            .into_iter()
+            .find(|info| info.id == account)
+            .and_then(|info| info.cooldown);
+        if let Some((until, reason @ (pool::Reason::Quota | pool::Reason::Auth))) = held {
+            self.save_hold(
+                provider,
+                account,
+                reason.as_str(),
+                until.saturating_duration_since(Instant::now()),
+            );
+        }
+    }
+
+    fn save_hold(&self, provider: &str, subject: &str, kind: &str, lasts: Duration) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let until = crate::store::now_secs() + lasts.as_secs() as i64;
+        if let Err(e) = store.put_hold(provider, subject, kind, until) {
+            tracing::warn!(error = %e, "could not persist a cooldown");
+        }
+    }
+
+    /// Put the cooldowns and refused models of the last run back, before the first request.
+    fn restore_holds(&self) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let Ok(holds) = store.active_holds() else {
+            return;
+        };
+        if let Ok(creds) = creds::Store::load(&self.state_dir) {
+            self.sync(&creds);
+        }
+        let now = crate::store::now_secs();
+        let mut pool = self.lock_pool();
+        for hold in holds {
+            let until = Instant::now() + Duration::from_secs((hold.until - now).max(0) as u64);
+            if hold.kind == crate::store::MODEL_HOLD {
+                pool.set_unavailable(&hold.provider, &hold.subject, until);
+            } else if let Some(reason) = pool::Reason::parse(&hold.kind) {
+                pool.restore_cooldown(&hold.provider, &hold.subject, until, reason);
+            }
         }
     }
 
@@ -1051,6 +1163,7 @@ impl Gateway {
                         .report(provider_name, &account.id, outcome, now);
                     // Mirror the cooldown so a scrape shows which accounts are out.
                     self.metrics.set_cooling(provider_name, &account.id, true);
+                    self.persist_cooldown(provider_name, &account.id);
                     tracing::warn!(
                         provider = provider_name,
                         account = %account.id,
@@ -1841,6 +1954,16 @@ fn error_reply(
     response
 }
 
+/// A cooldown reason, in words for a model list.
+fn reason_text(reason: pool::Reason) -> &'static str {
+    match reason {
+        pool::Reason::RateLimited => "rate limited",
+        pool::Reason::Quota => "out of credit",
+        pool::Reason::Auth => "needs login",
+        pool::Reason::Disabled => "disabled by the provider",
+    }
+}
+
 /// Why an account cannot serve right now, in words a client can read.
 fn reason_label(failure: Option<&provider::Failure>) -> &'static str {
     match failure {
@@ -2187,6 +2310,48 @@ mod tests {
         let info = RequestInfo::of(body.as_bytes(), st.default_provider.as_deref());
         assert_eq!(info.provider, "");
         assert!(st.route(&info).is_none());
+    }
+
+    #[tokio::test]
+    async fn cooldowns_and_refused_models_survive_a_restart() {
+        let cfg = default_config();
+        let creds = creds::Store::load(&cfg.state_dir).unwrap();
+        creds.upsert(creds::Entry {
+            provider: "command-code".into(),
+            id: "cmd1".into(),
+            label: None,
+            paused: false,
+            needs_reauth: false,
+            last_error: None,
+            disabled_until: None,
+            credential: creds::Secret::ApiKey { key: "k".into() },
+        });
+        creds.save().unwrap();
+
+        let first = Gateway::new(&cfg).expect("gateway");
+        first.sync(&creds::Store::load(&cfg.state_dir).unwrap());
+        let now = Instant::now();
+        first.lock_pool().report(
+            "command-code",
+            "cmd1",
+            pool::Outcome::Quota { reset_after: None },
+            now,
+        );
+        first.persist_cooldown("command-code", "cmd1");
+        first.hold_model("command-code", "gpt-6.2-sol");
+        drop(first);
+
+        let second = Gateway::new(&cfg).expect("gateway");
+        let pool = second.lock_pool();
+        let now = Instant::now();
+        assert_eq!(
+            pool.blocked("command-code", false, now),
+            Some(pool::Reason::Quota)
+        );
+        assert_eq!(pool.blocked("command-code", true, now), None);
+        assert!(pool
+            .unavailable_until("command-code", "gpt-6.2-sol", now)
+            .is_some());
     }
 
     #[tokio::test]

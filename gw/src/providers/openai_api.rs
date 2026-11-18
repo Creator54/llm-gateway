@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::{future::BoxFuture, FutureExt};
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::chat::{
     buffered_reply, chat_body, error_body, invalid, names_error, relay, responses_json_to_chat,
@@ -66,6 +66,9 @@ impl OpenAiApi {
             Inbound::Responses => ("responses", passthrough(req, false)?),
             Inbound::Messages => ("chat/completions", chat_body(req)?),
         };
+        if path == "responses" {
+            instructions_into_input(&mut body);
+        }
         if req.fast == Some(true) {
             if let Some(object) = body.as_object_mut() {
                 object
@@ -153,6 +156,39 @@ impl Provider for OpenAiApi {
     ) -> BoxFuture<'a, Result<Reply, Failure>> {
         self.turn(req, account).boxed()
     }
+}
+
+/// The platform API does not cache the Responses `instructions` field on current models, but
+/// does cache the same text as the first `developer` input item. Only the Codex backend
+/// requires `instructions`, so here the system prompt moves into the input.
+fn instructions_into_input(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let Some(Value::String(text)) = object
+        .get("instructions")
+        .filter(|v| v.is_string())
+        .cloned()
+    else {
+        return;
+    };
+    let item = json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{ "type": "input_text", "text": text }],
+    });
+    let mut items = match object.remove("input") {
+        Some(Value::Array(items)) => items,
+        Some(Value::String(text)) => vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }],
+        })],
+        _ => Vec::new(),
+    };
+    items.insert(0, item);
+    object.insert("input".into(), Value::Array(items));
+    object.remove("instructions");
 }
 
 /// Function tools are refused on chat completions by models that reason by default, even when

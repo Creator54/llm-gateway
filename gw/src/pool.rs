@@ -31,6 +31,28 @@ pub enum Reason {
     Disabled,
 }
 
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::RateLimited => "rate_limited",
+            Reason::Quota => "quota",
+            Reason::Auth => "auth",
+            Reason::Disabled => "disabled",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        [
+            Reason::RateLimited,
+            Reason::Quota,
+            Reason::Auth,
+            Reason::Disabled,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == text)
+    }
+}
+
 /// What one attempt on an account means for that account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -323,6 +345,39 @@ impl Pool {
             .unwrap_or_default()
     }
 
+    /// Put a known account back on cooldown after a restart; unknown accounts are ignored.
+    pub fn restore_cooldown(
+        &mut self,
+        provider: &str,
+        account: &str,
+        until: Instant,
+        reason: Reason,
+    ) {
+        if let Some(state) = self.state_mut(provider, account) {
+            state.cooldown = Some((until, reason));
+        }
+    }
+
+    /// Why no account of the provider can serve a model now; `None` when one can, and for a
+    /// provider with no accounts, which this pool cannot judge.
+    pub fn blocked(&self, provider: &str, free: bool, now: Instant) -> Option<Reason> {
+        let states = self.providers.get(provider).filter(|s| !s.is_empty())?;
+        let mut why = None;
+        for state in states {
+            let cooling = state.cooldown.filter(|(until, _)| *until > now);
+            let held = match cooling {
+                Some((_, Reason::Quota)) => !free,
+                Some(_) => true,
+                None => false,
+            };
+            if !state.paused && !held {
+                return None;
+            }
+            why = why.or(cooling.map(|(_, reason)| reason));
+        }
+        why
+    }
+
     /// Drop an account's cooldown so it is tried again; unknown accounts are ignored.
     pub fn clear_cooldown(&mut self, provider: &str, account: &str) {
         if let Some(state) = self.state_mut(provider, account) {
@@ -447,6 +502,25 @@ mod tests {
             pool.add(provider, account);
         }
         pool
+    }
+
+    #[test]
+    fn a_provider_is_blocked_only_when_no_account_can_serve() {
+        let now = Instant::now();
+        let mut pool = pool_of("p", &["a", "b"]);
+        assert_eq!(pool.blocked("p", false, now), None);
+        pool.report("p", "a", Outcome::Quota { reset_after: None }, now);
+        assert_eq!(pool.blocked("p", false, now), None, "b still serves");
+        pool.report("p", "b", Outcome::Quota { reset_after: None }, now);
+        assert_eq!(pool.blocked("p", false, now), Some(Reason::Quota));
+        assert_eq!(
+            pool.blocked("p", true, now),
+            None,
+            "free models need no credit"
+        );
+        assert_eq!(pool.blocked("none", false, now), None);
+        let later = now + MAX_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(pool.blocked("p", false, later), None);
     }
 
     #[test]

@@ -126,8 +126,10 @@ async fn tools_with_reasoning_effort_go_through_responses() {
         "model": "gpt-6.2-sol",
         "reasoning_effort": "medium",
         "max_tokens": 16,
+        "prompt_cache_key": "session-1",
+        "prompt_cache_retention": "24h",
         "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
-        "messages": [{"role":"user","content":"hi"}]
+        "messages": [{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]
     });
     let reply = adapter
         .send(&request(Inbound::Chat, body, false, false), &keyed())
@@ -141,6 +143,13 @@ async fn tools_with_reasoning_effort_go_through_responses() {
     assert_eq!(seen[0].path, "/v1/responses");
     assert_eq!(seen[0].body["reasoning"]["effort"], "medium");
     assert_eq!(seen[0].body["max_output_tokens"], 16);
+    assert!(
+        seen[0].body.get("instructions").is_none(),
+        "cacheable as input"
+    );
+    assert_eq!(seen[0].body["input"][0]["role"], "developer");
+    assert_eq!(seen[0].body["prompt_cache_key"], "session-1");
+    assert_eq!(seen[0].body["prompt_cache_retention"], "24h");
     assert_eq!(seen[0].body["tools"][0]["name"], "f");
 }
 

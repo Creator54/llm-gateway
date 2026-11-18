@@ -332,6 +332,9 @@ async fn run() -> anyhow::Result<()> {
                     "no {provider} account {id}"
                 );
                 store.save()?;
+                if let Ok(db) = gw::store::Store::open(&cfg.state_dir) {
+                    db.clear_holds(&provider, &id)?;
+                }
                 gw::ui::ok(&format!("{provider}/{id}: the next request rechecks it"));
                 Ok(())
             }
@@ -440,7 +443,10 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
 async fn fetch_models(cfg: &gw::config::Config, pinned: bool) -> anyhow::Result<Vec<u8>> {
     let mut req = reqwest::Client::new()
         .get(format!("{}/models", gw::connect::default_url(cfg.listen)))
-        .query(&[("accounts", if pinned { "1" } else { "0" })]);
+        .query(&[
+            ("accounts", if pinned { "1" } else { "0" }),
+            ("status", "1"),
+        ]);
     if let Some(key) = read_key(cfg.api_key_file.as_deref())? {
         req = req.bearer_auth(key);
     }
@@ -533,8 +539,14 @@ async fn models(
     if rows.is_empty() && filter.is_some() {
         anyhow::bail!("no model matches that text; run `gw models` for the full list");
     }
-    for id in rows.iter().filter_map(|m| m["id"].as_str()) {
-        println!("{id}");
+    for row in rows {
+        let Some(id) = row["id"].as_str() else {
+            continue;
+        };
+        match row["gw_unavailable"].as_str() {
+            Some(why) => println!("{id}  (unavailable: {why})"),
+            None => println!("{id}"),
+        }
     }
     Ok(())
 }
