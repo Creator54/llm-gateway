@@ -328,11 +328,7 @@ impl Agent {
                     ),
                 ]
                 .into_iter()
-                .chain(model_list(
-                    "providers.gw.models",
-                    &opts.models,
-                    |id| serde_json::json!({ "id": id }),
-                ))
+                .chain(model_list("providers.gw.models", &opts.models, pi_model))
                 .collect(),
             }]),
             Agent::Opencode => {
@@ -402,6 +398,35 @@ impl Agent {
                 ],
             }]),
         }
+    }
+}
+
+/// pi treats a model with no `input` as text-only and drops images before sending, so
+/// say which ids take them.
+fn pi_model(id: &str) -> serde_json::Value {
+    if sees_images(id) {
+        serde_json::json!({ "id": id, "input": ["text", "image"] })
+    } else {
+        serde_json::json!({ "id": id })
+    }
+}
+
+/// Whether `id` names a model that accepts images: Claude, GPT, o-series and Gemini on
+/// the providers that pass images through unchanged, and every combo (each one's first
+/// targets are such models).
+fn sees_images(id: &str) -> bool {
+    let Some((provider, model)) = id.split_once('/') else {
+        return false;
+    };
+    match provider {
+        "combo" => true,
+        "anthropic" | "openai" | "openai-api" | "antigravity" => {
+            !model.contains("gpt-oss")
+                && ["claude", "gpt-", "o3", "o4", "gemini"]
+                    .iter()
+                    .any(|family| model.starts_with(family))
+        }
+        _ => false,
     }
 }
 
@@ -1265,6 +1290,26 @@ mod tests {
             & 0o777;
         assert_eq!(manifest, 0o600);
         assert_eq!(sandbox.mode(".pi/agent/models.json"), 0o600);
+    }
+
+    #[test]
+    fn pi_marks_the_models_that_take_images() {
+        for id in [
+            "anthropic/claude-sonnet-5-5",
+            "openai/gpt-6.1-sol",
+            "openai-api/o3",
+            "antigravity/gemini-3.8-flash",
+            "combo/failover",
+        ] {
+            assert_eq!(
+                pi_model(id)["input"],
+                serde_json::json!(["text", "image"]),
+                "{id}"
+            );
+        }
+        for id in ["antigravity/gpt-oss-120b-medium", "kiro/glm-5", "auto"] {
+            assert!(pi_model(id).get("input").is_none(), "{id}");
+        }
     }
 
     #[test]
