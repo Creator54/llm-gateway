@@ -123,7 +123,12 @@ async fn fetch(cfg: &Config) -> anyhow::Result<(Vec<Window>, Vec<Failure>)> {
     let now = crate::login::now_secs();
     let (mut windows, mut failures) = (Vec::new(), Vec::new());
     for provider in PROVIDERS {
-        for entry in store.accounts(provider) {
+        // The usage endpoints belong to subscriptions; a key is billed per token.
+        for entry in store
+            .accounts(provider)
+            .into_iter()
+            .filter(|entry| matches!(entry.credential, creds::Secret::OAuth(_)))
+        {
             let name = entry.label.clone().unwrap_or_else(|| entry.id.clone());
             match probe(&store, &client, provider, entry).await {
                 Ok(found) => {
