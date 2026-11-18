@@ -20,8 +20,18 @@ pub const PROVIDERS: &[&str] = &[
     "opencode",
 ];
 
+/// Where an API key comes from.
+pub enum KeySource {
+    Prompt,
+    Env(String),
+}
+
+/// Providers that also take a direct API key.
+const KEY_PROVIDERS: [&str; 4] = ["anthropic", "openai", "command-code", "opencode"];
+
 pub struct Login {
     pub provider: String,
+    pub key: Option<KeySource>,
     pub device: bool,
     pub no_browser: bool,
     pub label: Option<String>,
@@ -46,6 +56,12 @@ pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
     if args.device && provider != "openai" {
         anyhow::bail!("{provider} has no device-code flow; drop --device");
     }
+    if args.key.is_some() && !KEY_PROVIDERS.contains(&provider.as_str()) {
+        anyhow::bail!(
+            "{provider} has no API key access; keys work for: {}",
+            KEY_PROVIDERS.join(", ")
+        );
+    }
     let label = Some(args.label.unwrap_or_else(|| provider.clone()));
     let opts = Options {
         dir,
@@ -61,9 +77,11 @@ pub async fn login(args: Login, dir: PathBuf) -> Result<()> {
         ..Options::default()
     };
     let http = reqwest::Client::new();
-    let entry = providers::run(&provider, &http, &opts)
-        .await?
-        .entry(&provider, opts.label.clone());
+    let credential = match args.key {
+        Some(source) => providers::key::login(&http, &provider, source).await?,
+        None => providers::run(&provider, &http, &opts).await?,
+    };
+    let entry = credential.entry(&provider, opts.label.clone());
     let store = creds::Store::load(&opts.dir)?;
     store.upsert(entry.clone());
     store.save()?;

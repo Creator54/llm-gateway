@@ -128,11 +128,17 @@ enum Cmd {
         /// Print the URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
+        /// Store an API key instead of signing in (anthropic, openai, command-code, opencode)
+        #[arg(long, conflicts_with = "device")]
+        key: bool,
+        /// Like --key, reading the key from this environment variable
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["device", "key"])]
+        env: Option<String>,
         /// Print JSON
         #[arg(long)]
         json: bool,
         /// Log in again to every account that needs it, one after another
-        #[arg(long, conflicts_with_all = ["provider", "label", "device", "json"])]
+        #[arg(long, conflicts_with_all = ["provider", "label", "device", "json", "key", "env"])]
         expired: bool,
     },
     /// Manage stored accounts
@@ -268,6 +274,8 @@ async fn run() -> anyhow::Result<()> {
             label,
             device,
             no_browser,
+            key,
+            env,
             json,
             expired,
         } => {
@@ -281,6 +289,11 @@ async fn run() -> anyhow::Result<()> {
                 no_browser,
                 label,
                 json,
+                key: match (key, env) {
+                    (_, Some(var)) => Some(gw::login::cli::KeySource::Env(var)),
+                    (true, None) => Some(gw::login::cli::KeySource::Prompt),
+                    _ => None,
+                },
             };
             gw::login::cli::login(args, cfg.state_dir).await
         }
