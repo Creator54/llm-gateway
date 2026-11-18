@@ -189,8 +189,10 @@ impl ChatStream {
                 self.done = true;
             }
             "response.failed" | "error" => {
+                tracing::warn!(%event, "upstream ended the stream with an error");
                 let message = event
                     .pointer("/response/error/message")
+                    .or_else(|| event.pointer("/error/message"))
                     .or_else(|| event.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("upstream failed");
