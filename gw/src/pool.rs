@@ -68,6 +68,8 @@ impl Outcome {
 
 struct AccountState {
     id: String,
+    /// Name shown to the user; a pin may use it in place of the id.
+    label: Option<String>,
     paused: bool,
     cooldown: Option<(Instant, Reason)>,
     /// Assignment counter value of the last pick; the smallest value is picked next.
@@ -78,6 +80,11 @@ impl AccountState {
     /// Whether the account may serve a request now; expired cooldowns are cleared by the caller.
     fn usable(&self) -> bool {
         !self.paused && self.cooldown.is_none()
+    }
+
+    /// Whether a pin names this account, by id or label.
+    fn is(&self, pin: &str) -> bool {
+        self.id == pin || self.label.as_deref() == Some(pin)
     }
 }
 
@@ -128,6 +135,7 @@ impl Pool {
         }
         states.push(AccountState {
             id: account.to_owned(),
+            label: None,
             paused: false,
             cooldown: None,
             assigned: 0,
@@ -149,6 +157,12 @@ impl Pool {
     }
 
     /// Pause or resume an account; unknown accounts are ignored.
+    pub fn set_label(&mut self, provider: &str, account: &str, label: Option<&str>) {
+        if let Some(state) = self.state_mut(provider, account) {
+            state.label = label.map(str::to_owned);
+        }
+    }
+
     pub fn set_paused(&mut self, provider: &str, account: &str, paused: bool) {
         if let Some(state) = self.state_mut(provider, account) {
             state.paused = paused;
@@ -224,7 +238,7 @@ impl Pool {
         let chosen = match pinned {
             Some(id) => states
                 .iter_mut()
-                .find(|state| state.id == id && state.usable())
+                .find(|state| state.is(id) && state.usable())
                 .map(|state| {
                     state.assigned = tick;
                     state.id.clone()
@@ -353,7 +367,7 @@ impl Pool {
         let states = self.providers.get(provider)?;
         let mut soonest: Option<Instant> = None;
         for state in states {
-            if pinned.is_some_and(|id| state.id != id) || state.paused {
+            if pinned.is_some_and(|id| !state.is(id)) || state.paused {
                 continue;
             }
             let until = match state.cooldown {
@@ -452,6 +466,22 @@ mod tests {
         assert_eq!(pool.pick("p", "s1", Some("nope"), now), None);
         // The pin did not move the session, which still follows its own pick.
         assert_eq!(pool.pick("p", "s1", None, now).as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn a_pin_may_name_the_label() {
+        let mut pool = pool_of("p", &["id-1", "id-2"]);
+        pool.set_label("p", "id-2", Some("work"));
+        let now = Instant::now();
+        assert_eq!(
+            pool.pick("p", "s", Some("work"), now).as_deref(),
+            Some("id-2")
+        );
+        assert_eq!(
+            pool.pick("p", "s", Some("id-2"), now).as_deref(),
+            Some("id-2")
+        );
+        assert_eq!(pool.pick("p", "s", Some("home"), now), None);
     }
 
     #[test]

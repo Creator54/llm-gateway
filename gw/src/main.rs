@@ -109,6 +109,9 @@ enum Cmd {
         /// Show which account can use which model (discovered providers only)
         #[arg(long, conflicts_with = "json")]
         accounts: bool,
+        /// Also list provider@account/model for providers with several accounts
+        #[arg(long, conflicts_with = "accounts")]
+        pinned: bool,
         /// Print JSON
         #[arg(long)]
         json: bool,
@@ -257,6 +260,7 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Models {
             refresh,
             accounts,
+            pinned,
             json,
         } => {
             if refresh {
@@ -265,7 +269,7 @@ async fn run() -> anyhow::Result<()> {
             if accounts {
                 return account_models(&cfg);
             }
-            models(&cfg, json).await
+            models(&cfg, json, pinned).await
         }
         Cmd::Setup { yes, dry_run } => {
             let config = cli
@@ -370,6 +374,10 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
             _ => String::new(),
         };
         let name = e.label.as_deref().unwrap_or(&e.id);
+        let kind = match e.credential {
+            gw::creds::Secret::ApiKey { .. } => " (key)",
+            _ => "",
+        };
         let email = match e.email() {
             Some(email) if emails => format!(" <{email}>"),
             _ => String::new(),
@@ -378,7 +386,7 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
             .or_default()
             .entry(state)
             .or_default()
-            .push(format!("{name}{email}"));
+            .push(format!("{name}{kind}{email}"));
     }
     let lines = by
         .into_iter()
@@ -410,9 +418,10 @@ fn accounts(state_dir: &Path, emails: bool) -> anyhow::Result<(Vec<String>, Vec<
 }
 
 /// Ask the running gateway for its model list (raw JSON body).
-async fn fetch_models(cfg: &gw::config::Config) -> anyhow::Result<Vec<u8>> {
-    let mut req =
-        reqwest::Client::new().get(format!("{}/models", gw::connect::default_url(cfg.listen)));
+async fn fetch_models(cfg: &gw::config::Config, pinned: bool) -> anyhow::Result<Vec<u8>> {
+    let mut req = reqwest::Client::new()
+        .get(format!("{}/models", gw::connect::default_url(cfg.listen)))
+        .query(&[("accounts", if pinned { "1" } else { "0" })]);
     if let Some(key) = read_key(cfg.api_key_file.as_deref())? {
         req = req.bearer_auth(key);
     }
@@ -447,7 +456,7 @@ async fn fetch_models(cfg: &gw::config::Config) -> anyhow::Result<Vec<u8>> {
 }
 
 async fn model_ids(cfg: &gw::config::Config) -> anyhow::Result<Vec<String>> {
-    let body: serde_json::Value = serde_json::from_slice(&fetch_models(cfg).await?)?;
+    let body: serde_json::Value = serde_json::from_slice(&fetch_models(cfg, false).await?)?;
     Ok(body["data"]
         .as_array()
         .into_iter()
@@ -485,12 +494,21 @@ async fn refresh_models(cfg: &gw::config::Config) -> anyhow::Result<()> {
 }
 
 /// `gw models`: ask the running gateway what it serves.
-async fn models(cfg: &gw::config::Config, json: bool) -> anyhow::Result<()> {
+async fn models(cfg: &gw::config::Config, json: bool, pinned: bool) -> anyhow::Result<()> {
     if json {
-        println!("{}", String::from_utf8_lossy(&fetch_models(cfg).await?));
+        println!(
+            "{}",
+            String::from_utf8_lossy(&fetch_models(cfg, pinned).await?)
+        );
         return Ok(());
     }
-    for id in model_ids(cfg).await? {
+    let body: serde_json::Value = serde_json::from_slice(&fetch_models(cfg, pinned).await?)?;
+    for id in body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str())
+    {
         println!("{id}");
     }
     Ok(())
@@ -893,7 +911,10 @@ async fn combos(cfg: &gw::config::Config, state_dir: &Path, ui: &gw::ui::Ui) {
                     String::new()
                 },
                 (i + 1).to_string(),
-                t.provider.clone(),
+                match &t.account {
+                    Some(account) => format!("{}@{account}", t.provider),
+                    None => t.provider.clone(),
+                },
                 t.model.clone(),
             ]);
         }

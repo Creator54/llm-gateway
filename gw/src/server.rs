@@ -487,7 +487,14 @@ async fn list_models(State(st): State<Arc<Gateway>>, req: Request) -> Response {
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let local = st.model_list();
+    let mut local = st.model_list();
+    if req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|p| p == "accounts=1"))
+    {
+        local.extend(st.pinned_models(&local));
+    }
     if local.is_empty() || declared_len.is_some_and(|len| len > 0) {
         return forward(State(st), req).await;
     }
@@ -579,6 +586,34 @@ impl Gateway {
         }
         let names: Vec<String> = self.combos.keys().cloned().collect();
         models::with_builtins(entries, &names)
+    }
+
+    /// `provider@account/model` for every account of a provider that has several,
+    /// so a client's picker can choose the account. Single-account providers add nothing.
+    fn pinned_models(&self, listed: &[models::Entry]) -> Vec<models::Entry> {
+        let Ok(store) = creds::Store::load(&self.state_dir) else {
+            return Vec::new();
+        };
+        let all = store.all();
+        let mut out = Vec::new();
+        for entry in listed {
+            let Some((provider, model)) = entry.id.split_once('/') else {
+                continue;
+            };
+            let names: Vec<&str> = all
+                .iter()
+                .filter(|a| a.provider == provider)
+                .map(|a| a.label.as_deref().unwrap_or(&a.id))
+                .collect();
+            if names.len() < 2 {
+                continue;
+            }
+            out.extend(names.into_iter().map(|name| models::Entry {
+                id: format!("{provider}@{name}/{model}"),
+                ..entry.clone()
+            }));
+        }
+        out
     }
 
     /// Send `plan` upstream and stream the reply back, journaling it as it passes.
@@ -837,6 +872,7 @@ impl Gateway {
             targets: vec![combo::Target {
                 provider: info.provider.clone(),
                 model: info.model.clone(),
+                account: None,
                 weight: 1,
             }],
             combo: None,
@@ -849,6 +885,7 @@ impl Gateway {
         let mut pool = self.lock_pool();
         for entry in creds.all() {
             pool.add(&entry.provider, &entry.id);
+            pool.set_label(&entry.provider, &entry.id, entry.label.as_deref());
             pool.set_paused(&entry.provider, &entry.id, entry.paused);
             let now = crate::login::now_secs();
             let until = entry
@@ -934,7 +971,9 @@ impl Gateway {
                         continue;
                     }
                     let index = route.targets.iter().position(|item| {
-                        item.provider == target.provider && item.model == target.model
+                        item.provider == target.provider
+                            && item.model == target.model
+                            && item.account == target.account
                     })?;
                     return Some((target.clone(), id, index));
                 }

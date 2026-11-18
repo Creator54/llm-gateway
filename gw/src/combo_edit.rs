@@ -6,11 +6,16 @@ use anyhow::{bail, Context};
 use std::path::Path;
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table};
 
-/// Parse `provider/model` or `provider/model*weight`.
+/// Parse `provider/model`, `provider@account/model`, optionally with `*weight`.
 pub fn parse_target(spec: &str) -> anyhow::Result<Target> {
     let (provider, rest) = spec
         .split_once('/')
         .with_context(|| format!("target `{spec}` must look like provider/model"))?;
+    let (provider, account) = match provider.split_once('@') {
+        Some((provider, account)) if !account.is_empty() => (provider, Some(account.to_owned())),
+        Some(_) => bail!("target `{spec}` has an empty account after @"),
+        None => (provider, None),
+    };
     let provider = providers::canonical(provider);
     if !providers::is_provider(provider) {
         bail!(
@@ -32,6 +37,7 @@ pub fn parse_target(spec: &str) -> anyhow::Result<Target> {
     Ok(Target {
         provider: provider.to_owned(),
         model: model.to_owned(),
+        account,
         weight,
     })
 }
@@ -58,6 +64,9 @@ pub fn set(path: &Path, name: &str, strategy: Strategy, targets: &[Target]) -> a
         let mut row = InlineTable::new();
         row.insert("provider", t.provider.as_str().into());
         row.insert("model", t.model.as_str().into());
+        if let Some(account) = &t.account {
+            row.insert("account", account.as_str().into());
+        }
         if t.weight > 0 {
             row.insert("weight", i64::from(t.weight).into());
         }
@@ -114,6 +123,16 @@ mod tests {
 
     fn target(spec: &str) -> Target {
         parse_target(spec).unwrap()
+    }
+
+    #[test]
+    fn a_target_may_name_an_account() {
+        let t = target("openai@api/gpt-6-luna*2");
+        assert_eq!(
+            (t.provider.as_str(), t.account.as_deref(), t.weight),
+            ("openai", Some("api"), 2)
+        );
+        assert!(parse_target("openai@/gpt-6-luna").is_err());
     }
 
     #[test]

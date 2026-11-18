@@ -25,6 +25,9 @@ pub struct Target {
     /// Provider id, as the account pool keys it.
     pub provider: String,
     pub model: String,
+    /// Account (id or label) this target is limited to; any account when unset.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Share of new sessions that start here; round-robin only, zero means one.
     #[serde(default)]
     pub weight: u32,
@@ -168,9 +171,12 @@ impl<'a> Attempt<'a> {
         {
             return None;
         }
-        let account = self
-            .pool
-            .pick(&target.provider, self.session, None, self.now)?;
+        let account = self.pool.pick(
+            &target.provider,
+            self.session,
+            target.account.as_deref(),
+            self.now,
+        )?;
         self.last = Some((index, account.clone()));
         Some((target, account))
     }
@@ -256,6 +262,7 @@ mod tests {
         Target {
             provider: provider.to_owned(),
             model: "m".to_owned(),
+            account: None,
             weight: 1,
         }
     }
@@ -275,6 +282,15 @@ mod tests {
             pool.add(provider, account);
         }
         pool
+    }
+
+    #[test]
+    fn a_target_stays_on_its_account() {
+        let mut combo = combo(Strategy::Failover, &["p"]);
+        combo.targets[0].account = Some("a2".into());
+        let mut pool = pool(&[("p", "a1"), ("p", "a2")]);
+        let mut attempt = combo.attempt(&mut pool, "s", Instant::now());
+        assert_eq!(attempt.next().map(|(_, id)| id).as_deref(), Some("a2"));
     }
 
     #[test]

@@ -114,6 +114,7 @@ fn combo(provider: &str, model: &str) -> Combo {
         targets: vec![Target {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            account: None,
             weight: 1,
         }],
         sticky_limit: 1,
@@ -147,6 +148,7 @@ async fn combo_skips_a_target_without_an_adapter() {
     mixed.targets.push(Target {
         provider: "opencode".into(),
         model: "beam-free".into(),
+        account: None,
         weight: 1,
     });
     combos.insert("mixed".to_owned(), mixed);
@@ -234,4 +236,52 @@ async fn a_cooling_account_fails_over_to_a_live_one() {
     assert!(body.contains("ok"));
     // One refusal, then the serving account.
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+/// `?accounts=1` adds `provider@account/model` only for providers with several accounts.
+#[tokio::test]
+async fn account_pinned_models_are_listed_on_request() {
+    let dir = temp_dir("pinned-list");
+    creds(
+        &dir,
+        &[
+            ("opencode", "a1", "k1"),
+            ("opencode", "a2", "k2"),
+            ("anthropic", "solo", "k3"),
+        ],
+    );
+    let addr = serve(Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        state_dir: dir,
+        profile: Profile::Parity,
+        models: BTreeMap::from([
+            ("opencode".to_owned(), vec!["beam-free".to_owned()]),
+            ("anthropic".to_owned(), vec!["claude-x".to_owned()]),
+        ]),
+        ..Config::default()
+    })
+    .await;
+    let ids = |query: &'static str| async move {
+        let text = reqwest::get(format!("http://{addr}/v1/models{query}"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(!ids("").await.iter().any(|id| id.contains('@')));
+    let pinned = ids("?accounts=1").await;
+    assert!(
+        pinned.contains(&"opencode@a1/beam-free".to_owned()),
+        "{pinned:?}"
+    );
+    assert!(pinned.contains(&"opencode@a2/beam-free".to_owned()));
+    assert!(!pinned.iter().any(|id| id.starts_with("anthropic@")));
 }
