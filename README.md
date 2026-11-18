@@ -30,7 +30,8 @@ owner-only permissions at start.
 
 ```sh
 gw login anthropic              # browser or device flow, stores the account
-gw login openai --device
+gw login openai --device        # ChatGPT subscription (Codex backend)
+gw login openai-api --key       # OpenAI platform API key, billed per token
 gw account import               # pull accounts from an existing opencodex setup
 gw account list
 gw serve                        # or the systemd unit
@@ -44,6 +45,10 @@ gw disconnect codex
 ```
 
 `gw status` shows which agents point at the gateway.
+
+`openai` and `openai-api` are separate providers: `openai` rides a ChatGPT login, while
+`openai-api` calls `api.openai.com/v1` with a platform key (`openai-api/gpt-5.5`).
+`gw models --refresh` lists the models a key can use.
 
 ## Models and routing
 

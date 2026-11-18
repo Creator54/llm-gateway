@@ -218,6 +218,9 @@ impl Gateway {
             let adapter: Box<dyn provider::Provider> = match name {
                 "opencode" => Box::new(providers::opencode::Opencode::new(client.clone(), base)),
                 "openai" => Box::new(providers::openai::OpenAi::new(client.clone(), base)),
+                "openai-api" => {
+                    Box::new(providers::openai_api::OpenAiApi::new(client.clone(), base))
+                }
                 "anthropic" => Box::new(providers::anthropic::Anthropic::new(
                     client.clone(),
                     base,

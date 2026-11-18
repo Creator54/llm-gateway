@@ -14,6 +14,7 @@ use crate::{creds, ui};
 pub const PROVIDERS: &[&str] = &[
     "anthropic",
     "openai",
+    "openai-api",
     "antigravity",
     "kiro",
     "command-code",
@@ -29,7 +30,7 @@ pub enum KeySource {
 }
 
 /// Providers that also take a direct API key.
-const KEY_PROVIDERS: [&str; 4] = ["anthropic", "openai", "command-code", "opencode"];
+const KEY_PROVIDERS: [&str; 4] = ["anthropic", "openai-api", "command-code", "opencode"];
 
 pub struct Login {
     pub provider: String,

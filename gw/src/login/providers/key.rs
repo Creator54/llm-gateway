@@ -22,7 +22,7 @@ pub fn clean(typed: &str) -> Result<String> {
 fn dashboard(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("https://console.anthropic.com/settings/keys"),
-        "openai" => Some("https://platform.openai.com/api-keys"),
+        "openai-api" => Some("https://platform.openai.com/api-keys"),
         "opencode" => Some("https://opencode.ai/auth"),
         _ => None,
     }
@@ -56,7 +56,7 @@ fn check_request(
     key: &str,
 ) -> Option<reqwest::RequestBuilder> {
     match provider {
-        "openai" => Some(
+        "openai-api" => Some(
             http.get("https://api.openai.com/v1/models")
                 .bearer_auth(key),
         ),
@@ -107,10 +107,10 @@ mod tests {
     fn env_source_reads_the_variable_and_names_a_missing_one() {
         std::env::set_var("GW_TEST_KEY_VAR", " sk-from-env ");
         assert_eq!(
-            read("openai", KeySource::Env("GW_TEST_KEY_VAR".into())).unwrap(),
+            read("openai-api", KeySource::Env("GW_TEST_KEY_VAR".into())).unwrap(),
             "sk-from-env"
         );
-        let err = read("openai", KeySource::Env("GW_TEST_KEY_UNSET".into())).unwrap_err();
+        let err = read("openai-api", KeySource::Env("GW_TEST_KEY_UNSET".into())).unwrap_err();
         assert!(err.to_string().contains("GW_TEST_KEY_UNSET is not set"));
     }
 }

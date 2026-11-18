@@ -121,8 +121,8 @@ fn fast_multiplier(provider: &str, model: &str) -> f64 {
     };
     let name = normalise(base);
     match provider {
-        "openai" if name == "gpt-5-5" => 2.5,
-        "openai" => 2.0,
+        "openai" | "openai-api" if name == "gpt-5-5" => 2.5,
+        "openai" | "openai-api" => 2.0,
         "anthropic" if name.contains("opus") => 2.0,
         _ => 1.0,
     }

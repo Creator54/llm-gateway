@@ -2,18 +2,21 @@
 
 pub mod anthropic;
 pub mod antigravity;
+mod chat;
 pub mod command_code;
 pub mod kiro;
 pub mod openai;
+pub mod openai_api;
 pub mod opencode;
 
 /// Provider names that have an adapter, spelled as routes and `[endpoints]` use them.
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 7] = [
     "anthropic",
     "antigravity",
     "command-code",
     "kiro",
     "openai",
+    "openai-api",
     "opencode",
 ];
 

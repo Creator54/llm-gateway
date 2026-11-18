@@ -6,7 +6,7 @@
 
 use crate::config::Config;
 use crate::creds::{self, Entry};
-use crate::providers::{anthropic, antigravity};
+use crate::providers::{anthropic, antigravity, openai_api};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -43,7 +43,7 @@ pub async fn refresh(cfg: &Config) -> anyhow::Result<Vec<(String, anyhow::Result
     let client = reqwest::Client::new();
     let mut saved = load_accounts(&cfg.state_dir);
     let mut report = Vec::new();
-    for provider in ["anthropic", "antigravity"] {
+    for provider in ["anthropic", "antigravity", "openai-api"] {
         let accounts = store.accounts(provider);
         let mut first_error = None;
         let mut succeeded = false;
@@ -129,6 +129,15 @@ async fn discover(
         "anthropic" => {
             let base = base.unwrap_or(anthropic::DEFAULT_BASE);
             get(client, &format!("{base}/v1/models?limit=1000"), &token).await?
+        }
+        "openai-api" => {
+            let base = base.unwrap_or(openai_api::DEFAULT_BASE_URL);
+            let response = client
+                .get(format!("{base}/models"))
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            json_body(response).await?
         }
         _ => {
             let base = base.unwrap_or(antigravity::DEFAULT_BASE_URL);
@@ -217,8 +226,31 @@ fn ids(provider: &str, body: &Value) -> Vec<String> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|m| m["id"].as_str().map(str::to_owned))
+        .filter_map(|m| m["id"].as_str())
+        .filter(|id| provider != "openai-api" || is_chat_model(id))
+        .map(str::to_owned)
         .collect()
+}
+
+/// OpenAI's listing also holds embeddings, speech, images and moderation, none of which a
+/// chat client can route to.
+fn is_chat_model(id: &str) -> bool {
+    const SKIPPED: [&str; 7] = [
+        "realtime",
+        "audio",
+        "transcribe",
+        "tts",
+        "image",
+        "embedding",
+        "moderation",
+    ];
+    let family = id.starts_with("gpt-")
+        || id.starts_with("chatgpt-")
+        || id.starts_with("codex-")
+        || id
+            .strip_prefix('o')
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    family && !SKIPPED.iter().any(|word| id.contains(word))
 }
 
 #[cfg(test)]
@@ -234,6 +266,19 @@ mod tests {
         let mut got = ids("antigravity", &cca);
         got.sort();
         assert_eq!(got, ["claude-y", "gemini-x"]);
+    }
+
+    #[test]
+    fn openai_listing_keeps_only_chat_models() {
+        let body = json!({ "data": [
+            { "id": "gpt-5.5" }, { "id": "o3-mini" }, { "id": "chatgpt-4o-latest" },
+            { "id": "text-embedding-3-small" }, { "id": "whisper-1" }, { "id": "dall-e-3" },
+            { "id": "gpt-4o-realtime-preview" }, { "id": "gpt-image-1" }, { "id": "omni-moderation-latest" },
+        ] });
+        assert_eq!(
+            ids("openai-api", &body),
+            ["gpt-5.5", "o3-mini", "chatgpt-4o-latest"]
+        );
     }
 
     #[test]
