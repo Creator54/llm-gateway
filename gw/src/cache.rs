@@ -95,7 +95,11 @@ pub fn rewrite(
             let stripped = strip_volatile_in_place(&mut value, opts);
             stripped | anthropic_messages_in_place(&mut value, opts)
         }
-        Family::OpenAi => openai_cache_key_in_place(&mut value, session, opts, supports),
+        // OpenAI caches by key, but the key still needs a clean prefix to hit.
+        Family::OpenAi => {
+            let stripped = strip_volatile_in_place(&mut value, opts);
+            stripped | openai_cache_key_in_place(&mut value, session, opts, supports)
+        }
     };
     if !changed {
         return body.to_vec();
@@ -210,18 +214,26 @@ pub fn prefix_hash(body: &Value) -> u64 {
             last_msg = Some(m.max(last_msg.unwrap_or(0)));
         }
     }
-    if last_bp.is_none() {
+    // Without a marked prefix there is nothing Anthropic could cache; a key is what
+    // makes OpenAI look for a cached prefix at all.
+    if last_bp.is_none() && !has_cache_key(body) {
         return 0;
     }
     let mut prefix = Vec::with_capacity(3);
     prefix.push(body.get("tools").cloned().unwrap_or(Value::Null));
-    prefix.push(body.get("system").cloned().unwrap_or(Value::Null));
+    prefix.push(
+        body.get("system")
+            .cloned()
+            .or_else(|| body.get("instructions").cloned())
+            .unwrap_or(Value::Null),
+    );
     let messages = body
         .get("messages")
+        .or_else(|| body.get("input"))
         .and_then(Value::as_array)
         .map(|m| match last_msg {
             Some(last) => m[..=last.min(m.len().saturating_sub(1))].to_vec(),
-            None => Vec::new(),
+            None => m.to_vec(),
         })
         .unwrap_or_default();
     prefix.push(Value::Array(messages));
@@ -229,6 +241,11 @@ pub fn prefix_hash(body: &Value) -> u64 {
         Ok(bytes) => fnv1a(&bytes),
         Err(_) => 0,
     }
+}
+
+/// Whether the body names a provider cache key, so its prefix can be hashed.
+fn has_cache_key(body: &Value) -> bool {
+    body.get("prompt_cache_key").is_some() || body.get("promptCacheKey").is_some()
 }
 
 /// Whether the cached prefix changed; `0` from either side means nothing was cached.
@@ -242,10 +259,13 @@ fn walk(body: &Value) -> Vec<Spot> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         spots.extend((0..tools.len()).map(Spot::Tool));
     }
-    match body.get("system") {
-        Some(Value::Array(blocks)) => spots.extend((0..blocks.len()).map(Spot::System)),
-        Some(Value::String(_)) => spots.push(Spot::SystemStr),
-        _ => {}
+    if let Some(blocks) = body.get("system").and_then(Value::as_array) {
+        spots.extend((0..blocks.len()).map(Spot::System));
+    } else if body.get("system").and_then(Value::as_str).is_some() {
+        spots.push(Spot::SystemStr);
+    } else if body.get("instructions").and_then(Value::as_str).is_some() {
+        // OpenAI Responses names the stable instruction text `instructions`.
+        spots.push(Spot::SystemStr);
     }
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         for (m, msg) in messages.iter().enumerate() {
@@ -261,7 +281,7 @@ fn block(body: &Value, spot: Spot) -> Option<&Value> {
     match spot {
         Spot::Tool(i) => body.get("tools")?.get(i),
         Spot::System(i) => body.get("system")?.get(i),
-        Spot::SystemStr => body.get("system"),
+        Spot::SystemStr => body.get("system").or_else(|| body.get("instructions")),
         Spot::Block(m, b) => body.get("messages")?.get(m)?.get("content")?.get(b),
     }
 }
@@ -440,17 +460,31 @@ fn repair_ttl_order(body: &mut Value) -> bool {
     changed
 }
 
+/// Mutable system text, under `system` or the Responses-style `instructions`.
+fn system_text_mut(body: &mut Value) -> Option<&mut String> {
+    let field = if body.get("system").and_then(Value::as_str).is_some() {
+        "system"
+    } else {
+        "instructions"
+    };
+    let value = body.get_mut(field)?;
+    if let Value::String(text) = value {
+        return Some(text);
+    }
+    None
+}
+
 /// Rewrite one block's text if it holds a pi session-overview with churn fields.
 fn strip_churn(body: &mut Value, spot: Spot) -> bool {
     let text = match spot {
-        Spot::SystemStr => match body.get_mut("system") {
-            Some(Value::String(s)) => s,
-            _ => return false,
-        },
+        Spot::SystemStr => system_text_mut(body),
         _ => match block_mut(body, spot).and_then(|b| b.get_mut("text")) {
-            Some(Value::String(s)) => s,
+            Some(Value::String(s)) => Some(s),
             _ => return false,
         },
+    };
+    let Some(text) = text else {
+        return false;
     };
     match strip_session_overview(text) {
         Some(cleaned) => {
@@ -943,6 +977,38 @@ mod tests {
         assert!(!cache_break(0, 2));
         assert!(!cache_break(1, 0));
         assert!(!cache_break(0, 0));
+    }
+
+    #[test]
+    fn strips_churn_from_openai_before_the_cache_key_is_set() {
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt",
+            "instructions": "<session-overview>\nLine count: 3 / 2000\n</session-overview>",
+            "input": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let out = rewrite(&body, Family::OpenAi, &Options::default(), "sess", |_| {
+            Some(true)
+        });
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed["instructions"],
+            "<session-overview>\n</session-overview>"
+        );
+        assert_eq!(parsed["prompt_cache_key"], "sess");
+    }
+
+    #[test]
+    fn prefix_hash_covers_openai_instructions_and_input() {
+        let body = parse(json!({
+            "prompt_cache_key": "sess",
+            "instructions": "You are terse.",
+            "input": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(prefix_hash(&body) > 0);
+        let mut changed = body.clone();
+        changed["input"][0]["content"] = json!("changed");
+        assert_ne!(prefix_hash(&changed), prefix_hash(&body));
     }
 
     #[test]

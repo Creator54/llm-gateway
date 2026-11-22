@@ -213,7 +213,12 @@ impl ChatStream {
         }
         self.done = true;
         let mut out = self.open();
-        out.extend(self.frame(json!({}), Some("stop"), None));
+        let finish = if self.calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        out.extend(self.frame(json!({}), Some(finish), None));
         out.extend_from_slice(b"data: [DONE]\n\n");
         out
     }
@@ -228,6 +233,8 @@ pub struct ResponsesStream {
     calls: BTreeMap<u64, CallState>,
     namespaces: ToolNamespaces,
     usage: Value,
+    /// The upstream Chat finish reason, when the final chunk carried one.
+    finish: Option<String>,
     seq: u64,
     started: bool,
     done: bool,
@@ -244,6 +251,7 @@ impl ResponsesStream {
             calls: BTreeMap::new(),
             namespaces: super::tool_namespaces(request),
             usage: json!({}),
+            finish: None,
             seq: 0,
             started: false,
             done: false,
@@ -287,6 +295,12 @@ impl ResponsesStream {
         };
         if let Some(usage) = chunk.get("usage").filter(|usage| usage.is_object()) {
             self.usage = usage.clone();
+        }
+        if let Some(finish) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish = Some(finish.to_owned());
         }
         let Some(delta) = chunk.pointer("/choices/0/delta") else {
             return out;
@@ -418,8 +432,18 @@ impl ResponsesStream {
                 json!({ "output_index": index + 1, "item": item }),
             ));
         }
-        let response = self.response("completed", self.output_items());
-        out.extend(self.event("response.completed", json!({ "response": response })));
+        let status = if self.finish.as_deref() == Some("length") {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let response = self.response(status, self.output_items());
+        let kind = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        out.extend(self.event(kind, json!({ "response": response })));
         out.extend_from_slice(b"data: [DONE]\n\n");
         out
     }
@@ -440,10 +464,19 @@ impl ResponsesStream {
     }
 
     fn response(&self, status: &str, output: Vec<Value>) -> Value {
-        json!({ "id": self.response_id, "object": "response", "created_at": now(),
+        let mut response = json!({ "id": self.response_id, "object": "response", "created_at": now(),
             "status": status, "error": null, "model": self.model, "output": output,
             "usage": responses_usage(&self.usage),
-        })
+        });
+        if status == "incomplete" {
+            if let Some(object) = response.as_object_mut() {
+                object.insert(
+                    "incomplete_details".into(),
+                    json!({ "reason": "max_output_tokens" }),
+                );
+            }
+        }
+        response
     }
 
     fn event(&mut self, name: &str, data: Value) -> Vec<u8> {

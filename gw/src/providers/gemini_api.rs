@@ -31,10 +31,14 @@ pub const SUPPORTED_MODELS: &[&str] = &[
     "gemini-1.5-pro",
 ];
 
-/// The upstream call: `{base}/{model}:{method}?key=…`, plus `?alt=sse` when streaming.
-fn request_url(base: &str, model: &str, method: &str, stream: bool, key: &str) -> String {
-    let query = if stream { "alt=sse&" } else { "" };
-    format!("{base}/{model}:{method}?{query}key={key}")
+/// The upstream call: `{base}/{model}:{method}`, plus `?alt=sse` when streaming. The key rides
+/// in the `x-goog-api-key` header only, never the URL.
+fn request_url(base: &str, model: &str, method: &str, stream: bool) -> String {
+    let mut url = format!("{base}/{model}:{method}");
+    if stream {
+        url.push_str("?alt=sse");
+    }
+    url
 }
 
 pub struct GeminiApi {
@@ -70,7 +74,7 @@ impl GeminiApi {
         } else {
             "generateContent"
         };
-        let url = request_url(&self.base, &req.model, method, req.stream, key);
+        let url = request_url(&self.base, &req.model, method, req.stream);
         let response = self
             .client
             .post(&url)
@@ -239,10 +243,12 @@ impl GeminiStreamState {
             return Vec::new();
         }
         self.finished = true;
+        let mut out = Vec::new();
         if let Ok(Some(data)) = self.parser.finish() {
-            self.frame(&data);
+            out.extend(self.frame(&data));
         }
-        self.sink.finish()
+        out.extend(self.sink.finish());
+        out
     }
 }
 
@@ -271,6 +277,10 @@ fn gemini_stream(
             match state.source.next().await {
                 Some(Ok(chunk)) => {
                     let out = state.feed(&chunk);
+                    if state.finished && !out.is_empty() {
+                        // The upstream reported an error; forward it before closing the stream.
+                        return Some((Ok(Bytes::from(out)), state));
+                    }
                     if state.finished {
                         let tail = state.flush();
                         if tail.is_empty() {
@@ -286,8 +296,8 @@ fn gemini_stream(
                 Some(Err(error)) => {
                     state.finished = true;
                     let tail = state.flush();
-                    if tail.is_empty() {
-                        return None;
+                    if !tail.is_empty() {
+                        return Some((Ok(Bytes::from(tail)), state));
                     }
                     return Some((Err(std::io::Error::other(error)), state));
                 }
@@ -728,26 +738,24 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_upstream_url_with_the_key() {
+    fn builds_the_upstream_url_without_the_key() {
         assert_eq!(
             request_url(
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "gemini-2.0-flash",
                 "generateContent",
-                false,
-                "k"
+                false
             ),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=k"
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         );
         assert_eq!(
             request_url(
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "gemini-2.0-flash",
                 "streamGenerateContent",
-                true,
-                "k"
+                true
             ),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=k"
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
         );
     }
 
