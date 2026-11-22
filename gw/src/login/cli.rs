@@ -19,6 +19,7 @@ pub const PROVIDERS: &[&str] = &[
     "kiro",
     "command-code",
     "opencode",
+    "gemini-api",
 ];
 
 /// Where an API key comes from.
@@ -30,7 +31,13 @@ pub enum KeySource {
 }
 
 /// Providers that also take a direct API key.
-pub const KEY_PROVIDERS: [&str; 4] = ["anthropic", "openai-api", "command-code", "opencode"];
+pub const KEY_PROVIDERS: [&str; 5] = [
+    "anthropic",
+    "openai-api",
+    "command-code",
+    "gemini-api",
+    "opencode",
+];
 
 pub struct Login {
     pub provider: String,

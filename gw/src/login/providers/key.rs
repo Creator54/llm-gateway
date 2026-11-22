@@ -23,6 +23,7 @@ fn dashboard(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("https://console.anthropic.com/settings/keys"),
         "openai-api" => Some("https://platform.openai.com/api-keys"),
+        "gemini-api" => Some("https://aistudio.google.com/app/apikey"),
         "opencode" => Some("https://opencode.ai/auth"),
         _ => None,
     }
@@ -64,6 +65,10 @@ fn check_request(
             http.get("https://api.anthropic.com/v1/models")
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01"),
+        ),
+        "gemini-api" => Some(
+            http.get("https://generativelanguage.googleapis.com/v1beta/models")
+                .header("x-goog-api-key", key),
         ),
         _ => None,
     }

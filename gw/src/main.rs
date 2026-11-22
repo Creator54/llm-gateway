@@ -135,7 +135,7 @@ enum Cmd {
         /// Print the URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
-        /// Store an API key instead of signing in (anthropic, openai-api, command-code, opencode)
+        /// Store an API key instead of signing in (anthropic, openai-api, command-code, gemini-api, opencode)
         #[arg(
             long,
             value_name = "KEY",

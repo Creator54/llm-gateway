@@ -201,7 +201,7 @@ pub async fn run(provider: &str, http: &reqwest::Client, opts: &Options) -> Resu
         "antigravity" => oauth(antigravity::login(http, opts).await),
         "kiro" => kiro::login(http, opts).await,
         "command-code" => oauth(command_code::login(http, opts).await),
-        "opencode" | "openai-api" => {
+        "gemini-api" | "opencode" | "openai-api" => {
             key::login(http, provider, super::cli::KeySource::Prompt).await
         }
         other => Err(anyhow!("unknown login provider: {other}")),

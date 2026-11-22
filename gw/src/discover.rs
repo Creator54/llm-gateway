@@ -1,12 +1,12 @@
 //! Live model discovery: ask each provider what the logged-in account can use and
 //! keep the answer in `<state_dir>/models.json`, which the gateway merges into `/v1/models`.
 //!
-//! Only providers with a real listing endpoint are covered (anthropic, antigravity);
+//! Only providers with a real listing endpoint are covered (anthropic, antigravity, gemini-api);
 //! the rest keep their `[models]` entries from the config.
 
 use crate::config::Config;
 use crate::creds::{self, Entry};
-use crate::providers::{anthropic, antigravity, command_code, openai_api};
+use crate::providers::{anthropic, antigravity, command_code, gemini_api, openai_api};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -43,7 +43,14 @@ pub async fn refresh(cfg: &Config) -> anyhow::Result<Vec<(String, anyhow::Result
     let client = reqwest::Client::new();
     let mut saved = load_accounts(&cfg.state_dir);
     let mut report = Vec::new();
-    for provider in ["anthropic", "antigravity", "command-code", "openai-api"] {
+    for provider in [
+        "anthropic",
+        "antigravity",
+        "command-code",
+        "gemini-api",
+        "openai-api",
+    ] {
+
         let accounts = store.accounts(provider);
         let mut first_error = None;
         let mut succeeded = false;
@@ -126,6 +133,15 @@ async fn discover(
     let token = access_token(&entry)?;
     let base = cfg.endpoints.get(provider).map(|b| b.trim_end_matches('/'));
     let body = match provider {
+        "gemini-api" => {
+            let base = base.unwrap_or(gemini_api::DEFAULT_BASE_URL);
+            let response = client
+                .get(format!("{base}/models"))
+                .header("x-goog-api-key", &token)
+                .send()
+                .await?;
+            json_body(response).await?
+        }
         "anthropic" => {
             let base = base.unwrap_or(anthropic::DEFAULT_BASE);
             get(client, &format!("{base}/v1/models?limit=1000"), &token).await?
@@ -223,6 +239,16 @@ fn ids(provider: &str, body: &Value) -> Vec<String> {
                     .collect()
             })
             .unwrap_or_default();
+    }
+    if provider == "gemini-api" {
+        // The listing nests under `models` with `name` values like `models/gemini-2.0-flash`.
+        return body["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["name"].as_str())
+            .map(|name| name.trim_start_matches("models/").to_owned())
+            .collect();
     }
     body["data"]
         .as_array()
