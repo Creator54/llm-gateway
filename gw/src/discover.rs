@@ -133,9 +133,8 @@ async fn discover(
     let base = cfg.endpoints.get(provider).map(|b| b.trim_end_matches('/'));
     let body = match provider {
         "gemini-api" => {
-            let base = base.unwrap_or(gemini_api::DEFAULT_BASE_URL);
             let response = client
-                .get(format!("{base}/models"))
+                .get(gemini_models_url(base))
                 .header("x-goog-api-key", &token)
                 .send()
                 .await?;
@@ -218,6 +217,14 @@ async fn post(
     json_body(response).await
 }
 
+/// Gemini lists models at the collection base itself; `DEFAULT_BASE_URL` already ends in
+/// `/v1beta/models`, so nothing is appended.
+fn gemini_models_url(endpoints_base: Option<&str>) -> String {
+    endpoints_base
+        .map(|base| base.trim_end_matches('/').to_owned())
+        .unwrap_or_else(|| gemini_api::DEFAULT_BASE_URL.to_owned())
+}
+
 async fn json_body(response: reqwest::Response) -> anyhow::Result<Value> {
     let status = response.status();
     let bytes = response.bytes().await?;
@@ -293,6 +300,19 @@ mod tests {
         let mut got = ids("antigravity", &cca);
         got.sort();
         assert_eq!(got, ["claude-y", "gemini-x"]);
+    }
+
+    #[test]
+    fn gemini_listing_hits_the_collection_base() {
+        assert_eq!(gemini_models_url(None), gemini_api::DEFAULT_BASE_URL);
+        assert_eq!(
+            gemini_models_url(Some("http://h/v1beta/models/")),
+            "http://h/v1beta/models"
+        );
+        assert_eq!(
+            gemini_models_url(Some("http://h/v1beta")),
+            "http://h/v1beta"
+        );
     }
 
     #[test]
