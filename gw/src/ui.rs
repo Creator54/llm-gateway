@@ -188,18 +188,21 @@ impl Ui {
         }
     }
 
-    /// Key/value block; value truncated to the line width.
+    /// Key/value block; long values wrap onto extra lines instead of cropping.
     pub fn render_kv(&self, rows: &[(&str, &str)]) -> String {
         let key_w = rows.iter().map(|(k, _)| chars(k)).max().unwrap_or(0);
         let avail = self.width.saturating_sub(key_w + 2).max(8);
+        let dots = self.sym().dots;
         let mut out = String::new();
         for (key, value) in rows {
             let pad = " ".repeat(key_w - chars(key) + 2);
-            let value = truncate(value, avail, self.sym().dots);
-            out.push_str(&format!(
-                "{}{pad}{value}\n",
-                self.paint(self.color, DIM, key)
-            ));
+            for chunk in wrap(value, avail, dots) {
+                out.push_str(&format!(
+                    "{}{pad}{}\n",
+                    self.paint(self.color, DIM, key),
+                    chunk
+                ));
+            }
         }
         out
     }
@@ -221,17 +224,36 @@ impl Ui {
         let widths = fit(&nat, self.width.saturating_sub(2 * (cols - 1)).max(cols));
         let dots = self.sym().dots;
 
-        let mut out = String::new();
-        let mut header = Vec::with_capacity(cols);
-        for (i, h) in headers.iter().enumerate() {
-            header.push(self.paint(self.color, DIM, &pad(h, widths[i], dots)));
-        }
-        out.push_str(&join(&header));
-        for row in rows {
-            let cells: Vec<String> = (0..cols)
-                .map(|i| pad(&cell(row, i), widths[i], dots))
+        // Lay out one line per text chunk: cells that fit render as before,
+        // longer cells wrap instead of being cropped with an ellipsis.
+        let lines_for = |cells: &[&str]| -> Vec<String> {
+            let chunked: Vec<Vec<String>> = (0..cols)
+                .map(|i| wrap(cells.get(i).copied().unwrap_or(""), widths[i], dots))
                 .collect();
-            out.push_str(&join(&cells));
+            let line_count = chunked.iter().map(|c| c.len()).max().unwrap_or(1);
+            (0..line_count)
+                .map(|j| {
+                    let parts: Vec<String> = (0..cols)
+                        .map(|i| {
+                            let text = chunked[i].get(j).map(String::as_str).unwrap_or("");
+                            pad(text, widths[i], dots)
+                        })
+                        .collect();
+                    parts.join("  ").trim_end().to_string()
+                })
+                .collect()
+        };
+
+        let mut out = String::new();
+        for line in lines_for(headers) {
+            out.push_str(&self.paint(self.color, DIM, &line));
+            out.push('\n');
+        }
+        for row in rows {
+            for line in lines_for(row) {
+                out.push_str(&line);
+                out.push('\n');
+            }
         }
         out
     }
@@ -338,10 +360,28 @@ fn pad(text: &str, width: usize, dots: &str) -> String {
     format!("{text}{fill}")
 }
 
-/// Join padded cells with two spaces, without trailing whitespace.
-fn join(cells: &[String]) -> String {
-    let line = cells.join("  ");
-    format!("{}\n", line.trim_end())
+/// Split text into chunks of at most `width` characters (honoring the
+/// truncation marker width), so overlong values wrap instead of being cropped.
+fn wrap(text: &str, width: usize, dots: &str) -> Vec<String> {
+    if chars(text) <= width {
+        return vec![text.to_string()];
+    }
+    let chunk = width.saturating_sub(chars(dots)).max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if !current.is_empty() && chars(&current) >= chunk {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
 }
 
 /// Shrink natural column widths to `available`, proportionally, largest first.
@@ -441,12 +481,13 @@ mod tests {
     }
 
     #[test]
-    fn kv_truncates_long_values() {
+    fn kv_wraps_long_values() {
         let long = "a".repeat(200);
         let out = plain(30).render_kv(&[("k", &long)]);
-        let line = out.lines().next().unwrap();
-        assert_eq!(chars(line), 30);
-        assert!(line.ends_with('…'));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 8);
+        assert!(lines.iter().all(|l| chars(l) <= 30));
+        assert!(!out.contains('…'));
     }
 
     #[test]
@@ -480,7 +521,33 @@ mod tests {
         for line in out.lines() {
             assert!(chars(line) <= 40, "line too wide: {line}");
         }
-        assert!(out.contains('…'));
+        // Long cells wrap onto extra lines instead of being cropped.
+        assert!(!out.contains('…'));
+        assert!(out.lines().count() > 3);
+    }
+
+    #[test]
+    fn table_wraps_long_cells_instead_of_truncating() {
+        let headers = [
+            "provider", "model", "account", "reqs", "errs", "in", "out", "cached", "hit", "~cost",
+        ];
+        let row: [&str; 10] = [
+            "command-code",
+            "deepseek/deepseek-v4.1-flash",
+            "cmd1",
+            "580",
+            "0",
+            "1.4M",
+            "279k",
+            "41.9M",
+            "-",
+            "$4.2",
+        ];
+        let out = plain(80).render_table(&headers, &[&row]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(!out.contains('…'));
+        assert!(lines.iter().all(|l| chars(l) <= 80));
+        assert!(lines.len() > 1);
     }
 
     #[test]
