@@ -603,14 +603,42 @@ fn gemini_tools(tools: &[Value]) -> Value {
             Some(json!({
                 "name": function.get("name").and_then(Value::as_str).unwrap_or(""),
                 "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
-                "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({
-                    "type": "object",
-                    "properties": {},
-                })),
+                "parameters": gemini_schema(
+                    &function.get("parameters").cloned().unwrap_or_else(|| json!({
+                        "type": "object",
+                        "properties": {},
+                    })),
+                ),
             }))
         })
         .collect::<Vec<_>>();
     json!([{ "function_declarations": declarations }])
+}
+
+/// Gemini's function-declaration schema is the OpenAPI subset: no `additionalProperties` and no
+/// bare `const` (a single-value `enum` instead).
+fn gemini_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, item) in map {
+                match key.as_str() {
+                    // Gemini has no `additionalProperties`; a plain property list suffices.
+                    "additionalProperties" => {}
+                    // Gemini expresses a fixed value as a single-element `enum`.
+                    "const" => {
+                        out.insert("enum".into(), json!([item.clone()]));
+                    }
+                    _ => {
+                        out.insert(key.clone(), gemini_schema(item));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(gemini_schema).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Relay the headers worth passing on: content type and Google's own cache and rate-limit headers.
@@ -751,6 +779,36 @@ mod tests {
             .unwrap();
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["name"], "read");
+    }
+
+    #[test]
+    fn strips_tool_keywords_gemini_does_not_accept() {
+        let chat = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "additionalProperties": false },
+                            "mode": { "type": "string", "const": "fast" },
+                        },
+                    },
+                },
+            }],
+        });
+        let body = to_gemini(&chat);
+        let declaration = &body["tools"][0]["function_declarations"][0];
+        let parameters = declaration["parameters"].as_object().unwrap();
+        assert!(parameters.get("additionalProperties").is_none());
+        assert!(parameters.get("properties").unwrap()["path"]
+            .as_object()
+            .unwrap()
+            .get("additionalProperties")
+            .is_none());
+        assert_eq!(parameters["properties"]["mode"]["enum"], json!(["fast"]));
     }
 
     #[test]
