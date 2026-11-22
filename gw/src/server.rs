@@ -235,6 +235,10 @@ impl Gateway {
                     base,
                 )),
                 "kiro" => Box::new(providers::kiro::Kiro::new(client.clone(), base)),
+                "gemini-api" => Box::new(providers::gemini_api::GeminiApi::new(
+                    client.clone(),
+                    base,
+                )),
                 other => anyhow::bail!("{other} has no adapter"),
             };
             adapters.insert(name.to_owned(), Arc::from(adapter));
