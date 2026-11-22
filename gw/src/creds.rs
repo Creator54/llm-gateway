@@ -340,6 +340,38 @@ impl Store {
         }
     }
 
+    /// Rename an account, resolving it by id or current label.
+    pub fn rename(&self, provider: &str, id_or_label: &str, label: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(!label.trim().is_empty(), "account label cannot be empty");
+        let mut state = self.write();
+        let matches: Vec<_> = state
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.provider == provider
+                    && (entry.id == id_or_label || entry.label.as_deref() == Some(id_or_label))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        anyhow::ensure!(!matches.is_empty(), "no {provider} account {id_or_label}");
+        anyhow::ensure!(
+            matches.len() == 1,
+            "multiple {provider} accounts match {id_or_label:?}; use an account id from `gw account list`"
+        );
+        anyhow::ensure!(
+            !state.accounts.iter().enumerate().any(|(index, entry)| {
+                entry.provider == provider
+                    && index != matches[0]
+                    && (entry.id == label || entry.label.as_deref() == Some(label))
+            }),
+            "{provider} account label {label:?} conflicts with another account id or label"
+        );
+        let id = state.accounts[matches[0]].id.clone();
+        state.accounts[matches[0]].label = Some(label.to_owned());
+        Ok(id)
+    }
+
     pub fn set_paused(&self, provider: &str, id: &str, paused: bool) -> bool {
         match self
             .write()
@@ -996,6 +1028,32 @@ mod tests {
         );
         let err = Store::load(&dir.0).unwrap_err().to_string();
         assert!(err.contains("duplicate account p/i"), "{err}");
+    }
+
+    #[test]
+    fn rename_resolves_ids_and_labels_and_rejects_ambiguous_names() {
+        let dir = TempDir::new("rename");
+        let store = Store::load(&dir.0).unwrap();
+        let mut first = api_entry("openai", "id-1");
+        first.label = Some("first".into());
+        store.upsert(first);
+        store.upsert(api_entry("openai", "id-2"));
+
+        store.rename("openai", "id-1", "primary").unwrap();
+        store.rename("openai", "id-2", "secondary").unwrap();
+        assert_eq!(
+            store.get("openai", "id-1").unwrap().label.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            store.get("openai", "id-2").unwrap().label.as_deref(),
+            Some("secondary")
+        );
+        assert!(store.rename("openai", "primary", "secondary").is_err());
+        assert!(store.rename("openai", "id-1", "id-2").is_err());
+        assert!(store.rename("openai", "missing", "unused").is_err());
+        assert!(store.rename("openai", "id-1", "  ").is_err());
+        assert!(store.rename("anthropic", "id-1", "unused").is_err());
     }
 
     #[test]

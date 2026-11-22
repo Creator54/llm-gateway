@@ -94,6 +94,71 @@ fn import_dry_run_on_empty_dir_is_json() {
 }
 
 #[test]
+fn restart_uses_the_systemd_user_service() {
+    let dir = Temp::new("restart");
+    let bin = dir.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let marker = dir.0.join("systemctl-args");
+    let systemctl = bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_gw"))
+        .args(["restart"])
+        .env("PATH", path)
+        .env("HOME", dir.0.join("home"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "--user\nrestart\ngw.service\n"
+    );
+}
+
+#[test]
+fn account_rename_updates_the_persisted_label() {
+    let dir = Temp::new("rename");
+    let state = dir.0.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let file = state.join("credentials.json");
+    std::fs::write(
+        &file,
+        r#"{"version":1,"accounts":[{"provider":"openai","id":"account-1","label":"old","paused":false,"needs_reauth":false,"credential":{"type":"api_key","key":"sk-fake"}}]}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+
+    let out = gw(&dir.0, &["account", "rename", "openai", "old", "primary"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(stored["accounts"][0]["label"], "primary");
+}
+
+#[test]
 fn empty_store_lists_empty_json() {
     let dir = Temp::new("list");
     let out = gw(&dir.0, &["account", "list", "--json"]);

@@ -53,6 +53,8 @@ enum ComboCmd {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Restart the systemd user service
+    Restart,
     /// Run the gateway
     Serve,
     /// Point an agent's config at this gateway
@@ -186,6 +188,14 @@ enum AccountCmd {
         /// Account id or label, as shown by `gw account list`
         id: String,
     },
+    /// Rename one stored account (restart a running gateway to apply the new label there)
+    Rename {
+        #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
+        provider: String,
+        /// Account id or current label, as shown by `gw account list`
+        id: String,
+        label: String,
+    },
     /// Remove one stored account
     Remove {
         #[arg(value_parser = PossibleValuesParser::new(gw::providers::NAMES))]
@@ -226,6 +236,11 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = gw::config::Config::load(cli.config.as_deref())?;
     match cli.cmd {
+        Cmd::Restart => {
+            gw::service::systemctl(&["restart", gw::service::NAME])?;
+            gw::ui::ok("restarted gw.service");
+            Ok(())
+        }
         Cmd::Serve => gw::server::run(cfg).await,
         Cmd::Connect {
             agent,
@@ -336,6 +351,17 @@ async fn run() -> anyhow::Result<()> {
                     db.clear_holds(&provider, &id)?;
                 }
                 gw::ui::ok(&format!("{provider}/{id}: the next request rechecks it"));
+                Ok(())
+            }
+            AccountCmd::Rename {
+                provider,
+                id,
+                label,
+            } => {
+                let store = gw::creds::Store::load(&cfg.state_dir)?;
+                let account_id = store.rename(&provider, &id, &label)?;
+                store.save()?;
+                gw::ui::ok(&format!("{provider}/{account_id}: renamed to {label}; restart a running gateway to apply"));
                 Ok(())
             }
             AccountCmd::Remove { provider, id, json } => {
