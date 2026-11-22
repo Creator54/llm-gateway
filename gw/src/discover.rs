@@ -50,7 +50,6 @@ pub async fn refresh(cfg: &Config) -> anyhow::Result<Vec<(String, anyhow::Result
         "gemini-api",
         "openai-api",
     ] {
-
         let accounts = store.accounts(provider);
         let mut first_error = None;
         let mut succeeded = false;

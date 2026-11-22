@@ -6,7 +6,11 @@
 //! back per the client's protocol.
 
 use bytes::Bytes;
-use futures_util::{future::BoxFuture, stream::{self, BoxStream, StreamExt}, FutureExt};
+use futures_util::{
+    future::BoxFuture,
+    stream::{self, BoxStream, StreamExt},
+    FutureExt,
+};
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
 use serde_json::{json, Map, Value};
@@ -55,7 +59,11 @@ impl GeminiApi {
         let bytes = serde_json::to_vec(&body)
             .map_err(|_| invalid("request body is not serializable", req.inbound))?;
 
-        let method = if req.stream { "streamGenerateContent" } else { "generateContent" };
+        let method = if req.stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
         let query = if req.stream { "?alt=sse" } else { "" };
         let url = format!("{}/{}:{}&key={key}{query}", self.base, req.model, method);
         let response = self
@@ -85,10 +93,7 @@ impl GeminiApi {
 
         if req.stream {
             let mut headers = reply_headers(response.headers());
-            headers.insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream"),
-            );
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             headers.insert(
                 http::header::CACHE_CONTROL,
                 HeaderValue::from_static("no-cache"),
@@ -144,12 +149,12 @@ impl Sink {
     fn push(&mut self, chunk: &Value) -> Vec<u8> {
         match self {
             Sink::Chat(out) => out.push(chunk),
-            Sink::Responses(stream) => stream.push_chunk(
-                &serde_json::to_string(chunk).unwrap_or_else(|_| "{}".into()),
-            ),
-            Sink::Messages(stream) => stream.push_chunk(
-                &serde_json::to_string(chunk).unwrap_or_else(|_| "{}".into()),
-            ),
+            Sink::Responses(stream) => {
+                stream.push_chunk(&serde_json::to_string(chunk).unwrap_or_else(|_| "{}".into()))
+            }
+            Sink::Messages(stream) => {
+                stream.push_chunk(&serde_json::to_string(chunk).unwrap_or_else(|_| "{}".into()))
+            }
         }
     }
 
@@ -373,11 +378,7 @@ impl ChatOut {
             return Vec::new();
         }
         self.done = true;
-        let mut out = self.frame(
-            json!({}),
-            self.finish.as_deref(),
-            Some(&self.usage),
-        );
+        let mut out = self.frame(json!({}), self.finish.as_deref(), Some(&self.usage));
         out.extend_from_slice(b"data: [DONE]\n\n");
         out
     }
@@ -467,7 +468,10 @@ fn gemini_to_chat_chunk(payload: &Value, model: &str) -> Option<Value> {
         "model": model,
         "choices": [{ "index": 0, "delta": Value::Object(delta), "finish_reason": finish }],
     });
-    if let Some(usage) = payload.pointer("/usageMetadata").filter(|usage| usage.is_object()) {
+    if let Some(usage) = payload
+        .pointer("/usageMetadata")
+        .filter(|usage| usage.is_object())
+    {
         chunk["usage"] = usage_from_gemini(usage);
     }
     Some(chunk)
@@ -475,10 +479,22 @@ fn gemini_to_chat_chunk(payload: &Value, model: &str) -> Option<Value> {
 
 /// Gemini `usageMetadata` onto the chat-completions usage object.
 fn usage_from_gemini(usage: &Value) -> Value {
-    let prompt = usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let completion = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let cached = usage.get("cachedContentTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64).unwrap_or(0);
+    let prompt = usage
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion = usage
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = usage
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let thoughts = usage
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
@@ -498,11 +514,14 @@ fn to_gemini(chat: &Value) -> Value {
         );
     }
     let contents = chat_contents(chat);
-    if !contents.as_array().map_or(true, |items| items.is_empty()) {
+    if !contents.as_array().is_none_or(|items| items.is_empty()) {
         body.insert("contents".into(), contents);
     }
     let mut config = Map::new();
-    if let Some(max) = chat.get("max_tokens").or_else(|| chat.get("max_completion_tokens")) {
+    if let Some(max) = chat
+        .get("max_tokens")
+        .or_else(|| chat.get("max_completion_tokens"))
+    {
         config.insert("maxOutputTokens".into(), max.clone());
     }
     if let Some(temperature) = chat.get("temperature") {
@@ -534,11 +553,18 @@ fn system_text(chat: &Value) -> Option<String> {
 }
 
 fn chat_contents(chat: &Value) -> Value {
-    let messages = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let messages = chat
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let contents = messages
         .iter()
         .filter_map(|message| {
-            let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
             let role = if role == "assistant" { "model" } else { "user" };
             let text = message_content(message);
             if text.is_empty() {
@@ -587,7 +613,8 @@ fn reply_headers(upstream: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in upstream {
         let name = name.as_str();
-        let relayed = name == "content-type" || name.starts_with("x-goog-") || name.starts_with("cache-");
+        let relayed =
+            name == "content-type" || name.starts_with("x-goog-") || name.starts_with("cache-");
         if let (true, Ok(name)) = (relayed, HeaderName::from_bytes(name.as_bytes())) {
             headers.append(name, value.clone());
         }
@@ -605,10 +632,16 @@ async fn reject(status: StatusCode, response: reqwest::Response) -> Failure {
 fn failure_for(status: StatusCode, body: &[u8], wait: Option<Duration>) -> Failure {
     match status.as_u16() {
         401 | 403 => Failure::Auth,
-        400 => Failure::Fatal { status, body: Bytes::from(body.to_vec()) },
+        400 => Failure::Fatal {
+            status,
+            body: Bytes::from(body.to_vec()),
+        },
         429 => Failure::RateLimited { retry_after: wait },
         code if (500..600).contains(&code) => Failure::Retryable,
-        _ => Failure::Fatal { status, body: Bytes::from(body.to_vec()) },
+        _ => Failure::Fatal {
+            status,
+            body: Bytes::from(body.to_vec()),
+        },
     }
 }
 
@@ -684,7 +717,9 @@ mod tests {
             "tools": [{ "type": "function", "function": { "name": "read", "description": "read", "parameters": { "type": "object" } } }],
         });
         let body = to_gemini(&chat);
-        let declarations = body["tools"][0]["function_declarations"].as_array().unwrap();
+        let declarations = body["tools"][0]["function_declarations"]
+            .as_array()
+            .unwrap();
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["name"], "read");
     }
@@ -702,7 +737,10 @@ mod tests {
         assert_eq!(chat_usage["completion_tokens"], 4);
         assert_eq!(chat_usage["total_tokens"], 14);
         assert_eq!(chat_usage["prompt_tokens_details"]["cached_tokens"], 6);
-        assert_eq!(chat_usage["completion_tokens_details"]["reasoning_tokens"], 2);
+        assert_eq!(
+            chat_usage["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
     }
 
     #[test]
@@ -737,7 +775,9 @@ mod tests {
             "candidates": [{ "content": { "parts": [{ "functionCall": { "name": "read", "args": { "path": "a" } } }] }, "finishReason": "FUNCTION_CALL" }],
         });
         let chunk = gemini_to_chat_chunk(&payload, "gemini-2.0-flash").expect("chunk");
-        let calls = chunk["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+        let calls = chunk["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .unwrap();
         assert_eq!(calls[0]["function"]["name"], "read");
         assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a\"}");
         assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
@@ -745,17 +785,35 @@ mod tests {
 
     #[test]
     fn classifies_gemini_failures() {
-        assert_eq!(failure_for(StatusCode::UNAUTHORIZED, b"no", None), Failure::Auth);
-        assert_eq!(failure_for(StatusCode::FORBIDDEN, b"no", None), Failure::Auth);
+        assert_eq!(
+            failure_for(StatusCode::UNAUTHORIZED, b"no", None),
+            Failure::Auth
+        );
+        assert_eq!(
+            failure_for(StatusCode::FORBIDDEN, b"no", None),
+            Failure::Auth
+        );
         assert_eq!(
             failure_for(StatusCode::BAD_REQUEST, b"bad", None),
-            Failure::Fatal { status: StatusCode::BAD_REQUEST, body: Bytes::from_static(b"bad") }
+            Failure::Fatal {
+                status: StatusCode::BAD_REQUEST,
+                body: Bytes::from_static(b"bad")
+            }
         );
         assert_eq!(
-            failure_for(StatusCode::TOO_MANY_REQUESTS, b"slow down", Some(Duration::from_secs(2))),
-            Failure::RateLimited { retry_after: Some(Duration::from_secs(2)) }
+            failure_for(
+                StatusCode::TOO_MANY_REQUESTS,
+                b"slow down",
+                Some(Duration::from_secs(2))
+            ),
+            Failure::RateLimited {
+                retry_after: Some(Duration::from_secs(2))
+            }
         );
-        assert_eq!(failure_for(StatusCode::INTERNAL_SERVER_ERROR, b"boom", None), Failure::Retryable);
+        assert_eq!(
+            failure_for(StatusCode::INTERNAL_SERVER_ERROR, b"boom", None),
+            Failure::Retryable
+        );
     }
 
     #[test]
