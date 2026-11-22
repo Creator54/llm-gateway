@@ -96,10 +96,32 @@ impl Prices {
         )
     }
 
-    fn find(&self, model: &str) -> Option<&Price> {
+    fn find(&self, model: &str) -> Option<Price> {
         let wanted = normalise(model);
-        self.prices.iter().find(|p| normalise(&p.id) == wanted)
+        self.prices
+            .iter()
+            .find(|p| normalise(&p.id) == wanted)
+            .cloned()
+            .or_else(|| gemini_price(&wanted))
     }
+}
+
+/// Gemini list prices (dollars per million tokens) for the pay-per-token API models, falling
+/// back when the public feed has no entry for them.
+fn gemini_price(model: &str) -> Option<Price> {
+    let (id, input, output, input_cached) = match model {
+        "gemini-2-0-flash" => ("gemini-2.0-flash", 0.1, 0.4, Some(0.03)),
+        "gemini-2-0-pro" => ("gemini-2.0-pro", 0.4, 1.25, Some(0.1)),
+        "gemini-1-5-flash" => ("gemini-1.5-flash", 0.075, 0.3, Some(0.075)),
+        "gemini-1-5-pro" => ("gemini-1.5-pro", 1.25, 5.0, Some(0.3125)),
+        _ => return None,
+    };
+    Some(Price {
+        id: id.to_owned(),
+        input,
+        output,
+        input_cached,
+    })
 }
 
 async fn fetch() -> anyhow::Result<(Prices, Vec<u8>)> {
@@ -148,6 +170,14 @@ pub fn dollars(cost: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_cost_uses_input_cached_and_output() {
+        let prices = Prices::default();
+        let cost = prices.cost(&row("gemini/gemini-2.0-flash")).unwrap();
+        // 0.10 input + 0.03 cached read + 0.40 output per million tokens.
+        assert!((cost - 0.53).abs() < 1e-9);
+    }
 
     fn prices() -> Prices {
         serde_json::from_str(

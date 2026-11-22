@@ -2305,6 +2305,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_api_routes_its_pay_per_token_models() {
+        let (info, targets) = routed(&default_config(), "gemini-api/gemini-2.0-flash");
+        assert_eq!(info.provider, "gemini-api");
+        assert_eq!(info.model, "gemini-2.0-flash");
+        assert_eq!(targets, ["gemini-api/gemini-2.0-flash"]);
+    }
+
+    #[tokio::test]
     async fn unknown_default_provider_leaves_a_bare_model_to_the_fallback() {
         let cfg = Config {
             default_provider: Some("nope".into()),
