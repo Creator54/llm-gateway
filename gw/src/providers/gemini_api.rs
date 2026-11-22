@@ -718,6 +718,20 @@ mod tests {
     }
 
     #[test]
+    fn maps_gemini_usage_tolerates_missing_fields() {
+        let chat_usage = usage_from_gemini(&json!({}));
+        assert_eq!(chat_usage["prompt_tokens"], 0);
+        assert_eq!(chat_usage["completion_tokens"], 0);
+        assert_eq!(chat_usage["total_tokens"], 0);
+        let malformed = usage_from_gemini(&json!({
+            "promptTokenCount": "lots",
+            "candidatesTokenCount": null,
+        }));
+        assert_eq!(malformed["prompt_tokens"], 0);
+        assert_eq!(malformed["completion_tokens"], 0);
+    }
+
+    #[test]
     fn maps_gemini_tool_calls_to_chat_chunks() {
         let payload = json!({
             "candidates": [{ "content": { "parts": [{ "functionCall": { "name": "read", "args": { "path": "a" } } }] }, "finishReason": "FUNCTION_CALL" }],
@@ -783,6 +797,24 @@ mod tests {
         let tail = state.flush();
         let text = String::from_utf8_lossy(&tail).to_string();
         assert!(text.contains(r#""cached_tokens":1"#));
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn streams_gemini_text_across_chunks_without_loss() {
+        let mut state = chat_state();
+        let first = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "Hello" }] }, "finishReason": null }],
+        });
+        let second = json!({
+            "candidates": [{ "content": { "parts": [{ "text": " world" }] }, "finishReason": "STOP" }],
+        });
+        let out = state.feed(&sse(&first));
+        assert!(String::from_utf8_lossy(&out).contains("\"content\":\"Hello\""));
+        let out = state.feed(&sse(&second));
+        assert!(String::from_utf8_lossy(&out).contains("\"content\":\" world\""));
+        let tail = state.flush();
+        let text = String::from_utf8_lossy(&tail).to_string();
         assert!(text.ends_with("data: [DONE]\n\n"));
     }
 
