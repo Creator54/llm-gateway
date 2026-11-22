@@ -31,6 +31,12 @@ pub const SUPPORTED_MODELS: &[&str] = &[
     "gemini-1.5-pro",
 ];
 
+/// The upstream call: `{base}/{model}:{method}?key=…`, plus `?alt=sse` when streaming.
+fn request_url(base: &str, model: &str, method: &str, stream: bool, key: &str) -> String {
+    let query = if stream { "alt=sse&" } else { "" };
+    format!("{base}/{model}:{method}?{query}key={key}")
+}
+
 pub struct GeminiApi {
     client: reqwest::Client,
     base: String,
@@ -64,8 +70,7 @@ impl GeminiApi {
         } else {
             "generateContent"
         };
-        let query = if req.stream { "?alt=sse" } else { "" };
-        let url = format!("{}/{}:{}&key={key}{query}", self.base, req.model, method);
+        let url = request_url(&self.base, &req.model, method, req.stream, key);
         let response = self
             .client
             .post(&url)
@@ -687,6 +692,30 @@ mod tests {
         assert!(SUPPORTED_MODELS.contains(&"gemini-2.0-pro"));
         assert!(SUPPORTED_MODELS.contains(&"gemini-1.5-pro"));
         assert!(!SUPPORTED_MODELS.contains(&"gemini-pro-free"));
+    }
+
+    #[test]
+    fn builds_the_upstream_url_with_the_key() {
+        assert_eq!(
+            request_url(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "gemini-2.0-flash",
+                "generateContent",
+                false,
+                "k"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=k"
+        );
+        assert_eq!(
+            request_url(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "gemini-2.0-flash",
+                "streamGenerateContent",
+                true,
+                "k"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=k"
+        );
     }
 
     #[test]
