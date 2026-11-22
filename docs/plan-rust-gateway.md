@@ -21,7 +21,8 @@ Target: `gw` < 30 MB idle, < 100 MB at 50 concurrent streams.
 - Inbound: `/v1/responses` (HTTP + WS), `/v1/chat/completions`, `/v1/messages`,
   `/v1/messages/count_tokens`, `/v1/models`, health.
 - Providers: openai (ChatGPT), openai-api (API key, see `provider-specs/openai-api.md`),
-  anthropic (OAuth), google-antigravity, kiro, command-code, opencode-zen, opencode-cli.
+  anthropic (OAuth), google-antigravity, gemini-api (Google API key, see
+  `provider-specs/gemini-api.md`), kiro, command-code, opencode-zen, opencode-cli.
 - Agents: pi, codex, Claude Code, opencode.
 - Out: GUI/dashboard, other opencodex providers, desktop integrations, ML
   compressors, telemetry.

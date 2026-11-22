@@ -32,6 +32,7 @@ owner-only permissions at start.
 gw login anthropic              # browser or device flow, stores the account
 gw login openai --device        # ChatGPT subscription (Codex backend)
 gw login openai-api --key       # OpenAI platform API key, billed per token
+gw login gemini-api --key        # Google Gemini API key, billed per token
 gw account import               # pull accounts from an existing opencodex setup
 gw account list
 gw serve                        # or the systemd unit
@@ -48,6 +49,8 @@ gw disconnect codex
 
 `openai` and `openai-api` are separate providers: `openai` rides a ChatGPT login, while
 `openai-api` calls `api.openai.com/v1` with a platform key (`openai-api/gpt-5.5`).
+`gemini-api` is the same shape for Google: a pay-per-token key against
+`generativelanguage.googleapis.com/v1beta` (`gemini-api/gemini-2.0-flash`).
 `gw models --refresh` lists the models a key can use.
 
 ## Models and routing
