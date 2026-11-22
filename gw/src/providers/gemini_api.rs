@@ -180,6 +180,7 @@ struct GeminiStreamState {
     inbound: Inbound,
     model: String,
     finished: bool,
+    next_index: usize,
 }
 
 impl GeminiStreamState {
@@ -224,9 +225,12 @@ impl GeminiStreamState {
             };
             return frame.into_bytes();
         }
-        let Some(chunk) = gemini_to_chat_chunk(&payload, &self.model) else {
+        let Some(chunk) = gemini_to_chat_chunk(&payload, &self.model, self.next_index) else {
             return Vec::new();
         };
+        self.next_index += chunk["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .map_or(0, |calls| calls.len());
         self.sink.push(&chunk)
     }
 
@@ -257,6 +261,7 @@ fn gemini_stream(
         inbound: req.inbound,
         model: req.model.clone(),
         finished: false,
+        next_index: 0,
     };
     stream::unfold(state, |mut state| async move {
         loop {
@@ -424,7 +429,7 @@ fn gemini_finish(finish: &str) -> Option<&'static str> {
 }
 
 /// Map a Gemini response onto the chat-completions-shaped chunk the protocol sinks consume.
-fn gemini_to_chat_chunk(payload: &Value, model: &str) -> Option<Value> {
+fn gemini_to_chat_chunk(payload: &Value, model: &str, first_index: usize) -> Option<Value> {
     if payload.get("error").is_some() {
         return None;
     }
@@ -443,10 +448,10 @@ fn gemini_to_chat_chunk(payload: &Value, model: &str) -> Option<Value> {
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
-                .unwrap_or("call_0")
-                .to_owned();
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("call_{}", first_index + calls.len()));
             calls.push(json!({
-                "index": calls.len(),
+                "index": first_index + calls.len(),
                 "id": call_id,
                 "type": "function",
                 "function": {
@@ -836,7 +841,7 @@ mod tests {
             "candidates": [{ "content": { "parts": [{ "text": "Hello" }] }, "finishReason": "STOP" }],
             "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 2 },
         });
-        let chunk = gemini_to_chat_chunk(&payload, "gemini-2.0-flash").expect("chunk");
+        let chunk = gemini_to_chat_chunk(&payload, "gemini-2.0-flash", 0).expect("chunk");
         assert_eq!(chunk["choices"][0]["delta"]["content"], "Hello");
         assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
         assert_eq!(chunk["usage"]["prompt_tokens"], 3);
@@ -861,13 +866,31 @@ mod tests {
         let payload = json!({
             "candidates": [{ "content": { "parts": [{ "functionCall": { "name": "read", "args": { "path": "a" } } }] }, "finishReason": "FUNCTION_CALL" }],
         });
-        let chunk = gemini_to_chat_chunk(&payload, "gemini-2.0-flash").expect("chunk");
+        let chunk = gemini_to_chat_chunk(&payload, "gemini-2.0-flash", 0).expect("chunk");
         let calls = chunk["choices"][0]["delta"]["tool_calls"]
             .as_array()
             .unwrap();
         assert_eq!(calls[0]["function"]["name"], "read");
         assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a\"}");
         assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn assigns_sequential_tool_call_slots() {
+        let payload = json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "name": "read", "args": { "path": "a" } } },
+                { "functionCall": { "name": "bash", "args": { "command": "ls" } } },
+            ] }, "finishReason": "FUNCTION_CALL" }],
+        });
+        let chunk = gemini_to_chat_chunk(&payload, "gemini-2.0-flash", 0).expect("chunk");
+        let calls = chunk["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+        assert_eq!(calls[0]["id"], "call_0");
+        assert_eq!(calls[1]["id"], "call_1");
     }
 
     #[test]
@@ -927,6 +950,7 @@ mod tests {
             inbound: Inbound::Chat,
             model: "gemini-2.0-flash".to_owned(),
             finished: false,
+            next_index: 0,
         }
     }
 
