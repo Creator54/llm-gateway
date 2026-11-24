@@ -10,10 +10,10 @@ let
   # The API key is read from a systemd credential at start.
   configFile = pkgs.writeText "gw-config.toml" ''
     listen = "127.0.0.1:${toString cfg.port}"
-    api_key_file = ${lib.escapeShellArg "${stateDirPath}/api-key"}
-    state_dir = ${lib.escapeShellArg stateDirPath}
+    api_key_file = ${builtins.toJSON "${stateDirPath}/api-key"}
+    state_dir = ${builtins.toJSON stateDirPath}
     max_body_bytes = ${toString cfg.maxBodyBytes}
-    profile = "${cfg.profile}"
+    profile = ${builtins.toJSON cfg.profile}
   '';
 
   start = pkgs.writeShellScript "gw-start" ''
