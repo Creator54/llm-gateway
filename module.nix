@@ -10,15 +10,15 @@ let
   # The API key is read from a systemd credential at start.
   configFile = pkgs.writeText "gw-config.toml" ''
     listen = "127.0.0.1:${toString cfg.port}"
-    api_key_file = ${lib.escapeShellArg "${cfg.stateDirPath}/api-key"}
-    state_dir = ${lib.escapeShellArg cfg.stateDirPath}
+    api_key_file = ${lib.escapeShellArg "${stateDirPath}/api-key"}
+    state_dir = ${lib.escapeShellArg stateDirPath}
     max_body_bytes = ${toString cfg.maxBodyBytes}
     profile = "${cfg.profile}"
   '';
 
   start = pkgs.writeShellScript "gw-start" ''
     set -eu
-    state=${lib.escapeShellArg cfg.stateDirPath}
+    state=${lib.escapeShellArg stateDirPath}
     # Install the client key with owner-only permissions, then hand the path to gw.
     umask 077
     cat "$CREDENTIALS_DIRECTORY/api-key" > "$state/api-key"
@@ -94,7 +94,7 @@ in
 
       # Tokens live under the state directory; HOME keeps provider SDKs quiet.
       environment = {
-        HOME = cfg.stateDirPath;
+        HOME = stateDirPath;
         RUST_LOG = "info";
       };
 
@@ -113,7 +113,7 @@ in
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = true;
-        ReadWritePaths = [ cfg.stateDirPath ];
+        ReadWritePaths = [ stateDirPath ];
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
         LockPersonality = true;

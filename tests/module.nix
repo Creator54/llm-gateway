@@ -29,6 +29,10 @@ let
     # The old two-unit layout must be gone.
     (!(c.systemd.services ? llm-gateway-hub))
     (!(c.systemd.services ? llm-gateway-headroom))
+    # Force the unit body so a broken reference fails here, not on deploy.
+    (service.environment.HOME == "/var/lib/llm-gateway")
+    (service.serviceConfig.ReadWritePaths == [ "/var/lib/llm-gateway" ])
+    (nixpkgs.lib.hasInfix "gw-start" service.serviceConfig.ExecStart)
     # A key inside the Nix store is rejected.
     (builtins.any (a: !a.assertion && nixpkgs.lib.hasInfix "apiKeyFile" a.message) invalid.assertions)
     # So is a state dir that is not a single path segment.
