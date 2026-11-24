@@ -4,7 +4,6 @@
 //! own, and this module prints the result lines. Tokens are never printed.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::{providers, Flow, Options};
@@ -45,12 +44,6 @@ pub struct Login {
     pub device: bool,
     pub no_browser: bool,
     pub label: Option<String>,
-    pub json: bool,
-}
-
-pub struct Import {
-    pub from: Option<PathBuf>,
-    pub dry_run: bool,
     pub json: bool,
 }
 
@@ -190,82 +183,6 @@ pub async fn relogin(no_browser: bool, dir: PathBuf) -> Result<()> {
         done += 1;
     }
     ui::info(&format!("{done} of {total} accounts logged in"));
-    Ok(())
-}
-
-/// Import opencodex credentials into the store.
-pub fn import(args: Import, dir: PathBuf) -> Result<()> {
-    let from = match args.from {
-        Some(path) => path,
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --from"))?
-            .join(".opencodex"),
-    };
-    let entries = creds::import_opencodex(&from)?;
-    let store = creds::Store::load(&dir)?;
-    let mut seen = HashSet::new();
-    let mut rows: Vec<[String; 4]> = Vec::new();
-    for entry in entries {
-        // The same (provider, id) twice in one file is a duplicate, not an update.
-        let key = (entry.provider.clone(), entry.id.clone());
-        let action = if !seen.insert(key) {
-            "duplicate"
-        } else {
-            match store.get(&entry.provider, &entry.id) {
-                Some(_) => "replace",
-                None => "add",
-            }
-        };
-        if action != "duplicate" && !args.dry_run {
-            store.upsert(entry.clone());
-        }
-        rows.push([
-            entry.provider,
-            entry.id,
-            entry.label.unwrap_or_else(|| "-".to_string()),
-            action.to_string(),
-        ]);
-    }
-    if !args.dry_run && !rows.is_empty() {
-        store.save()?;
-    }
-    if args.json {
-        let items: Vec<_> = rows
-            .iter()
-            .map(|r| serde_json::json!({"provider": r[0], "id": r[1], "label": r[2], "action": r[3]}))
-            .collect();
-        print_json(&serde_json::Value::Array(items));
-        return Ok(());
-    }
-    if rows.is_empty() {
-        ui::info(&format!("no accounts found in {}", from.display()));
-        return Ok(());
-    }
-    let headers = ["provider", "id", "label", "action"];
-    let cells: Vec<Vec<&str>> = rows
-        .iter()
-        .map(|r| r.iter().map(String::as_str).collect())
-        .collect();
-    let lines: Vec<&[&str]> = cells.iter().map(|c| c.as_slice()).collect();
-    print!("{}", ui::Ui::from_env().render_table(&headers, &lines));
-    for r in &rows {
-        match r[3].as_str() {
-            "duplicate" => ui::info(&format!("skipped duplicate {} / {}", r[0], r[1])),
-            "replace" => ui::info(&format!("replaced existing {} / {}", r[0], r[1])),
-            _ => {}
-        }
-    }
-    let verb = if args.dry_run {
-        "would store"
-    } else {
-        "stored"
-    };
-    let stored = rows.iter().filter(|r| r[3] != "duplicate").count();
-    ui::info(&format!(
-        "{verb} {stored} account(s) from {}",
-        from.display()
-    ));
     Ok(())
 }
 

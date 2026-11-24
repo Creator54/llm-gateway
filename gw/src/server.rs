@@ -1533,8 +1533,6 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.split(';').next().unwrap_or(v).trim() == "text/event-stream")
 }
 
-/// Provider names clients still send from the opencodex era, mapped to the adapter that
-/// serves them now.
 /// Client suffix asking for the fast tier; a single `-fast` is a real model id.
 const FAST: &str = "--fast";
 

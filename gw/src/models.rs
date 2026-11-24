@@ -5,15 +5,12 @@
 
 use bytes::Bytes;
 use http::HeaderMap;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::route::{self, Target};
-
-/// opencodex serves zero for `created`; clients only check that it is present.
+/// Clients only check that `created` is present.
 const CREATED: u64 = 0;
-/// Same fixed timestamp opencodex uses for Anthropic-flavor rows.
+/// Fixed timestamp for Anthropic-flavor rows.
 const CREATED_AT: &str = "2026-01-01T00:00:00Z";
 
 /// One routable model.
@@ -135,76 +132,6 @@ pub fn with_builtins(entries: impl IntoIterator<Item = Entry>, combos: &[String]
     all
 }
 
-#[derive(Deserialize)]
-struct RawCatalog {
-    data: Vec<RawRow>,
-}
-
-/// One row of opencodex's OpenAI-shape `/v1/models` list. Only the fields we seed are read.
-#[derive(Deserialize)]
-struct RawRow {
-    id: String,
-    #[serde(default)]
-    owned_by: Option<String>,
-    #[serde(default)]
-    context_window: Option<u64>,
-    #[serde(default)]
-    max_output_tokens: Option<u64>,
-}
-
-/// Parse an opencodex OpenAI-shape `/v1/models` body into seed entries.
-///
-/// Routed ids are kept byte for byte, including nested slashes
-/// (`command-code/deepseek/deepseek-v4.1-flash`). opencodex publishes bare native ids
-/// (`gpt-6-luna`); those get their `owned_by` namespace in front because our router
-/// only accepts `provider/model`. Rows that still do not parse, and duplicate ids, are
-/// skipped: a stale catalog must not fail the refresh.
-pub fn parse_catalog(body: &[u8]) -> anyhow::Result<Vec<Entry>> {
-    let catalog: RawCatalog = serde_json::from_slice(body)?;
-    let mut seen = HashSet::new();
-    let mut entries = Vec::with_capacity(catalog.data.len());
-    for row in catalog.data {
-        let Some(entry) = entry_from(row) else {
-            continue;
-        };
-        if seen.insert(entry.id.clone()) {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
-}
-
-fn entry_from(row: RawRow) -> Option<Entry> {
-    let id = qualify(row.id, row.owned_by.as_deref())?;
-    let provider = match route::parse(&id)? {
-        Target::Model { provider, .. } => provider,
-        Target::Combo(_) => "combo".to_owned(),
-        Target::Auto(_) => "auto".to_owned(),
-    };
-    Some(Entry {
-        id,
-        provider,
-        context_window: capacity(row.context_window),
-        max_output: capacity(row.max_output_tokens),
-    })
-}
-
-/// Keep ids the router accepts; qualify a bare native id with its owner.
-fn qualify(id: String, owned_by: Option<&str>) -> Option<String> {
-    if route::parse(&id).is_some() {
-        return Some(id);
-    }
-    if id.is_empty() || id.contains('/') {
-        return None;
-    }
-    let qualified = format!("{}/{id}", owned_by?);
-    route::parse(&qualified).map(|_| qualified)
-}
-
-fn capacity(value: Option<u64>) -> u32 {
-    value.unwrap_or(0).min(u64::from(u32::MAX)) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,49 +232,5 @@ mod tests {
         let entries = with_builtins([auto_entry(), combo_entry("a")], &combos);
         let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(ids, ["auto", "combo/a", "combo/b"]);
-    }
-
-    #[test]
-    fn catalog_keeps_routed_ids_and_qualifies_bare_natives() {
-        let body = br#"{"object":"list","data":[
-            {"id":"openai/gpt-6-luna","object":"model","created":0,"owned_by":"openai",
-             "context_window":272000,"max_output_tokens":128000},
-            {"id":"command-code/deepseek/deepseek-v4.1-flash","owned_by":"command-code"},
-            {"id":"combo/pi-subagents","owned_by":"openai"},
-            {"id":"gpt-6-sol","owned_by":"openai"},
-            {"id":"anthropic@work/claude-opus-4-8","owned_by":"anthropic"}
-        ]}"#;
-        let entries = parse_catalog(body).unwrap();
-        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "openai/gpt-6-luna",
-                "command-code/deepseek/deepseek-v4.1-flash",
-                "combo/pi-subagents",
-                "openai/gpt-6-sol",
-                "anthropic@work/claude-opus-4-8",
-            ]
-        );
-        assert_eq!(entries[0].context_window, 272_000);
-        assert_eq!(entries[0].max_output, 128_000);
-        assert_eq!(entries[1].provider, "command-code");
-        assert_eq!(entries[2].provider, "combo");
-        assert_eq!(entries[3].provider, "openai");
-    }
-
-    #[test]
-    fn catalog_skips_unroutable_and_duplicate_rows() {
-        let body = br#"{"data":[
-            {"id":"gpt-6-luna"},
-            {"id":""},
-            {"id":"/leading","owned_by":"openai"},
-            {"id":"openai/gpt-6-luna","owned_by":"openai","context_window":1},
-            {"id":"openai/gpt-6-luna","owned_by":"openai","context_window":2}
-        ]}"#;
-        let entries = parse_catalog(body).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].context_window, 1);
-        assert!(parse_catalog(b"{\"data\":3}").is_err());
     }
 }

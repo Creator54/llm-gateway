@@ -346,7 +346,7 @@ fn sha256(input: &[u8]) -> [u8; 32] {
 
 /// No tool result was recorded for a declared call; the upstream rejects unpaired calls.
 const NO_RESULT: &str =
-    "[ocx] no tool result was recorded for this tool call; execution status unknown.";
+    "[gw] no tool result was recorded for this tool call; execution status unknown.";
 
 #[derive(Clone, Default)]
 struct GitInfo {

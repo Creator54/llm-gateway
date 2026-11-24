@@ -26,9 +26,6 @@ let
     (service.serviceConfig.StateDirectoryMode == "0700")
     (service.serviceConfig.LoadCredential == "api-key:/run/secrets/gateway")
     c.users.users.llm-gateway.isSystemUser
-    # The old two-unit layout must be gone.
-    (!(c.systemd.services ? llm-gateway-hub))
-    (!(c.systemd.services ? llm-gateway-headroom))
     # Force the unit body so a broken reference fails here, not on deploy.
     (service.environment.HOME == "/var/lib/llm-gateway")
     (service.serviceConfig.ReadWritePaths == [ "/var/lib/llm-gateway" ])

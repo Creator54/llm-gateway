@@ -18,7 +18,7 @@ pub struct Config {
     pub listen: SocketAddr,
     /// File holding the key clients must send (Bearer or `x-gw-key`).
     pub api_key_file: Option<PathBuf>,
-    /// Upstream used for anything not handled natively (e.g. opencodex).
+    /// Upstream used for anything not handled natively.
     pub fallback: Option<String>,
     /// Provider a bare model id (no `provider/` prefix) routes to; `None` forwards it.
     pub default_provider: Option<String>,

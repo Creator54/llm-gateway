@@ -67,33 +67,6 @@ fn login_help_lists_providers() {
 }
 
 #[test]
-fn import_dry_run_on_empty_dir_is_json() {
-    let dir = Temp::new("import");
-    let empty = dir.0.join("empty");
-    std::fs::create_dir_all(&empty).unwrap();
-    let out = gw(
-        &dir.0,
-        &[
-            "account",
-            "import",
-            "--from",
-            empty.to_str().unwrap(),
-            "--dry-run",
-            "--json",
-        ],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = stdout(&out);
-    let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-    assert_eq!(value, serde_json::json!([]));
-    assert!(!dir.0.join("state").join("credentials.json").exists());
-}
-
-#[test]
 fn restart_uses_the_systemd_user_service() {
     let dir = Temp::new("restart");
     let bin = dir.0.join("bin");

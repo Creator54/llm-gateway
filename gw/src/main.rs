@@ -163,18 +163,6 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum AccountCmd {
-    /// Import accounts from an opencodex directory
-    Import {
-        /// Source directory (default: ~/.opencodex)
-        #[arg(long)]
-        from: Option<PathBuf>,
-        /// Show what would be stored without writing
-        #[arg(long)]
-        dry_run: bool,
-        /// Print JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// List stored accounts
     List {
         /// Print JSON
@@ -327,18 +315,6 @@ async fn run() -> anyhow::Result<()> {
             gw::login::cli::login(args, cfg.state_dir).await
         }
         Cmd::Account { cmd } => match cmd {
-            AccountCmd::Import {
-                from,
-                dry_run,
-                json,
-            } => gw::login::cli::import(
-                gw::login::cli::Import {
-                    from,
-                    dry_run,
-                    json,
-                },
-                cfg.state_dir,
-            ),
             AccountCmd::List { json } => gw::login::cli::list(json, cfg.state_dir),
             AccountCmd::Recheck { provider, id } => {
                 let store = gw::creds::Store::load(&cfg.state_dir)?;

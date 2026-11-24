@@ -9,7 +9,7 @@ Rust, single binary, about 4 MB RAM idle.
 ## Install
 
 ```sh
-nix run github:Creator54/llm-gateway -- --help
+nix run github:Creator54/llm-gateway/rust-gateway -- --help
 ```
 
 Or add the flake and run the service:
@@ -33,7 +33,6 @@ gw login anthropic              # browser or device flow, stores the account
 gw login openai --device        # ChatGPT subscription (Codex backend)
 gw login openai-api --key       # OpenAI platform API key, billed per token
 gw login gemini-api --key        # Google Gemini API key, billed per token
-gw account import               # pull accounts from an existing opencodex setup
 gw account list
 gw serve                        # or the systemd unit
 ```
@@ -89,8 +88,7 @@ just check          # fmt, test, clippy
 bench/mem.sh        # RAM under streaming load
 ```
 
-Provider wire contracts are in `docs/provider-specs/`. The design and phase plan
-are in `docs/plan-rust-gateway.md`.
+Provider wire contracts are in `docs/provider-specs/`.
 
 ## Combos
 

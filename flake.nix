@@ -1,52 +1,21 @@
 {
   description = "Personal LLM gateway";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    headroom-src = {
-      url = "github:Creator54/headroom/gateway";
-      flake = false;
-    };
-    opencodex-src = {
-      url = "github:Creator54/opencodex/gateway";
-      flake = false;
-    };
-  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { self, nixpkgs, opencodex-src, headroom-src }:
+  outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       eachSystem = nixpkgs.lib.genAttrs systems;
     in {
-      nixosModules.default = { pkgs, ... }: {
-        imports = [ ./module.nix ];
-        # The default package is ./nix/gw.nix; opencodex and headroom stay
-        # available for the Compose images but are no longer services here.
-      };
+      nixosModules.default = ./module.nix;
       packages = eachSystem (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          opencodex = pkgs.callPackage ./nix/opencodex.nix {
-            src = opencodex-src;
-          };
-          headroom = pkgs.callPackage ./nix/headroom.nix { src = headroom-src; };
-          gw = pkgs.callPackage ./nix/gw.nix { };
-        in (import ./nix/images.nix { inherit pkgs opencodex headroom; }) // {
-          inherit opencodex headroom gw;
-          default = pkgs.writeShellApplication {
-            name = "llm-gateway";
-            runtimeInputs = [ pkgs.podman pkgs.docker-compose pkgs.coreutils ];
-            runtimeEnv = {
-              GATEWAY_COMPOSE = "${self}/compose.yaml";
-              PODMAN_COMPOSE_PROVIDER = "${pkgs.docker-compose}/bin/docker-compose";
-            };
-            text = builtins.readFile ./scripts/gateway.sh;
-          };
-        });
+        let gw = nixpkgs.legacyPackages.${system}.callPackage ./nix/gw.nix { };
+        in { inherit gw; default = gw; });
       apps = eachSystem (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/llm-gateway";
+          program = "${self.packages.${system}.gw}/bin/gw";
         };
       });
       checks = eachSystem (system: {
@@ -60,12 +29,8 @@
       devShells = eachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
         in {
-          default = pkgs.mkShellNoCC {
-            packages = [ pkgs.just pkgs.git pkgs.podman pkgs.docker-compose pkgs.curl pkgs.wl-clipboard pkgs.xclip ];
-            PODMAN_COMPOSE_PROVIDER = "${pkgs.docker-compose}/bin/docker-compose";
-          };
-          rust = pkgs.mkShell {
-            packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.rust-analyzer pkgs.bun ];
+          default = pkgs.mkShell {
+            packages = [ pkgs.just pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.rust-analyzer pkgs.bun ];
           };
         });
     };

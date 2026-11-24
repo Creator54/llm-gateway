@@ -139,7 +139,7 @@ pub(super) fn convert_tools(chat: &Value, names: &mut ToolNames) -> (Vec<Value>,
     }
     if omitted > 0 {
         additions.push(format!(
-            "[opencodex] Kiro's outbound catalog budget allows {} of {} client tools this turn. {omitted} tools are omitted and unavailable this turn.",
+            "[gw] Kiro's outbound catalog budget allows {} of {} client tools this turn. {omitted} tools are omitted and unavailable this turn.",
             kept.len(),
             requested.len()
         ));
