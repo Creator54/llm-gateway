@@ -33,6 +33,12 @@ let
     (service.environment.HOME == "/var/lib/llm-gateway")
     (service.serviceConfig.ReadWritePaths == [ "/var/lib/llm-gateway" ])
     (nixpkgs.lib.hasInfix "gw-start" service.serviceConfig.ExecStart)
+    # The rendered config must be valid TOML (bare paths broke gw on phoenix).
+    (let
+      script = builtins.readFile service.serviceConfig.ExecStart;
+      path = builtins.head (builtins.match ".*--config ([^ \n]+).*" script);
+      cfgToml = builtins.fromTOML (builtins.readFile path);
+    in cfgToml.state_dir == "/var/lib/llm-gateway" && cfgToml.api_key_file == "/var/lib/llm-gateway/api-key")
     # A key inside the Nix store is rejected.
     (builtins.any (a: !a.assertion && nixpkgs.lib.hasInfix "apiKeyFile" a.message) invalid.assertions)
     # So is a state dir that is not a single path segment.
