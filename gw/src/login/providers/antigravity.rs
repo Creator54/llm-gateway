@@ -10,7 +10,10 @@ use std::time::Duration;
 use super::{post_form, Pending};
 use crate::login::{pkce, ui, Options, Tokens};
 
-const CLIENT_ID: &str = concat!("1071006060591-", "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com");
+const CLIENT_ID: &str = concat!(
+    "1071006060591-",
+    "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+);
 const CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf");
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -321,7 +324,10 @@ mod tests {
             .route(
                 "/token",
                 post(|body: String| async move {
-                    assert!(body.contains(concat!("client_secret=GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf")));
+                    assert!(body.contains(concat!(
+                        "client_secret=GOCSPX-",
+                        "K58FWR486LdLJ1mLB8sXC4z6qDAf"
+                    )));
                     assert!(body.contains("grant_type=authorization_code"));
                     axum::Json(json!({
                         "access_token": "at-1",
