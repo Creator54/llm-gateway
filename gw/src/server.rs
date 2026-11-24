@@ -489,6 +489,10 @@ async fn count_tokens(State(st): State<Arc<Gateway>>, req: Request) -> Response 
 
 /// Local model list when the config can name any model, else the upstream's.
 async fn list_models(State(st): State<Arc<Gateway>>, req: Request) -> Response {
+    // The local list names every account; it is not public.
+    if st.key.is_some() && authenticate(&st, req.headers()).is_none() {
+        return unauthorized();
+    }
     let shape = models::shape(req.headers());
     let declared_len = req
         .headers()
@@ -2372,6 +2376,23 @@ mod tests {
         let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(json_body(resp).await, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn local_model_list_needs_the_key() {
+        let key = TempKey::new("secret");
+        let cfg = Config {
+            api_key_file: Some(key.0.clone()),
+            models: [("openai".to_string(), vec!["gpt-x".to_string()])].into(),
+            state_dir: temp_state(),
+            ..Config::default()
+        };
+        let url = format!("http://{}/v1/models", gateway_with(cfg).await);
+        let client = reqwest::Client::new();
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client.get(&url).bearer_auth("secret").send().await.unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
